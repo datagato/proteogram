@@ -1,0 +1,164 @@
+from proteogram.proteogram_v2 import ProteogramV2
+import glob
+import os
+from time import time
+import matplotlib.pyplot as plt
+import torch
+import warnings
+import argparse
+from tqdm import tqdm
+from Bio.PDB.PDBParser import PDBConstructionWarning
+from proteogram.utils import read_yaml
+# Ignore PDB construction warnings
+warnings.filterwarnings("ignore", category=PDBConstructionWarning)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description="Create Proteograms (v2).")
+    parser.add_argument("--max_workers", "-w",
+                        type=int,
+                        default=None,
+                        help="Max number of workers for multiprocessing \
+                            (default: 0, all available nodes).")
+    parser.add_argument('--overwrite',
+                        action='store_true',
+                        help="Recreate / overwrite Proteograms.")    
+    parser.add_argument('--verbose',
+                        action='store_true',
+                        help="Verbose output and logging.")
+    parser.add_argument('--save_simulated_pdb',
+                        action='store_true',
+                        help="Save the final simulated PDB structure from MD simulation.")
+    args = parser.parse_args()
+
+    start = time()
+    
+    if args.overwrite:
+        recreate = True
+    else:
+        recreate = False
+    config = read_yaml('config.yml')
+    limit_file = config['limit_file']
+    structures_dir = config['scope_structures_dir']
+    proteograms_output_dir = config['all_proteograms_dir']
+
+    # Only create proteograms for these structures in the input limit file
+    limit_to_these_structs = []
+    if limit_file:
+        with open(limit_file, 'r') as f:
+            for line in f:
+                limit_to_these_structs.append(line.strip())
+
+    # If the output dir exists, don't recreate, otherwise make one
+    if os.path.exists(proteograms_output_dir):
+        print(f'Directory {proteograms_output_dir} exists, will use.')
+    else:
+        os.makedirs(proteograms_output_dir)
+
+    # Create output directory for production PDB structures if requested
+    production_pdb_output_dir = None
+    if args.save_simulated_pdb:
+        production_pdb_output_dir = os.path.join(
+            proteograms_output_dir, 'production_structures')
+        if os.path.exists(production_pdb_output_dir):
+            print(f'Directory {production_pdb_output_dir} exists, will use.')
+        else:
+            os.makedirs(production_pdb_output_dir)
+            print(f'Created directory {production_pdb_output_dir} for production structures.')
+
+    pdb_files = glob.glob(os.path.join(structures_dir, '*'))
+    existing_image_files = glob.glob(
+            os.path.join(proteograms_output_dir, '*'))
+
+    # Make a list of (pdb-file-name, image-file-name) tuples as input
+    # to process pool
+    file_list = []
+    exts = ['ent', 'mmcif', 'cif' 'pdb']
+    for pdb_file in pdb_files:
+        bname =  os.path.basename(pdb_file)
+        # There are structure files we wish to limit to
+        if limit_to_these_structs:
+            if bname not in limit_to_these_structs:
+                continue
+        
+        chain_id = bname[1:5].upper()+':'+ bname[5].upper()
+
+        # name without extensions
+        bname_noext = bname
+        if bname.split('.')[-1] in exts:
+            for x in exts:
+                bname_noext.replace(x, '')
+        
+        image_file = os.path.join(proteograms_output_dir,
+                f'{bname_noext}.jpg')
+        if recreate == False:
+            if image_file not in existing_image_files:
+                file_list.append((pdb_file, image_file))
+        else: # recreate
+            file_list.append((pdb_file, image_file))
+
+    print(f'Number of structure files = {len(file_list)}')
+
+    # Check if CUDA-enabled GPU is available
+    use_gpu = torch.cuda.is_available()
+
+    # Insert regular loop over files using ProteogramV2 here
+    problem_files = []
+    problem_pdb_cnts = 0
+    for pdb_file, image_file in tqdm(file_list):
+        try:
+            bname =  os.path.basename(pdb_file)
+            chain_id = bname[5].upper()
+            # Create ProteogramV2 instance
+            proteogram = ProteogramV2(pdb_file,
+                                      chain_id,
+                                      atom_distance_cutoff=20,
+                                      hydrophobicity_delta_cutoff=30,
+                                      sequence_len_lower_cutoff=20,
+                                      sequence_len_upper_cutoff=1000,
+                                      use_gpu=use_gpu)
+            
+            # Calculate Proteogram with optional simulated PDB output
+            if args.save_simulated_pdb:
+                final_data, err, simulated_pdb_stream = proteogram.calculate_proteogram(
+                    return_simulated_pdb=True)
+            else:
+                final_data, err = proteogram.calculate_proteogram()
+                simulated_pdb_stream = None
+
+            if err is not None and args.verbose:
+                print(f'Error calculating Proteogram for {pdb_file}: {err}')
+            
+            # If Proteogram data is not None, save the image
+            if final_data is not None:
+                # Save image
+                plt.imsave(image_file, final_data.astype('uint8'))
+            
+            # Save production simulation PDB structure if requested
+            if simulated_pdb_stream is not None and production_pdb_output_dir is not None:
+                # Extract base name without extension and add simulation suffix
+                bname_base = os.path.splitext(bname)[0]
+                production_pdb_file = os.path.join(
+                    production_pdb_output_dir,
+                    f'{bname_base}_production.pdb'
+                )
+                with open(production_pdb_file, 'w') as f:
+                    f.write(simulated_pdb_stream.read())
+                if args.verbose:
+                    print(f'Saved production structure to {production_pdb_file}')
+                    
+        except Exception as e:
+            problem_files.append(pdb_file)
+            problem_pdb_cnts += 1
+            if args.verbose:
+                print(f'Problem with file {pdb_file}: {e}') 
+
+    if args.verbose:
+        # Save problem pdbs to file
+        with open(os.path.join(proteograms_output_dir, 'problem_structures.txt'), 'w') as f:
+            for problem_file in problem_files:
+                f.write(problem_file + '\n')
+
+    print(f'Problems with {problem_pdb_cnts} structure files.')
+    print(f'Computation took {time()-start} seconds')

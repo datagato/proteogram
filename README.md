@@ -1,87 +1,205 @@
 # Proteogram: an image embedding-based search approach to protein structure similarity
 
-This repo has the source code for the `proteogram` project and paper.
+## Introduction
 
-## Abstract
+Proteogram is a novel approach to protein structure similarity search that represents protein structures as image data, enabling the use of computer vision models for efficient and accurate similarity detection.
 
-**Motivation:**  Huge strides have been made in the last decade in the detection of protein similarity across evolutionarily remote distances using protein structure alignment for known structures (sequence-order dependent/independent, sequence-alignment dependent/independent). These methods accurately identify similar structures according to various measures such as TM-score, RMSD, and cosine-similarity. The main challenges remaining are computational efficiency, gains in accuracy, and new enhancements to the structural data representations, such as the incorporation of physicochemical properties and evolutionary information.  We have developed Proteogram, a new approach to protein structure search that leverages computer vision models to create embedding vectors for a cosine-similarity-based search across a database of Proteograms, wherein each Proteogram represents a single protein monomer as image data.  The Proteogram is a novel data type consisting of three categories of residue-level information:  alpha-carbon backbone distances, hydrophobicity similarities, and charge similarities.  These three dimensions of data are stacked to form an NxN 3-channel data structure (where N is the residue length), which can, consequently, be captured on disk as an RGB image and are inherently sequence-alignment independent. Proteograms not only represent spatial similarity through distograms (the pair-wise residue alpha-carbon distances), but also physicochemical properties of residues through the integration of hydrophobicity values and charge states. Thus, this work outlines a novel and efficient approach to the current challenges in protein structure similarity, alignment, and search.
+### Proteogram v1: Distance, Hydrophobicity, and Charge Maps
 
-**Results:** Two state-of-the-art methods in structure alignment and similarity search, USalign and GTalign, serve as points of comparison to the method introduced in our study.  Two evaluation datasets are used to understand search performance, one from the GTalign study and a new one introduced in this paper. On the GTalign evaluation dataset, superfamily and family performance could not be discerned easily, however on a more representative dataset, the Proteogram approach scores highest in Precision@K for superfamily and family-level search results.  Additionally, for the search step itself, the Proteogram approach has the highest throughput (according to pair-wise alignments per minute) of the three methods (1.63 times faster than GTalign and 89.4 times faster than USalign). This unique and promising technique shows the gains that can be achieved by accounting for physicochemical information in addition to spatial information with a data structure compatible with advanced computer vision models.
+The original Proteogram approach creates an NxN 3-channel image representation (where N is the residue length) by stacking three categories of residue-level information:
+
+1. **Alpha-carbon backbone distances** - Pair-wise residue Cα distances (distogram)
+2. **Hydrophobicity similarities** - Residue-residue hydrophobicity comparisons
+3. **Charge similarities** - Residue-residue charge state comparisons
+
+This representation captures both spatial similarity through distograms and physicochemical properties through hydrophobicity and charge maps. The resulting RGB image is inherently sequence-alignment independent and can be processed by standard computer vision models to generate embedding vectors for cosine-similarity-based search.
+
+### Proteogram v2: Incorporating MD Simulations
+
+Proteogram v2 extends the original approach by incorporating molecular dynamics (MD) simulations to compute physics-based residue-residue interaction energies. Instead of using static distance and property maps, v2 runs a complete MD simulation pipeline using OpenMM with the AMBER ff19SB force field to calculate:
+
+- **Van der Waals energies** - Attractive and repulsive Lennard-Jones interactions
+- **Electrostatic energies** - Attractive and repulsive Coulomb interactions
+
+The MD pipeline includes energy minimization, NPT and NVT equilibration, and production dynamics with harmonic restraints on alpha-carbon atoms. The resulting 3-channel data (with 6 attributes total) provides a richer representation of protein structure that accounts for dynamic conformational sampling and explicit solvent effects.
+
+For detailed information on the MD simulation methodology, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).
 
 ## Getting started
 
-This repo uses Python 3.8+.
+This repo uses Python 3.11+.
 
 ### Installing the package
 
-This project uses [Python Poetry](https://python-poetry.org/) to manage packages.  Using `poetry==1.8.3`, the following commands may be found useful.
+This project uses [uv](https://docs.astral.sh/uv/) as the package manager. To install `uv`, follow the [installation instructions](https://docs.astral.sh/uv/getting-started/installation/).
 
-To install all packages from the `pyproject.toml`:
-```
-poetry install
-```
+#### Create a virtual environment
 
-### Setting up an environment
-
-A virtual envrionment is highly encouraged.  One way to create a virtaul environment is with the built-in tool `venv` as in:
-
-```
-python3 -m venv env
+Create and activate a uv-managed virtual environment:
+```bash
+uv venv
+source .venv/bin/activate  # On Unix/macOS
+# or
+.venv\Scripts\activate     # On Windows
 ```
 
-To use the virtual environment, it needs to be activated which on Unix systems:
-```
-source env/bin/activate
+#### CPU-only installation
+
+For systems without a GPU or for development/testing on CPU:
+```bash
+uv sync
 ```
 
-To activate the virtual envrionment on Windows:
-```
-env\Scripts\activate
+This installs OpenMM with CPU-only support.
+
+#### GPU installation (CUDA 12)
+
+For systems with NVIDIA GPUs, install with CUDA 12 support for accelerated MD simulations:
+```bash
+uv sync --extra cuda12
 ```
 
-See [Create and Use Virtual Environments](https://packaging.python.org/en/latest/guides/installing-using-pip-and-virtual-environments/#create-and-use-virtual-environments) for more on `venv`.
+This uses the optional `cuda12` dependencies defined in `pyproject.toml` to install `openmm-cuda-12` and related CUDA packages.
+
+> **Note:** Ensure you have compatible NVIDIA drivers and CUDA 12 toolkit installed. See the [OpenMM documentation](http://docs.openmm.org/latest/userguide/application/01_getting_started.html#installing-openmm) for GPU requirements.
+
+#### [Optional] Adding dependencies
+
+To add a package dependency:
+```bash
+uv add <packagename>
+```
+
+To add a development dependency:
+```bash
+uv add --dev <packagename>
+```
 
 ### Set up configuration
 
-Fill out a `config.yml` (based on `config.example.yml`) file and place in the `scripts` folder where all scripts should be run.
+1. Copy the example configuration file:
+   ```bash
+   cp scripts/config.example.yml scripts/config.yml
+   ```
+
+2. Edit `scripts/config.yml` to configure:
+   - `scope_structures_dir`: Path to your input PDB structure files (here we used SCOPe 2.08 structures)
+   - `all_proteograms_dir`: Path where generated proteograms will be saved
+   - `limit_file`: (Optional) Path to a file listing specific structures to process
 
 ### Creating proteograms
 
-To create proteograms of your domains, run the following from the `scripts` folder:
-```
-python create_proteograms.py
+To create proteograms for your protein structures, run the following from the `scripts` folder:
+```bash
+cd scripts
+uv run python create_v2_proteograms.py
 ```
 
-### Measure similarity of a single domain to DB of proteograms
+Optional arguments:
+- `--overwrite`: Recreate proteograms even if they already exist
+- `--verbose`: Enable verbose output and logging
+- `--save_simulated_pdb`: Save the final MD simulation structure as a PDB file to a subfolder
 
-To utilize a new structure and compare to a DB (directory) of proteograms, run the following from the `scripts` folder (modify script values for your particular structure - see script):
-```
-python measure_similarity_single_domain.py
-```
+### Measure similarity of a single domain to a database of proteograms
+
+To compare a new structure against an existing database of proteograms and retrieve the top-k most similar proteins:
+
+1. Ensure you have a database of pre-computed proteograms (supplied separately or generated using the step above)
+
+2. Run the similarity search from the `scripts` folder:
+   ```bash
+   cd scripts
+   uv run python measure_similarity_single_domain.py
+   ```
+   
+   Modify the script to specify your query structure and the path to the proteogram database.
 
 Example resulting search image (scores and proteogram files are also output):
 
 ![example set of 5 search hits](assets/AF-A0A3M6TU40-F1-model_v4_A_top_sims.jpg)
 
-### Additional notes
+### Running an MD simulation
 
-To add a package dependency to the environment (and add to the main dependencies section of the `pyproject.toml`):
-```
-poetry add <packagename>
+The `NonBondedForceModel` module provides a complete pipeline for running molecular dynamics simulations and calculating residue-residue interaction energies. Here's an example:
+
+```python
+from proteogram.nonbonded_forces import NonBondedForceModel
+import numpy as np
+
+# Initialize the model
+model = NonBondedForceModel(
+    pdb_path='protein.pdb',
+    temperature=300.0,  # Kelvin
+    use_gpu=False       # Set True for GPU acceleration
+)
+
+# Run the full MD pipeline
+(vdw_e_att, vdw_e_rep, es_e_att, es_e_rep,
+ vdw_f_att, vdw_f_rep, es_f_att, es_f_rep, 
+ simulated_pdb_stream) = model.run_full_pipeline(
+    npt_steps=50000,           # 100 ps NPT equilibration
+    nvt_steps=50000,           # 100 ps NVT equilibration
+    production_steps=500000,   # 1 ns production
+    energy_calc_interval=10000,# Calculate energies every 20 ps
+    return_simulated_pdb=True  # Return final structure
+)
+
+# Save the final simulated structure
+with open('simulated_structure.pdb', 'w') as f:
+    f.write(simulated_pdb_stream.read())
+
+# Save energy and force matrices
+np.save('vdw_energy_attractive.npy', vdw_e_att)
+np.save('vdw_force_attractive.npy', vdw_f_att)
 ```
 
-To add a package dependency to the environment (and add to the dev dependencies section of the `pyproject.toml`):
-```
-poetry add <packagename> --dev
-```
+For detailed information on the MD simulation methodology, force calculations, and energy validation, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).
+
+## Scripts Reference
+
+The following table provides an overview of all scripts in the `scripts/` folder, their purpose, and the configuration variables or command-line arguments they use.
+
+| Script | Purpose | Config Variables (`config.yml`) | Command-Line Arguments |
+|--------|---------|--------------------------------|------------------------|
+| `create_v2_proteograms.py` | Create proteograms using MD-based nonbonded force calculations | `limit_file`, `scope_structures_dir`, `all_proteograms_dir` | `--max_workers`, `--overwrite`, `--verbose`, `--save_simulated_pdb` |
+| `create_proteograms.py` | Create proteograms using distance/hydrophobicity/charge maps (v1) | `scope_structures_dir`, `eval_proteograms_dir`, `limit_file` | None |
+| `measure_similarity_single_domain.py` | Search a single structure against a proteogram database | `top_k`, `model_file`, `embed_file`, `embed_file_exists`, `proteogram_sim_results`, `proteograms_dir_single_search` | None |
+| `measure_similarity.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | None |
+| `train_resnet_model.py` | Fine-tune a ResNet18 model for proteogram classification | `training_data_dir`, `model_file`, `num_epochs`, `learning_rate`, `batch_size`, `pretrained` | None |
+| `train_cnn_model.py` | Train an alternative CNN model for proteogram classification | `num_epochs_cnn`, `learning_rate_cnn`, `batch_size_cnn`, `cnn_model_file_prefix` | Uses `argparse` (see script) |
+| `evaluate_methods.py` | Evaluate proteogram approach vs GTalign and USalign | `gtalign_results_dir`, `usalign_results`, `save_bad_searches_dir`, `save_good_searches_dir` | None |
+| `make_training_and_eval_data.py` | Create training/validation datasets with SCOPe annotations | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out` | None |
+| `make_training_data_exclude_eval.py` | Create training data excluding evaluation set proteins | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out`, `scope_level` | None |
+| `create_annotation_file.py` | Generate annotation lookup file from SCOPe/RCSB/PDBe | `limit_file`, `scope_structures_dir`, `annot_file`, `fasta_style_file`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | None |
+| `find_structures_in_scope.py` | Find PDB structures in SCOPe 2.08 database | None (hardcoded paths in script) | None |
+| `get_structures_scope20840_list.py` | Download and parse PDB structures by chain | None (hardcoded paths in script) | None |
+| `copy_structures.py` | Copy structure files filtered by amino acid length | None (hardcoded paths in script) | None |
+
+> **Note:** Scripts with "None (hardcoded paths in script)" require editing the script directly to set file paths. See `config.example.yml` for descriptions of all configuration variables.
 
 ## Workflow for paper where the proteogram approach was compared to GTalign and USalign
 
 
-### Overview
+### Overview of v1 approach
 
 ![](assets/Workflow-Structure-Compression.png)
 
-### Proteogram generation
+### Proteogram v1 generation
 
 ![](assets/proteogram_generation.png)
+
+## References
+
+1. **GTalign** - Margelevicius, M. (2024). GTalign: High-performance protein structure alignment, superposition, and search. *Nature Communications*, 15, 1261. https://doi.org/10.1038/s41467-024-45653-4
+
+2. **US-align** - Zhang, C., Shine, M., Pyle, A.M., & Zhang, Y. (2022). US-align: universal structure alignments of proteins, nucleic acids, and macromolecular complexes. *Nature Methods*, 19, 1109–1115. https://doi.org/10.1038/s41592-022-01585-1
+
+3. **SCOPe 2.08** - Chandonia, J.M., Fox, N.K., & Brenner, S.E. (2017). SCOPe: Manual curation and artifact removal in the Structural Classification of Proteins - extended database. *Journal of Molecular Biology*, 429(3), 348-355. https://doi.org/10.1016/j.jmb.2016.11.023
+
+4. **OpenMM** - Eastman, P., Swails, J., Chodera, J.D., McGibbon, R.T., Zhao, Y., Beauchamp, K.A., Wang, L.P., Simmonett, A.C., Harrigan, M.P., Stern, C.D., Wiewiora, R.P., Brooks, B.R., & Pande, V.S. (2017). OpenMM 7: Rapid development of high performance algorithms for molecular dynamics. *PLOS Computational Biology*, 13(7), e1005659. https://doi.org/10.1371/journal.pcbi.1005659
+
+5. **AMBER ff19SB** - Tian, C., Kasavajhala, K., Belfon, K.A.A., Raguette, L., Huang, H., Migues, A.N., Bickel, J., Wang, Y., Pincay, J., Wu, Q., & Simmerling, C. (2020). ff19SB: Amino-Acid-Specific Protein Backbone Parameters Trained against Quantum Mechanics Energy Surfaces in Solution. *Journal of Chemical Theory and Computation*, 16(1), 528-552. https://doi.org/10.1021/acs.jctc.9b00591
+
+6. **ResNet** - He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep Residual Learning for Image Recognition. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 770-778. https://doi.org/10.1109/CVPR.2016.90
+
+7. **Foldseek** - van Kempen, M., Kim, S.S., Tumescheit, C., Mirdita, M., Lee, J., Gilchrist, C.L.M., Söding, J., & Steinegger, M. (2024). Fast and accurate protein structure search with Foldseek. *Nature Biotechnology*, 42, 243–246. https://doi.org/10.1038/s41587-023-01773-0
