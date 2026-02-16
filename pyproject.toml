@@ -1,38 +1,28 @@
 [project]
 name = "proteogram"
-version = "0.1.0"
-description = "Protein structure to image - manipulation and analysis."
+version = "0.0.3"
+description = "Protein structure to image manipulation and analysis."
 requires-python = ">=3.11"
-dependencies = [
-    "biopython~=1.8",
-    "kmeans-pytorch~=0.3",
-    "matplotlib~=3.10",
-    "MDAnalysis[analysis,extra_formats,parallel]==2.10.0",
-    "numpy~=1.26",
-    "openmm~=8.4",
-    "pandas~=3.0",
-    "pdbfixer @ git+https://github.com/openmm/pdbfixer@94cfa4c",
-    "pillow~=12.1",
-    "torch~=2.2",
-    "torchvision~=0.17",
-    "tqdm~=4.67",
-]
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
+cuda12 = [
+  "nvidia-cuda-nvcc-cu12==12.9.86",
+  "openmm-cuda-12==8.4.0.post2"
+]
 test = ["pytest", "pytest-cov"]
 notebook = [
   "jupyterlab>=4.2.5",
   "nglview>=3.1.4",
   "rcsbsearchapi>=1.5.1"
 ]
-cuda12 = [
-  "nvidia-cuda-nvcc-cu12",
-  "openmm-cuda-12~=8.4"
-]
 
 [tool.setuptools.packages.find]
 # Exclude patterns should match the full package name
-exclude = ["assets","notebooks", "scripts", "tmp"]
+exclude = ["assets", "paper", "notebooks", "scripts", "tmp"] 
 
 [build-system]
 requires = ["setuptools>=61.0"]

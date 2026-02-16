@@ -203,3 +203,50 @@ The following table provides an overview of all scripts in the `scripts/` folder
 6. **ResNet** - He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep Residual Learning for Image Recognition. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 770-778. https://doi.org/10.1109/CVPR.2016.90
 
 7. **Foldseek** - van Kempen, M., Kim, S.S., Tumescheit, C., Mirdita, M., Lee, J., Gilchrist, C.L.M., Söding, J., & Steinegger, M. (2024). Fast and accurate protein structure search with Foldseek. *Nature Biotechnology*, 42, 243–246. https://doi.org/10.1038/s41587-023-01773-0
+
+
+# Docker Guide (uv based)
+
+This repo is dockerized to run scripts under `/scripts` (e.g. measure_similarity.py, create_proteograms.py etc.)
+
+## Prerequisites
+- Docker installed
+- `uv.lock` present in repo root (recommended for reproducible builds)
+
+---
+
+## Build the Docker image
+
+From the repo root (the folder that contains `Dockerfile`, `pyproject.toml`, `uv.lock`):
+
+```
+sudo docker build -t proteogram:dev .
+```
+
+## Verify the image
+
+Verify Python and package import
+```
+docker run --rm proteogram:dev python -c "import proteogram; print('import ok')"
+```
+
+Verify scripts inside the container
+```
+docker run --rm proteogram:dev python scripts/measure_similarity.py
+```
+
+Interactively login to container and inspect the contents to see expected files.
+```
+docker run --rm -it proteogram:dev bash
+```
+
+### Mount the datasets 
+Note: `-v` bind mounts are applied **only at container run time**. The data is
+not stored in the image and will not be present unless you start the container
+with the `-v` flag.
+```
+sudo docker run --rm -it \
+  -v "$(pwd)/scripts/data/pdbstyle-2.08:/app/scripts/data/pdbstyle-2.08" \
+  proteogram:dev \
+  bash
+```
