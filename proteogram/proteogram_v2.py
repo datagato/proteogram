@@ -86,7 +86,10 @@ class ProteogramV2:
         seq_len = len(self.sequence)
         return (self.sequence_len_lower_cutoff <= seq_len <= self.sequence_len_upper_cutoff)
     
-    def calculate_proteogram(self, return_simulated_pdb: bool = False):
+    def calculate_proteogram(self,
+                             return_simulated_pdb: bool = False,
+                             debug: bool = False,
+                             subtract_solvent_energies: bool = True):
         """Calculate the proteogram maps.
 
         Computes distance, hydrophobicity, Van der Waals, and electrostatic maps
@@ -96,6 +99,11 @@ class ProteogramV2:
             return_simulated_pdb (bool): If True, also return the final
                 production structure from the MD simulation as a PDB stream.
                 Defaults to False.
+            debug (bool): If True, print debug information during calculations.
+                Defaults to False.
+            subtract_solvent_energies (bool): If True, subtract solvent-only 
+                energies from the protein+solvent energies to isolate the protein 
+                contributions. Defaults to False.
 
         Returns:
             tuple: A tuple containing:
@@ -112,7 +120,7 @@ class ProteogramV2:
         # Initialize the model
         model = NonBondedForceModel(
             pdb_path=self.pdb_path,
-            temperature=300.0, # Kelvin
+            temperature=310.15, # Kelvin (37 C)
             timestep=2.0, # Femtoseconds
             use_gpu=self.use_gpu # Set True for GPU acceleration
         )
@@ -123,25 +131,26 @@ class ProteogramV2:
             nvt_steps=50000,      # 100 ps NVT equilibration
             production_steps=500000,  # 1 ns production
             energy_calc_interval=10000,  # Calculate energies every 20 ps
-            return_simulated_pdb=return_simulated_pdb
+            return_simulated_pdb=return_simulated_pdb,
+            debug=debug,
+            subtract_solvent_energies=subtract_solvent_energies # Subtract solvent-only energies
         )
         
         # Unpack results based on whether simulated PDB was requested
         if return_simulated_pdb:
             vdw_e_att, vdw_e_rep, es_e_att, es_e_rep, \
-                vdw_f_att, vdw_f_rep, es_f_att, es_f_rep, simulated_pdb = pipeline_result
+                simulated_pdb = pipeline_result
         else:
-            vdw_e_att, vdw_e_rep, es_e_att, es_e_rep, \
-                vdw_f_att, vdw_f_rep, es_f_att, es_f_rep = pipeline_result
+            vdw_e_att, vdw_e_rep, es_e_att, es_e_rep = pipeline_result
             simulated_pdb = None
         
         # Normalize all maps to [0-255]
         norm_disto_map, disto_err = self.normalize_map(disto_map)
         norm_hydro_map, hydro_err = self.normalize_map(hydro_map)
-        norm_vdw_att_map, vdw_att_err = self.normalize_map(vdw_f_att)
-        norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_f_rep)
-        norm_es_att_map, es_att_err = self.normalize_map(es_f_att)
-        norm_es_rep_map, es_rep_err = self.normalize_map(es_f_rep)
+        norm_vdw_att_map, vdw_att_err = self.normalize_map(vdw_e_att)
+        norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep)
+        norm_es_att_map, es_att_err = self.normalize_map(es_e_att)
+        norm_es_rep_map, es_rep_err = self.normalize_map(es_e_rep)
         
         # Check for normalization errors
         errors = {

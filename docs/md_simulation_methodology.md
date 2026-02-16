@@ -12,7 +12,7 @@ This document describes the complete pipeline for calculating pairwise residue-r
    - [NPT Equilibration](#2-npt-equilibration)
    - [NVT Equilibration](#3-nvt-equilibration)
    - [Production MD](#4-production-md)
-5. [Force and Energy Calculations](#force-and-energy-calculations)
+5. [Energy Calculations](#energy-calculations)
    - [Van der Waals Interactions](#van-der-waals-lennard-jones-interactions)
    - [Electrostatic Interactions](#electrostatic-coulomb-interactions)
 6. [Output Matrices](#output-matrices)
@@ -97,7 +97,7 @@ RESP charges are specifically parameterized to work synergistically with the oth
 > 1. **Energy Minimization** → Optimized positions are saved
 > 2. **NPT Equilibration** → Starts from minimized positions; barostat is **added** to allow volume changes; uses alpha-carbon restraints
 > 3. **NVT Equilibration** → A **new system is created** from NPT positions; no barostat, with alpha-carbon restraints and temperature ramping
-> 4. **Production MD** → A **new system is created** (without constraints) for accurate force calculations
+> 4. **Production MD** → A **new system is created** from NVT positions (without constraints) for accurate force calculations
 >
 > This approach ensures each stage has the appropriate force configuration while preserving the structural progress from previous stages.
 
@@ -172,11 +172,7 @@ Alpha-carbon position restraints are maintained during temperature ramping to pr
 
 ---
 
-## Force and Energy Calculations
-
-Forces are calculated as the **negative gradient of the potential energy** with respect to distance:
-
-$$\vec{F} = -\nabla U = -\frac{dU}{dr}$$
+## Energy Calculations
 
 ### Van der Waals (Lennard-Jones) Interactions
 
@@ -204,19 +200,6 @@ $$\epsilon_{ij} = \sqrt{\epsilon_i \cdot \epsilon_j}$$
 | **Repulsive** | $U_{rep} = 4\epsilon_{ij} \left(\frac{\sigma_{ij}}{r}\right)^{12}$ | Short-range Pauli repulsion |
 | **Attractive** | $U_{att} = -4\epsilon_{ij} \left(\frac{\sigma_{ij}}{r}\right)^{6}$ | London dispersion |
 
-#### Force Derivation
-
-Taking the derivative of $U_{LJ}$ with respect to $r$:
-
-$$F_{LJ}(r) = -\frac{dU_{LJ}}{dr} = \frac{24\epsilon_{ij}}{r} \left[ 2\left(\frac{\sigma_{ij}}{r}\right)^{12} - \left(\frac{\sigma_{ij}}{r}\right)^{6} \right]$$
-
-#### Separated Force Terms
-
-| Component | Formula | Sign Convention |
-|-----------|---------|-----------------|
-| **Repulsive** | $F_{rep} = \frac{48\epsilon_{ij}}{r} \left(\frac{\sigma_{ij}}{r}\right)^{12}$ | Positive (pushes apart) |
-| **Attractive** | $F_{att} = -\frac{24\epsilon_{ij}}{r} \left(\frac{\sigma_{ij}}{r}\right)^{6}$ | Negative (pulls together) |
-
 ---
 
 ### Electrostatic (Coulomb) Interactions [7]
@@ -230,16 +213,13 @@ Where:
 - $q_i, q_j$ = partial charges in elementary charge units
 - $r$ = distance between atoms
 
-#### Force Derivation
-
-$$F_{elec}(r) = -\frac{dU_{elec}}{dr} = \frac{k_e \cdot q_i \cdot q_j}{r^2}$$
 
 #### Classification
 
-| Condition | Energy | Force | Type |
-|-----------|--------|-------|------|
-| $q_i \cdot q_j > 0$ (like charges) | Positive | Positive | **Repulsive** |
-| $q_i \cdot q_j < 0$ (opposite charges) | Negative | Negative | **Attractive** |
+| Condition | Energy  | Type |
+|-----------|--------|------|
+| $q_i \cdot q_j > 0$ (like charges) | Positive | **Repulsive** |
+| $q_i \cdot q_j < 0$ (opposite charges) | Negative | **Attractive** |
 
 ---
 
@@ -254,7 +234,7 @@ For each pair of protein residues $(i, j)$:
 
 3. **Skip if too close**: $r < 0.1$ nm (prevents singularities)
 
-4. **Compute energies and forces** using formulas above
+4. **Compute energies** using formulas above
 
 5. **Sum contributions** from all atom pairs
 
@@ -262,6 +242,15 @@ For each pair of protein residues $(i, j)$:
    $$\bar{E}_{ij} = \frac{\sum_{a_i, a_j} E(a_i, a_j)}{n_{atoms,i} \times n_{atoms,j}}$$
 
 7. **Store in upper triangle** of NxN matrix (symmetric)
+
+### Solvent Exclusion
+
+The pairwise residue-residue interaction energies are calculated **exclusively between protein residues**. Energy contributions from solvent molecules (water) and ions ($Na^+$/$Cl^-$) are explicitly subtracted from the residue-residue energies:
+
+- Protein-water, protein-ion, water-water, and ion-ion interactions are subtracted out and thus not included in the output matrices
+- This ensures the resulting energy matrices represent **intrinsic protein residue-residue interactions** without solvent-mediated effects
+
+This approach isolates the direct non-bonded interactions within the protein structure, providing a cleaner signal for structural analysis and comparison.
 
 ---
 
@@ -277,15 +266,6 @@ The pipeline produces **8 NxN matrices** (where N = number of protein residues):
 | `vdw_energy_repulsive` | Repulsive VdW energies ($r^{-12}$ term) |
 | `es_energy_attractive` | Attractive electrostatic (opposite charges) |
 | `es_energy_repulsive` | Repulsive electrostatic (like charges) |
-
-### Force Matrices (units: kJ/(mol·nm))
-
-| Matrix | Description |
-|--------|-------------|
-| `vdw_force_attractive` | Attractive VdW forces |
-| `vdw_force_repulsive` | Repulsive VdW forces |
-| `es_force_attractive` | Attractive electrostatic forces |
-| `es_force_repulsive` | Repulsive electrostatic forces |
 
 ### Matrix Properties
 
@@ -305,13 +285,13 @@ import numpy as np
 # Initialize model
 model = NonBondedForceModel(
     pdb_path='protein.pdb',
-    temperature=300.0,
+    temperature=311.75,
     use_gpu=False
 )
 
 # Run full pipeline
-(vdw_e_att, vdw_e_rep, es_e_att, es_e_rep,
- vdw_f_att, vdw_f_rep, es_f_att, es_f_rep, simulated_pdb_stream) = model.run_full_pipeline(
+(vdw_e_att, vdw_e_rep, es_e_att, es_e_rep, \
+    simulated_pdb_stream) = model.run_full_pipeline(
     npt_steps=50000,
     nvt_steps=50000,
     production_steps=500000,

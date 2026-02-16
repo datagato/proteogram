@@ -5,7 +5,6 @@ This module provides functionality for:
     - Running MD simulations (equilibration and production)
     - Calculating residue-residue interaction energies (VdW and electrostatic)
 """
-
 from openmm.app import (
     PDBFile, ForceField, Modeller, Simulation, PME,
     HBonds, StateDataReporter, DCDReporter
@@ -26,6 +25,8 @@ import io
 import numpy as np
 import sys
 import warnings
+from typing import Optional
+from pathlib import Path
 
 
 class NonBondedForceModel:
@@ -50,8 +51,8 @@ class NonBondedForceModel:
         residue_atom_indices (dict): Mapping of residue index to atom indices.
     """
 
-    # Default simulation parameters (CPU-friendly for development)
-    DEFAULT_TEMPERATURE = 300.0  # Kelvin
+    # Default simulation parameters
+    DEFAULT_TEMPERATURE = 310.15  # Kelvin (37 C)
     DEFAULT_PRESSURE = 1.0  # atmospheres
     DEFAULT_FRICTION_COEFFICIENT = 1.0  # 1/ps
     DEFAULT_PADDING = 1.0  # nanometers
@@ -68,7 +69,8 @@ class NonBondedForceModel:
         pressure: float = DEFAULT_PRESSURE,
         padding: float = DEFAULT_PADDING,
         timestep: float = DEFAULT_TIMESTEP,
-        use_gpu: bool = False
+        use_gpu: bool = False,
+        output_dir: Optional[str] = None
     ):
         """Initialize the NonBondedForceModel.
 
@@ -84,6 +86,8 @@ class NonBondedForceModel:
                 Defaults to 2 fs.
             use_gpu (bool, optional): Whether to use GPU acceleration.
                 Defaults to False (CPU).
+            output_dir (str, optional): Directory for saving debug outputs
+                (e.g., energy plots). Defaults to the PDB file's parent directory.
         """
         self.pdb_path = pdb_path
         self.temperature = temperature * kelvin
@@ -91,17 +95,28 @@ class NonBondedForceModel:
         self.padding = padding * nanometer
         self.timestep = timestep * femtoseconds
         self.use_gpu = use_gpu
+        self.output_dir = Path(output_dir) if output_dir else Path(pdb_path).parent
 
         # These will be set during setup
         self.forcefield = None
         self.topology = None
         self.positions = None
-        self.velocities = None
         self.modeller = None
         self.system = None
         self.simulation = None
         self.residue_atom_indices = {}
         self.protein_residue_indices = []
+        self.debug = False
+        
+        # Energy logging for debug mode
+        # Each stage stores: {'time_ps': [], 'energy_kj': [], 'stage': str}
+        self.energy_log = {
+            'initial': {'time_ps': [], 'energy_kj': [], 'stage': 'Initial'},
+            'minimization': {'time_ps': [], 'energy_kj': [], 'stage': 'Minimization'},
+            'npt': {'time_ps': [], 'energy_kj': [], 'stage': 'NPT Equilibration'},
+            'nvt': {'time_ps': [], 'energy_kj': [], 'stage': 'NVT Equilibration'},
+            'production': {'time_ps': [], 'energy_kj': [], 'stage': 'Production'}
+        }
 
     @staticmethod
     def fix_pdb_file(pdb_path: str) -> io.StringIO:
@@ -205,6 +220,38 @@ class NonBondedForceModel:
             res_idx = residue.index
             atom_indices = [atom.index for atom in residue.atoms()]
             self.residue_atom_indices[res_idx] = atom_indices
+        
+        # Also identify solvent and ion atoms for interaction group calculations
+        self._identify_solvent_atoms()
+
+    def _identify_solvent_atoms(self) -> None:
+        """Identify solvent (water) and ion atom indices after solvation.
+        
+        This builds sets of atom indices for:
+            - protein_atom_indices: All atoms belonging to protein residues
+            - solvent_atom_indices: Water molecules (HOH, WAT, TIP3, etc.)
+            - ion_atom_indices: Ions (Na+, Cl-, K+, etc.)
+        """
+        solvent_resnames = {'HOH', 'WAT', 'TIP3', 'TIP4', 'SPC', 'T3P', 'T4P', 'T5P'}
+        ion_resnames = {'NA', 'CL', 'K', 'MG', 'CA', 'ZN', 'NA+', 'CL-', 'K+', 'MG2+', 'CA2+', 'ZN2+'}
+        
+        self.protein_atom_indices = set()
+        self.solvent_atom_indices = set()
+        self.ion_atom_indices = set()
+        
+        for residue in self.topology.residues():
+            atom_indices = [atom.index for atom in residue.atoms()]
+            resname = residue.name.upper()
+            
+            if residue.index in self.protein_residue_indices:
+                self.protein_atom_indices.update(atom_indices)
+            elif resname in solvent_resnames:
+                self.solvent_atom_indices.update(atom_indices)
+            elif resname in ion_resnames:
+                self.ion_atom_indices.update(atom_indices)
+            else:
+                # Unknown residue type - could be ligand, treat as solvent for now
+                self.solvent_atom_indices.update(atom_indices)
 
     def _get_platform(self) -> Platform:
         """Get the appropriate compute platform.
@@ -282,9 +329,8 @@ class NonBondedForceModel:
             integrator,
             platform
         )
-        self.simulation.context.reinitialize(preserveState=True)
+        self.simulation.context.reinitialize(preserveState=False)
         self.simulation.context.setPositions(self.positions)
-        # self.simulation.context.setVelocities(self.velocities) if self.velocities is not None else None
 
     def minimize_energy(self, max_iterations: int = 1000) -> None:
         """Perform energy minimization.
@@ -293,10 +339,27 @@ class NonBondedForceModel:
             max_iterations (int): Maximum number of minimization iterations.
         """
         print("Performing energy minimization...")
+        
+        # Log initial energy before minimization (debug mode)
+        if self.debug:
+            initial_state = self.simulation.context.getState(getEnergy=True)
+            initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+            self._log_energy('initial', 0.0, initial_energy)
+            self._log_energy('minimization', 0.0, initial_energy)
+        
         self.simulation.minimizeEnergy(maxIterations=max_iterations)
         self.positions = self.simulation.context.getState(
             getPositions=True
         ).getPositions()
+        
+        # Log final energy after minimization (debug mode)
+        if self.debug:
+            final_state = self.simulation.context.getState(getEnergy=True)
+            final_energy = final_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+            # Use a small time increment to show minimization as a step
+            self._log_energy('minimization', 0.1, final_energy)
+            print(f"  [DEBUG] Minimization: {initial_energy:.1f} -> {final_energy:.1f} kJ/mol")
+        
         print("Energy minimization complete.")
 
     def get_simulated_pdb_stream(self) -> io.StringIO:
@@ -325,6 +388,175 @@ class NonBondedForceModel:
         PDBFile.writeFile(self.topology, self.positions, pdb_stream)
         pdb_stream.seek(0)
         return pdb_stream
+
+    def _log_energy(
+        self,
+        stage: str,
+        time_ps: float,
+        energy_kj: float
+    ) -> None:
+        """Log energy value for a given stage (only when debug is enabled).
+
+        Args:
+            stage (str): One of 'initial', 'minimization', 'npt', 'nvt', 'production'.
+            time_ps (float): Time in picoseconds.
+            energy_kj (float): Potential energy in kJ/mol.
+        """
+        if self.debug and stage in self.energy_log:
+            self.energy_log[stage]['time_ps'].append(time_ps)
+            self.energy_log[stage]['energy_kj'].append(energy_kj)
+
+    def _reset_energy_log(self) -> None:
+        """Reset all energy logs (useful when starting a new simulation)."""
+        for stage in self.energy_log:
+            self.energy_log[stage]['time_ps'] = []
+            self.energy_log[stage]['energy_kj'] = []
+
+    def plot_energy_history(
+        self,
+        output_path: Optional[str] = None,
+        show_plot: bool = False
+    ) -> None:
+        """Plot energy vs. time for all simulation stages.
+
+        Creates a multi-panel figure showing energy evolution during:
+        - Initial state (single point)
+        - Energy minimization
+        - NPT equilibration
+        - NVT equilibration
+        - Production run
+
+        Args:
+            output_path (str, optional): Path to save the figure. If None,
+                saves to the same directory as the PDB file with suffix '_energy.png'.
+            show_plot (bool): Whether to display the plot interactively.
+                Defaults to False.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+        except ImportError:
+            warnings.warn(
+                "matplotlib not installed. Cannot generate energy plot. "
+                "Install with: pip install matplotlib"
+            )
+            return
+
+        # Collect all stages that have data
+        stages_with_data = []
+        for stage_key, stage_data in self.energy_log.items():
+            if stage_data['energy_kj']:
+                stages_with_data.append((stage_key, stage_data))
+
+        if not stages_with_data:
+            print("No energy data to plot.")
+            return
+
+        # Color scheme for different stages
+        stage_colors = {
+            'initial': '#2ecc71',       # Green
+            'minimization': '#3498db',  # Blue
+            'npt': '#9b59b6',           # Purple
+            'nvt': '#e67e22',           # Orange
+            'production': '#e74c3c'     # Red
+        }
+
+        # Create figure with multiple subplots
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), height_ratios=[1, 2])
+        
+        # Top panel: Combined view with cumulative time
+        ax_combined = axes[0]
+        cumulative_time = 0.0
+        stage_boundaries = []  # Track where each stage ends
+        
+        for stage_key, stage_data in stages_with_data:
+            times = np.array(stage_data['time_ps'])
+            energies = np.array(stage_data['energy_kj'])
+            color = stage_colors.get(stage_key, '#7f8c8d')
+            
+            if len(times) > 0:
+                # Adjust times to be cumulative
+                adjusted_times = times + cumulative_time
+                
+                if stage_key == 'initial':
+                    # Plot as a single point
+                    ax_combined.scatter(adjusted_times, energies, color=color, 
+                                       s=100, zorder=5, label=stage_data['stage'])
+                else:
+                    ax_combined.plot(adjusted_times, energies, color=color, 
+                                    linewidth=1.5, label=stage_data['stage'])
+                
+                # Update cumulative time
+                if len(times) > 1:
+                    cumulative_time = adjusted_times[-1]
+                    stage_boundaries.append((cumulative_time, stage_data['stage']))
+        
+        # Add vertical lines at stage boundaries
+        for boundary_time, stage_name in stage_boundaries[:-1]:  # Skip last boundary
+            ax_combined.axvline(x=boundary_time, color='gray', linestyle='--', 
+                               alpha=0.5, linewidth=0.8)
+        
+        ax_combined.set_xlabel('Time (ps)', fontsize=11)
+        ax_combined.set_ylabel('Potential Energy (kJ/mol)', fontsize=11)
+        ax_combined.set_title('Energy Evolution Throughout Simulation', fontsize=12, fontweight='bold')
+        ax_combined.legend(loc='upper right', fontsize=9)
+        ax_combined.grid(True, alpha=0.3)
+        
+        # Bottom panel: Individual stage panels
+        ax_individual = axes[1]
+        
+        # Calculate how many stages have more than 1 data point
+        multi_point_stages = [(k, d) for k, d in stages_with_data 
+                              if len(d['energy_kj']) > 1]
+        
+        if multi_point_stages:
+            n_stages = len(multi_point_stages)
+            
+            # Create inset axes for each stage
+            for i, (stage_key, stage_data) in enumerate(multi_point_stages):
+                times = np.array(stage_data['time_ps'])
+                energies = np.array(stage_data['energy_kj'])
+                color = stage_colors.get(stage_key, '#7f8c8d')
+                
+                # Calculate subplot position
+                width = 0.8 / n_stages
+                left = 0.1 + i * (0.85 / n_stages)
+                
+                # Create inset axis
+                ax_inset = ax_individual.inset_axes([left, 0.15, width * 0.9, 0.75])
+                ax_inset.plot(times, energies, color=color, linewidth=1.2)
+                ax_inset.set_title(stage_data['stage'], fontsize=10, fontweight='bold')
+                ax_inset.set_xlabel('Time (ps)', fontsize=8)
+                ax_inset.set_ylabel('Energy (kJ/mol)', fontsize=8)
+                ax_inset.tick_params(axis='both', labelsize=7)
+                ax_inset.grid(True, alpha=0.3)
+                
+                # Add energy change annotation
+                energy_change = energies[-1] - energies[0]
+                change_text = f'ΔE = {energy_change:+.1f} kJ/mol'
+                ax_inset.annotate(change_text, xy=(0.5, 0.02), xycoords='axes fraction',
+                                 ha='center', fontsize=8, 
+                                 color='green' if energy_change < 0 else 'red')
+        
+        # Hide the main bottom axis (we're using insets)
+        ax_individual.set_visible(False)
+        
+        plt.tight_layout()
+        
+        if output_path is None:
+            # Save to output_dir (defaults to PDB file's parent directory)
+            debug_plots_dir = self.output_dir / "debug_plots"
+            debug_plots_dir.mkdir(parents=True, exist_ok=True)
+            
+            pdb_stem = Path(self.pdb_path).stem
+            output_path = debug_plots_dir / f"{pdb_stem}_energy.png"
+        
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
 
     def _validate_energy(
         self,
@@ -432,6 +664,13 @@ class NonBondedForceModel:
         energy_history = [initial_energy]
         check_interval = max(steps // 5, report_interval)  # Check 5 times during equilibration
         
+        # Calculate timestep in ps for energy logging
+        timestep_ps = self.timestep.value_in_unit(picoseconds)
+        
+        # Log initial energy (debug mode)
+        if self.debug:
+            self._log_energy('npt', 0.0, initial_energy)
+        
         # Run equilibration in chunks for monitoring
         steps_run = 0
         while steps_run < steps:
@@ -443,6 +682,11 @@ class NonBondedForceModel:
             state = self.simulation.context.getState(getEnergy=True)
             current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
             energy_history.append(current_energy)
+            
+            # Log energy (debug mode)
+            if self.debug:
+                time_ps = steps_run * timestep_ps
+                self._log_energy('npt', time_ps, current_energy)
             
             # Validate energy
             warnings_list = self._validate_energy(
@@ -469,12 +713,11 @@ class NonBondedForceModel:
         else:
             print(f"  Energy decreased by {initial_energy - final_energy:.1f} kJ/mol (good)")
         
-        # Update positions and velocities
+        # Update positions
         state = self.simulation.context.getState(
-            getPositions=True, getVelocities=True
+            getPositions=True
         )
         self.positions = state.getPositions()
-        self.velocities = state.getVelocities()
         print("NPT equilibration complete.")
 
     def equilibrate_nvt(
@@ -519,6 +762,13 @@ class NonBondedForceModel:
         energy_history = [initial_energy]
         check_interval = max(steps // 5, report_interval)  # Check 5 times during equilibration
         
+        # Calculate timestep in ps for energy logging
+        timestep_ps = self.timestep.value_in_unit(picoseconds)
+        
+        # Log initial energy (debug mode)
+        if self.debug:
+            self._log_energy('nvt', 0.0, initial_energy)
+        
         # Run equilibration in chunks for monitoring
         steps_run = 0
         while steps_run < steps:
@@ -530,6 +780,11 @@ class NonBondedForceModel:
             state = self.simulation.context.getState(getEnergy=True)
             current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
             energy_history.append(current_energy)
+            
+            # Log energy (debug mode)
+            if self.debug:
+                time_ps = steps_run * timestep_ps
+                self._log_energy('nvt', time_ps, current_energy)
             
             # Validate energy
             warnings_list = self._validate_energy(
@@ -556,12 +811,11 @@ class NonBondedForceModel:
         else:
             print(f"  Energy decreased by {initial_energy - final_energy:.1f} kJ/mol (good)")
         
-        # Update positions and velocities
+        # Update positions
         state = self.simulation.context.getState(
-            getPositions=True, getVelocities=True
+            getPositions=True
         )
         self.positions = state.getPositions()
-        self.velocities = state.getVelocities()
         print("NVT equilibration complete.")
 
     def equilibrate_nvt_with_warming(
@@ -609,13 +863,22 @@ class NonBondedForceModel:
         # Track energies for validation
         energy_history = [initial_energy]
         
+        # Calculate timestep in ps for energy logging
+        timestep_ps = self.timestep.value_in_unit(picoseconds)
+        
+        # Log initial energy (debug mode)
+        if self.debug:
+            self._log_energy('nvt', 0.0, initial_energy)
+        
         T = 5
         n = 1000
         n_intervals = steps // n
         energy_check_interval = max(n_intervals // 10, 1)  # Check ~10 times
         
+        steps_run = 0
         for i in range(n_intervals):
             self.simulation.step(n)
+            steps_run += n
             temperature = (T+(i*T))*kelvin 
             self.simulation.integrator.setTemperature(temperature)
             
@@ -624,6 +887,11 @@ class NonBondedForceModel:
                 state = self.simulation.context.getState(getEnergy=True)
                 current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
                 energy_history.append(current_energy)
+                
+                # Log energy (debug mode)
+                if self.debug:
+                    time_ps = steps_run * timestep_ps
+                    self._log_energy('nvt', time_ps, current_energy)
                 
                 # During heating, energy is expected to increase, but watch for instabilities
                 warnings_list = self._validate_energy(
@@ -651,20 +919,19 @@ class NonBondedForceModel:
             warnings.warn("NVT equilibration ended with positive energy - system may be unstable")
             print(f"  WARNING: Positive final energy detected!")
         
-        # Update positions and velocities
+        # Update positions
         state = self.simulation.context.getState(
-            getPositions=True, getVelocities=True
+            getPositions=True
         )
         self.positions = state.getPositions()
-        self.velocities = state.getVelocities()
         print("NVT equilibration complete.")
 
     def run_production(
         self,
         steps: int = DEFAULT_PRODUCTION_STEPS,
-        energy_calc_interval: int = 10000
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-               np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        energy_calc_interval: int = 10000,
+        subtract_solvent: bool = True
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Run production MD and calculate residue-residue interaction energies and forces.
 
         This method runs an MD simulation and periodically calculates the
@@ -673,18 +940,15 @@ class NonBondedForceModel:
         Args:
             steps (int): Number of production steps.
             energy_calc_interval (int): Interval (in steps) for calculating
-                interaction energies and forces.
+                interaction energies.
+            subtract_solvent (bool): Whether to subtract solvent interaction energies.
 
         Returns:
-            tuple[np.ndarray, ...]: A tuple of eight NxN matrices:
+            tuple[np.ndarray, ...]: A tuple of four NxN matrices:
                 - vdw_attractive: Attractive VdW energies (kJ/mol)
                 - vdw_repulsive: Repulsive VdW energies (kJ/mol)
                 - es_attractive: Attractive electrostatic energies (kJ/mol)
                 - es_repulsive: Repulsive electrostatic energies (kJ/mol)
-                - vdw_force_attractive: Attractive VdW forces (kJ/(mol·nm))
-                - vdw_force_repulsive: Repulsive VdW forces (kJ/(mol·nm))
-                - es_force_attractive: Attractive electrostatic forces (kJ/(mol·nm))
-                - es_force_repulsive: Repulsive electrostatic forces (kJ/(mol·nm))
         """
         print(f"Running production MD for {steps} steps...")
         
@@ -722,22 +986,25 @@ class NonBondedForceModel:
         energy_min = initial_energy
         energy_max = initial_energy
         
+        # Calculate timestep in ps for energy logging
+        timestep_ps = self.timestep.value_in_unit(picoseconds)
+        
+        # Log initial energy (debug mode)
+        if self.debug:
+            self._log_energy('production', 0.0, initial_energy)
+        
         # Accumulators for energies
         vdw_energy_attractive_sum = np.zeros((n_residues, n_residues))
         vdw_energy_repulsive_sum = np.zeros((n_residues, n_residues))
         es_energy_attractive_sum = np.zeros((n_residues, n_residues))
         es_energy_repulsive_sum = np.zeros((n_residues, n_residues))
         
-        # Accumulators for forces
-        vdw_force_attractive_sum = np.zeros((n_residues, n_residues))
-        vdw_force_repulsive_sum = np.zeros((n_residues, n_residues))
-        es_force_attractive_sum = np.zeros((n_residues, n_residues))
-        es_force_repulsive_sum = np.zeros((n_residues, n_residues))
-        
+        steps_run = 0
         frame_count = 0
         for _ in range(0, steps, energy_calc_interval):
             # Run simulation chunk
             self.simulation.step(energy_calc_interval)
+            steps_run += energy_calc_interval
             
             # Get current state with positions and energy
             state = self.simulation.context.getState(getPositions=True, getEnergy=True)
@@ -748,6 +1015,11 @@ class NonBondedForceModel:
             energy_history.append(current_energy)
             energy_min = min(energy_min, current_energy)
             energy_max = max(energy_max, current_energy)
+            
+            # Log energy (debug mode)
+            if self.debug:
+                time_ps = steps_run * timestep_ps
+                self._log_energy('production', time_ps, current_energy)
             
             # Validate energy periodically
             if frame_count % 10 == 0:
@@ -761,22 +1033,22 @@ class NonBondedForceModel:
                     print(f"  {w}")
             
             # Calculate pairwise energies and forces for this frame
-            (vdw_e_att, vdw_e_rep, es_e_att, es_e_rep,
-             vdw_f_att, vdw_f_rep, es_f_att, es_f_rep) = self._calculate_pairwise_energies(
-                positions
+            (vdw_e_att, vdw_e_rep, es_e_att, es_e_rep) = self._calculate_pairwise_energies(
+                positions=positions,
+                subtract_solvent=subtract_solvent
             )
-            
+
+            # # Calculate pairwise energies and forces for this frame
+            # (vdw_e_att, vdw_e_rep, es_e_att, es_e_rep) = self._calculate_pairwise_energies_get_potential(
+            #     positions
+            # )
+            # vdw_f_att, vdw_f_rep, es_f_att, es_f_rep = 1,1,1,1 # Placeholder for forces - need to implement force calculation
+
             # Accumulate energies
             vdw_energy_attractive_sum += vdw_e_att
             vdw_energy_repulsive_sum += vdw_e_rep
             es_energy_attractive_sum += es_e_att
             es_energy_repulsive_sum += es_e_rep
-            
-            # Accumulate forces
-            vdw_force_attractive_sum += vdw_f_att
-            vdw_force_repulsive_sum += vdw_f_rep
-            es_force_attractive_sum += es_f_att
-            es_force_repulsive_sum += es_f_rep
 
             frame_count+=1
         
@@ -810,16 +1082,14 @@ class NonBondedForceModel:
         vdw_energy_repulsive_avg = vdw_energy_repulsive_sum / frame_count
         es_energy_attractive_avg = es_energy_attractive_sum / frame_count
         es_energy_repulsive_avg = es_energy_repulsive_sum / frame_count
-        vdw_force_attractive_avg = vdw_force_attractive_sum / frame_count
-        vdw_force_repulsive_avg = vdw_force_repulsive_sum / frame_count
-        es_force_attractive_avg = es_force_attractive_sum / frame_count
-        es_force_repulsive_avg = es_force_repulsive_sum / frame_count
         
         print("Production MD complete.")
         
-        return [vdw_energy_attractive_avg, vdw_energy_repulsive_avg, es_energy_attractive_avg, es_energy_repulsive_avg,
-                vdw_force_attractive_avg, vdw_force_repulsive_avg,
-                es_force_attractive_avg, es_force_repulsive_avg]
+        # Generate energy plot if debug mode is enabled
+        if self.debug:
+            self.plot_energy_history()
+        
+        return [vdw_energy_attractive_avg, vdw_energy_repulsive_avg, es_energy_attractive_avg, es_energy_repulsive_avg]
 
     def _get_context(self) -> Context:
         """
@@ -864,22 +1134,149 @@ class NonBondedForceModel:
         electrostatic_interaction_energy = total_coulomb - solute_coulomb -solvent_coulomb
         return vdw_interaction_energy, electrostatic_interaction_energy
 
-    def _calculate_pairwise_energies(
+    def _calculate_residue_solvent_energies(
         self,
         positions: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-               np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Calculate pairwise residue-residue interaction energies and forces.
-
-        Uses Lennard-Jones potential for VdW and Coulomb's law for electrostatics.
-        Separates attractive and repulsive contributions for both energies and forces.
-
-        Forces are calculated as the negative gradient of the potential:
-            F_LJ = (24*eps/r) * [2*(sigma/r)^12 - (sigma/r)^6]
-            F_elec = k * q1 * q2 / r^2
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Calculate per-residue interaction energies with solvent using interaction groups.
+        
+        Uses CustomNonbondedForce with addInteractionGroup() to efficiently compute
+        the interaction energy between each protein residue and all solvent molecules.
+        This leverages OpenMM's optimized force calculations (including GPU acceleration).
 
         Args:
             positions (np.ndarray): Current atomic positions in nanometers.
+
+        Returns:
+            tuple: Four N-length arrays (one value per protein residue):
+                - vdw_energy_solvent: VdW energy with solvent (kJ/mol)
+                - es_energy_solvent: Electrostatic energy with solvent (kJ/mol)
+                - vdw_force_solvent: VdW force magnitude with solvent (kJ/(mol·nm))
+                - es_force_solvent: ES force magnitude with solvent (kJ/(mol·nm))
+        """
+        n_residues = len(self.protein_residue_indices)
+        
+        vdw_energy_solvent = np.zeros(n_residues)
+        es_energy_solvent = np.zeros(n_residues)
+        vdw_force_solvent = np.zeros(n_residues)
+        es_force_solvent = np.zeros(n_residues)
+        
+        # Get nonbonded force parameters from existing system
+        nonbonded_force = None
+        for force in self.system.getForces():
+            if isinstance(force, NonbondedForce):
+                nonbonded_force = force
+                break
+        
+        if nonbonded_force is None:
+            raise RuntimeError("No NonbondedForce found in system")
+        
+        # Combine solvent and ion atoms
+        solvent_and_ions = self.solvent_atom_indices | self.ion_atom_indices
+        
+        # Calculate residue-solvent energies using OpenMM interaction groups
+        for i, res_i in enumerate(self.protein_residue_indices):
+            residue_atoms = set(self.residue_atom_indices[res_i])
+            
+            # Create a temporary system with CustomNonbondedForce for this residue-solvent pair
+            # LJ force with interaction group (no cutoff - compute all interactions)
+            lj_force = CustomNonbondedForce(
+                "4*epsilon*((sigma/r)^12-(sigma/r)^6); "
+                "sigma=0.5*(sigma1+sigma2); "
+                "epsilon=sqrt(epsilon1*epsilon2)"
+            )
+            lj_force.addPerParticleParameter("sigma")
+            lj_force.addPerParticleParameter("epsilon")
+            lj_force.setNonbondedMethod(CustomNonbondedForce.NoCutoff)
+            lj_force.setForceGroup(0)
+            
+            # Coulomb force with interaction group (no cutoff - compute all interactions)
+            coulomb_force = CustomNonbondedForce(
+                "138.935456*charge1*charge2/r"  # k_coulomb in kJ·nm/(mol·e²)
+            )
+            coulomb_force.addPerParticleParameter("charge")
+            coulomb_force.setNonbondedMethod(CustomNonbondedForce.NoCutoff)
+            coulomb_force.setForceGroup(1)
+            
+            # Add all particles with their parameters
+            for atom_idx in range(nonbonded_force.getNumParticles()):
+                charge, sigma, epsilon = nonbonded_force.getParticleParameters(atom_idx)
+                lj_force.addParticle([
+                    sigma.value_in_unit(nanometer),
+                    epsilon.value_in_unit(kilojoules_per_mole)
+                ])
+                coulomb_force.addParticle([charge.value_in_unit(elementary_charge)])
+            
+            # Set interaction groups: only compute residue-solvent interactions
+            lj_force.addInteractionGroup(residue_atoms, solvent_and_ions)
+            coulomb_force.addInteractionGroup(residue_atoms, solvent_and_ions)
+            
+            # Create temporary system
+            temp_system = System()
+            for _ in range(nonbonded_force.getNumParticles()):
+                temp_system.addParticle(1.0)  # Mass doesn't matter for energy calc
+            
+            # Copy box vectors from topology
+            vectors = self.topology.getPeriodicBoxVectors()
+            if vectors is not None:
+                temp_system.setDefaultPeriodicBoxVectors(*vectors)
+            
+            temp_system.addForce(lj_force)
+            temp_system.addForce(coulomb_force)
+            
+            # Create context and calculate energies
+            integrator = VerletIntegrator(0.001 * picoseconds)
+            platform = self._get_platform()
+            context = Context(temp_system, integrator, platform)
+            context.setPositions(positions)
+            
+            # Get LJ energy (force group 0)
+            lj_state = context.getState(getEnergy=True, groups={0})
+            lj_energy = lj_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+            
+            # Get Coulomb energy (force group 1)
+            coulomb_state = context.getState(getEnergy=True, groups={1})
+            coulomb_energy = coulomb_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+            
+            # Normalize by number of atoms in residue
+            n_atoms_in_residue = len(residue_atoms)
+            vdw_energy_solvent[i] = lj_energy / n_atoms_in_residue
+            es_energy_solvent[i] = coulomb_energy / n_atoms_in_residue
+            
+            # For forces, we use the energy as a proxy (force calculation would require
+            # additional context.getState calls with getForces=True)
+            # Approximate force magnitude from energy gradient
+            vdw_force_solvent[i] = abs(lj_energy) / n_atoms_in_residue
+            es_force_solvent[i] = abs(coulomb_energy) / n_atoms_in_residue
+            
+            # Clean up
+            del context
+            del integrator
+        
+        return vdw_energy_solvent, es_energy_solvent, vdw_force_solvent, es_force_solvent
+
+    def _calculate_pairwise_energies(
+        self,
+        positions: np.ndarray,
+        subtract_solvent: bool = True
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Calculate pairwise residue-residue interaction energies and forces.
+
+        Uses Lennard-Jones potential for VdW and Coulomb's law for electrostatics.
+        Separates attractive and repulsive contributions for both energies.
+        
+        If subtract_solvent=True, the residue-solvent interaction energies are
+        subtracted from the diagonal elements, providing a measure of the 
+        desolvation penalty for each residue pair interaction.
+        
+        WARNING: subtract_solvent=True is computationally expensive as it
+        iterates over all solvent atoms for each protein residue.
+
+        Args:
+            positions (np.ndarray): Current atomic positions in nanometers.
+            subtract_solvent (bool): If True, subtract residue-solvent energies
+                from the pairwise energies. This approximates the desolvation 
+                penalty when two residues interact. Defaults to False.
 
         Returns:
             tuple: Eight NxN matrices:
@@ -887,24 +1284,19 @@ class NonBondedForceModel:
                 - vdw_energy_repulsive: Repulsive VdW energies (kJ/mol)
                 - es_energy_attractive: Attractive electrostatic energies (kJ/mol)
                 - es_energy_repulsive: Repulsive electrostatic energies (kJ/mol)
-                - vdw_force_attractive: Attractive VdW forces (kJ/(mol·nm))
-                - vdw_force_repulsive: Repulsive VdW forces (kJ/(mol·nm))
-                - es_force_attractive: Attractive electrostatic forces (kJ/(mol·nm))
-                - es_force_repulsive: Repulsive electrostatic forces (kJ/(mol·nm))
         """
         n_residues = len(self.protein_residue_indices)
+        
+        # Calculate residue-solvent energies if needed for subtraction
+        if subtract_solvent:
+            (vdw_solv, es_solv, 
+             vdw_force_solv, es_force_solv) = self._calculate_residue_solvent_energies(positions)
         
         # Energy matrices
         vdw_energy_attractive = np.zeros((n_residues, n_residues))
         vdw_energy_repulsive = np.zeros((n_residues, n_residues))
         es_energy_attractive = np.zeros((n_residues, n_residues))
         es_energy_repulsive = np.zeros((n_residues, n_residues))
-        
-        # Force matrices (scalar magnitudes, positive = repulsive, negative = attractive)
-        vdw_force_attractive = np.zeros((n_residues, n_residues))
-        vdw_force_repulsive = np.zeros((n_residues, n_residues))
-        es_force_attractive = np.zeros((n_residues, n_residues))
-        es_force_repulsive = np.zeros((n_residues, n_residues))
         
         # Get nonbonded force parameters from the system
         nonbonded_force = None
@@ -934,12 +1326,6 @@ class NonBondedForceModel:
                 vdw_energy_rep_ij = 0.0
                 es_energy_att_ij = 0.0
                 es_energy_rep_ij = 0.0
-                
-                # Force accumulators
-                vdw_force_att_ij = 0.0
-                vdw_force_rep_ij = 0.0
-                es_force_att_ij = 0.0
-                es_force_rep_ij = 0.0
                 
                 for atom_i in atoms_i:
                     charge_i, sigma_i, epsilon_i = nonbonded_force.getParticleParameters(atom_i)
@@ -977,25 +1363,13 @@ class NonBondedForceModel:
                         # Attractive term (r^-6)
                         vdw_energy_att_ij += -4 * epsilon_ij * sr6
                         
-                        # LJ Force: F = (24*eps/r) * [2*(sigma/r)^12 - (sigma/r)^6]
-                        # Repulsive force term: (48*eps/r) * (sigma/r)^12
-                        vdw_force_rep_ij += (48 * epsilon_ij / r) * sr12
-                        # Attractive force term: -(24*eps/r) * (sigma/r)^6
-                        vdw_force_att_ij += -(24 * epsilon_ij / r) * sr6
-                        
                         # Coulomb potential: k * q1 * q2 / r
                         es_energy = k_coulomb * charge_i * charge_j / r
                         
-                        # Coulomb force: F = k * q1 * q2 / r^2
-                        # Positive = repulsive (like charges), Negative = attractive (opposite charges)
-                        es_force = k_coulomb * charge_i * charge_j / (r * r)
-                        
                         if es_energy > 0:
                             es_energy_rep_ij += es_energy
-                            es_force_rep_ij += es_force
                         else:
                             es_energy_att_ij += es_energy
-                            es_force_att_ij += es_force
                 
                 # Normalize by number of atom pairs
                 norm_factor = len(atoms_i) * len(atoms_j)
@@ -1003,25 +1377,31 @@ class NonBondedForceModel:
                 vdw_energy_rep_ij /= norm_factor
                 es_energy_att_ij /= norm_factor
                 es_energy_rep_ij /= norm_factor
-                vdw_force_att_ij /= norm_factor
-                vdw_force_rep_ij /= norm_factor
-                es_force_att_ij /= norm_factor
-                es_force_rep_ij /= norm_factor
     
                 # Store in matrices (upper triangle)
                 vdw_energy_attractive[i, j] = vdw_energy_att_ij
                 vdw_energy_repulsive[i, j] = vdw_energy_rep_ij
                 es_energy_attractive[i, j] = es_energy_att_ij
                 es_energy_repulsive[i, j] = es_energy_rep_ij
-                vdw_force_attractive[i, j] = vdw_force_att_ij
-                vdw_force_repulsive[i, j] = vdw_force_rep_ij
-                es_force_attractive[i, j] = es_force_att_ij
-                es_force_repulsive[i, j] = es_force_rep_ij
         
-        return (vdw_energy_attractive, vdw_energy_repulsive, es_energy_attractive, es_energy_repulsive,
-                vdw_force_attractive, vdw_force_repulsive, es_force_attractive, es_force_repulsive)
+        # Subtract residue-solvent energies if requested
+        # This approximates the desolvation penalty: when residues i and j interact,
+        # they partially lose their interactions with solvent
+        if subtract_solvent:
+            for i in range(n_residues):
+                for j in range(i + 1, n_residues):
+                    # Average the solvent energies of both residues involved
+                    # This represents the "desolvation cost" of forming this contact
+                    avg_vdw_solv = (vdw_solv[i] + vdw_solv[j]) / 2
+                    avg_es_solv = (es_solv[i] + es_solv[j]) / 2
+                    
+                    # Subtract from attractive terms (solvent interaction is typically stabilizing)
+                    vdw_energy_attractive[i, j] -= avg_vdw_solv
+                    es_energy_attractive[i, j] -= avg_es_solv
+        
+        return (vdw_energy_attractive, vdw_energy_repulsive, es_energy_attractive, es_energy_repulsive)
     
-    def _calculate_pairwise_energies_get_potential(self) -> tuple[np.ndarray, np.ndarray]:
+    def _calculate_pairwise_energies_get_potential(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Calculate pairwise residue-residue interaction energies using OpenMM's getPotentialEnergy.
 
         This method uses OpenMM's parameter offset feature to compute interaction
@@ -1051,8 +1431,10 @@ class NonBondedForceModel:
         n_residues = len(self.protein_residue_indices)
         
         # Initialize energy matrices
-        lj_interaction_energies = np.zeros((n_residues, n_residues))
-        coulomb_interaction_energies = np.zeros((n_residues, n_residues))
+        vdw_energy_attractive = np.zeros((n_residues, n_residues))
+        vdw_energy_repulsive = np.zeros((n_residues, n_residues))
+        es_energy_attractive = np.zeros((n_residues, n_residues))
+        es_energy_repulsive = np.zeros((n_residues, n_residues))
         
         # Get all protein atom indices for reference
         all_protein_atoms = set()
@@ -1061,7 +1443,7 @@ class NonBondedForceModel:
         
         print(f"Calculating pairwise energies for {n_residues} residues...")
         total_pairs = n_residues * (n_residues - 1) // 2
-        pair_count = 0
+        # pair_count = 0
         
         # Calculate pairwise energies between protein residues
         for i, res_i in enumerate(self.protein_residue_indices):
@@ -1153,12 +1535,22 @@ class NonBondedForceModel:
                 lj_interaction = total_lj - res_i_lj - res_j_lj
                 
                 # Store results (convert to float, remove units)
-                lj_interaction_energies[i, j] = lj_interaction.value_in_unit(kilojoules_per_mole)
-                coulomb_interaction_energies[i, j] = coulomb_interaction.value_in_unit(kilojoules_per_mole)
+                lj_interaction_energy = lj_interaction.value_in_unit(kilojoules_per_mole)
+                coulomb_interaction_energy = coulomb_interaction.value_in_unit(kilojoules_per_mole)
+
+                if lj_interaction_energy < 0:
+                    vdw_energy_attractive[i, j] = lj_interaction_energy
+                else:
+                    vdw_energy_repulsive[i, j] = lj_interaction_energy
+
+                if coulomb_interaction_energy < 0:
+                    es_energy_attractive[i, j] = coulomb_interaction_energy
+                else:
+                    es_energy_repulsive[i, j] = coulomb_interaction_energy
                 
-                pair_count += 1
-                if pair_count % 100 == 0:
-                    print(f"  Processed {pair_count}/{total_pairs} residue pairs...")
+                # pair_count += 1
+                # if pair_count % 100 == 0:
+                #     print(f"  Processed {pair_count}/{total_pairs} residue pairs...")
                 
                 # Clean up context
                 del context
@@ -1166,7 +1558,7 @@ class NonBondedForceModel:
         
         print(f"Completed pairwise energy calculations for {total_pairs} pairs.")
         
-        return lj_interaction_energies, coulomb_interaction_energies
+        return (vdw_energy_attractive, vdw_energy_repulsive, es_energy_attractive, es_energy_repulsive)
     
     def run_full_pipeline(
         self,
@@ -1174,7 +1566,9 @@ class NonBondedForceModel:
         nvt_steps: int = DEFAULT_NVT_STEPS,
         production_steps: int = DEFAULT_PRODUCTION_STEPS,
         energy_calc_interval: int = 10000,
-        return_simulated_pdb: bool = False
+        return_simulated_pdb: bool = False,
+        subtract_solvent_energies: bool = True,
+        debug: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                np.ndarray, np.ndarray, np.ndarray, np.ndarray] | \
          tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
@@ -1195,6 +1589,8 @@ class NonBondedForceModel:
             energy_calc_interval (int): Interval for calculating energies/forces.
             return_simulated_pdb (bool): If True, return the final production
                 structure as a PDB stream. Defaults to False.
+            debug (bool): If True, print additional information during the pipeline
+                such as energy statistics and graphs.
 
         Returns:
             tuple[np.ndarray, ...]: Eight NxN matrices (or nine items if
@@ -1203,16 +1599,15 @@ class NonBondedForceModel:
                 - vdw_repulsive: Repulsive VdW energies (kJ/mol)
                 - es_attractive: Attractive electrostatic energies (kJ/mol)
                 - es_repulsive: Repulsive electrostatic energies (kJ/mol)
-                - vdw_force_attractive: Attractive VdW forces (kJ/(mol·nm))
-                - vdw_force_repulsive: Repulsive VdW forces (kJ/(mol·nm))
-                - es_force_attractive: Attractive electrostatic forces (kJ/(mol·nm))
-                - es_force_repulsive: Repulsive electrostatic forces (kJ/(mol·nm))
                 - production_pdb (io.StringIO): Final production structure as PDB
                     stream (only if return_simulated_pdb=True)
         """
         print("=" * 60)
         print("Starting full MD simulation pipeline")
         print("=" * 60)
+        
+        # Set debug mode for energy logging and plotting
+        self.debug = debug
         
         # Step 1: Setup system
         print("\n[Step 1/5] Setting up system...")
@@ -1236,8 +1631,8 @@ class NonBondedForceModel:
         print("\n[Step 5/5] Production MD...")
         results = self.run_production(
             steps=production_steps,
-            energy_calc_interval=energy_calc_interval
-        )
+            energy_calc_interval=energy_calc_interval,
+            subtract_solvent=subtract_solvent_energies)
         
         # Capture production structure if requested
         production_pdb_stream = None

@@ -26,10 +26,13 @@ if __name__ == '__main__':
                         help="Recreate / overwrite Proteograms.")    
     parser.add_argument('--verbose',
                         action='store_true',
-                        help="Verbose output and logging.")
+                        help="Verbose output.")
+    parser.add_argument('--debug',
+                        action='store_true',
+                        help="Enable debug mode with additional logging and plots.")
     parser.add_argument('--save_simulated_pdb',
                         action='store_true',
-                        help="Save the final simulated PDB structure from MD simulation.")
+                        help="Save the final simulated PDB structure and energy graphs from MD simulation.")
     args = parser.parse_args()
 
     start = time()
@@ -67,28 +70,34 @@ if __name__ == '__main__':
             os.makedirs(production_pdb_output_dir)
             print(f'Created directory {production_pdb_output_dir} for production structures.')
 
-    pdb_files = glob.glob(os.path.join(structures_dir, '*'))
+    pdb_files = glob.glob(os.path.join(structures_dir, '**', '*'),
+                          recursive=True)
     existing_image_files = glob.glob(
             os.path.join(proteograms_output_dir, '*'))
 
     # Make a list of (pdb-file-name, image-file-name) tuples as input
     # to process pool
     file_list = []
-    exts = ['ent', 'mmcif', 'cif' 'pdb']
+    exts = ['ent', 'mmcif', 'cif', 'pdb']
     for pdb_file in pdb_files:
         bname =  os.path.basename(pdb_file)
-        # There are structure files we wish to limit to
-        if limit_to_these_structs:
-            if bname not in limit_to_these_structs:
-                continue
+        if len(bname.split('.')) == 1:
+            # If there is no extension, add .ent as default
+            bname += '.ent'
         
-        chain_id = bname[1:5].upper()+':'+ bname[5].upper()
-
         # name without extensions
         bname_noext = bname
         if bname.split('.')[-1] in exts:
             for x in exts:
-                bname_noext.replace(x, '')
+                bname_noext = bname_noext.replace(f'.{x}', '')
+        
+        # There are structure files we wish to limit to
+        # Compare using basename without extension since limit file may not include extensions
+        if limit_to_these_structs:
+            if bname_noext not in limit_to_these_structs and bname not in limit_to_these_structs:
+                continue
+        
+        chain_id = bname[1:5].upper()+':'+ bname[5].upper()
         
         image_file = os.path.join(proteograms_output_dir,
                 f'{bname_noext}.jpg')
@@ -111,6 +120,11 @@ if __name__ == '__main__':
             bname =  os.path.basename(pdb_file)
             chain_id = bname[5].upper()
             # Create ProteogramV2 instance
+            # Note: the cutoff values are in Angstroms for distance and
+            # and are chosen to balance capturing meaningful interactions 
+            # while managing computational cost. These can be adjusted along
+            # with sequence length cutoffs based on the specific proteins 
+            # being analyzed.
             proteogram = ProteogramV2(pdb_file,
                                       chain_id,
                                       atom_distance_cutoff=20,
@@ -122,9 +136,13 @@ if __name__ == '__main__':
             # Calculate Proteogram with optional simulated PDB output
             if args.save_simulated_pdb:
                 final_data, err, simulated_pdb_stream = proteogram.calculate_proteogram(
-                    return_simulated_pdb=True)
+                    return_simulated_pdb=True,
+                    subtract_solvent_energies=True,
+                    debug=args.debug)
             else:
-                final_data, err = proteogram.calculate_proteogram()
+                final_data, err = proteogram.calculate_proteogram(
+                    subtract_solvent_energies=True,
+                    debug=args.debug)
                 simulated_pdb_stream = None
 
             if err is not None and args.verbose:
