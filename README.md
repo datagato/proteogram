@@ -209,9 +209,68 @@ The following table provides an overview of all scripts in the `scripts/` folder
 
 This repo is dockerized to run scripts under `/scripts` (e.g. measure_similarity.py, create_proteograms.py etc.)
 
+## CPU vs GPU containers (important)
+
+Docker images do **not** automatically get GPU access at build time.
+GPU access is assigned **when you run the container**.
+
+- Use a CPU image/container for CPU workflows.
+- Use a GPU-capable image/container for GPU workflows.
+- Start the GPU container with `--gpus ...` (or the equivalent in Compose/Kubernetes).
+
+Also note: `--platform` (for example `linux/amd64` or `linux/arm64`) controls CPU architecture, **not** whether GPU is attached.
+
 ## Prerequisites
 - Docker installed
 - `uv.lock` present in repo root (recommended for reproducible builds)
+- For GPU containers: NVIDIA driver + NVIDIA Container Toolkit installed on the host
+
+## `uv.lock` usage (important for Docker builds)
+
+Both Dockerfiles install dependencies with:
+
+```bash
+uv sync --active --frozen ...
+```
+
+`--frozen` means the build will fail if `uv.lock` is missing or out of sync with
+`pyproject.toml`.
+
+### When you change dependencies
+
+If you edit `pyproject.toml` (or dependency extras), regenerate and commit the lockfile:
+
+```bash
+uv lock
+uv sync --frozen
+git add pyproject.toml uv.lock
+```
+
+### Common error: lockfile mismatch
+
+If Docker build fails around `uv sync --frozen`, run:
+
+```bash
+uv lock
+```
+
+Then rebuild the image.
+
+## Supported Docker platforms
+
+- **CPU image (`Dockerfile`)**
+  - Intended for standard Linux Docker platforms.
+  - Commonly works on: `linux/amd64`, `linux/arm64`.
+
+- **GPU image (`Dockerfile.gpu`)**
+  - Intended for Linux hosts with NVIDIA GPU runtime support.
+  - Primary supported platform: `linux/amd64`.
+
+### Notes on platform vs GPU
+
+- `--platform` selects CPU architecture (for example `linux/amd64`, `linux/arm64`).
+- GPU access is assigned at runtime with `--gpus ...`.
+- GPU use also depends on host setup (NVIDIA drivers + NVIDIA Container Toolkit).
 
 ---
 
@@ -222,6 +281,21 @@ From the repo root (the folder that contains `Dockerfile`, `pyproject.toml`, `uv
 ```
 sudo docker build -t proteogram:dev .
 ```
+
+For clarity, build/tag CPU and GPU images explicitly:
+
+```bash
+sudo docker build -t proteogram:cpu .
+```
+
+GPU image (uses `Dockerfile.gpu` and installs `cuda12` extra dependencies via uv):
+
+```bash
+sudo docker build -f Dockerfile.gpu -t proteogram:gpu .
+```
+
+> `Dockerfile` = CPU image; `Dockerfile.gpu` = GPU-capable Python environment.
+> GPU access is still granted only at runtime with `--gpus ...`.
 
 ## Verify the image
 
@@ -234,6 +308,39 @@ Verify scripts inside the container
 ```
 docker run --rm proteogram:dev python scripts/measure_similarity.py
 ```
+
+## Run CPU container
+
+Run normally (no GPU flags):
+
+```bash
+docker run --rm -it proteogram:cpu bash
+```
+
+## Run GPU container
+
+Assign GPU at runtime with Docker's `--gpus` flag:
+
+```bash
+docker run --rm --gpus all -it proteogram:gpu bash
+```
+
+Use a specific GPU device (example GPU 0 only):
+
+```bash
+docker run --rm --gpus '"device=0"' -it proteogram:gpu bash
+```
+
+Verify OpenMM can see CUDA platform in GPU container:
+
+```bash
+docker run --rm --gpus all proteogram:gpu \
+  python -c "from openmm import Platform; print([Platform.getPlatform(i).getName() for i in range(Platform.getNumPlatforms())])"
+```
+
+You should see `CUDA` in the printed platform list.
+
+For CPU-only service, use `proteogram:cpu` and omit GPU device reservations.
 
 Interactively login to container and inspect the contents to see expected files.
 ```

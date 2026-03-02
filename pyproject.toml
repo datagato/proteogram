@@ -3,10 +3,18 @@ name = "proteogram"
 version = "0.0.3"
 description = "Protein structure to image manipulation and analysis."
 requires-python = ">=3.11"
-dynamic = ["dependencies"]
-
-[tool.setuptools.dynamic]
-dependencies = {file = ["requirements.txt"]}
+dependencies = [
+  "biopython>=1.8",
+  "pandas>=2.2.2",
+  "matplotlib>=3.6",
+  "ase==3.23.0",
+  "numpy>=1",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "torchsummary>=1.5",
+  "kmeans-pytorch>=0.3",
+  "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main"
+]
 
 [project.optional-dependencies]
 cuda12 = [
@@ -22,7 +30,7 @@ notebook = [
 
 [tool.setuptools.packages.find]
 # Exclude patterns should match the full package name
-exclude = ["assets", "paper", "notebooks", "scripts", "tmp"] 
+exclude = ["assets", "docs", "paper", "notebooks", "scripts", "tmp"] 
 
 [build-system]
 requires = ["setuptools>=61.0"]
