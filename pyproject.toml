@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda12 = [
+  "openmm==8.4.0",
   "nvidia-cuda-nvcc-cu12==12.9.86",
   "openmm-cuda-12==8.4.0.post2"
 ]
