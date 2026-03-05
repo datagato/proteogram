@@ -9,6 +9,7 @@ dependencies = [
   "matplotlib>=3.6",
   "ase==3.23.0",
   "numpy>=1",
+  "PyYAML>=6.0",
   "torch>=2.2",
   "torchvision>=0.17",
   "torchsummary>=1.5",
