@@ -126,31 +126,31 @@ The `NonBondedForceModel` module provides a complete pipeline for running molecu
 from proteogram.nonbonded_forces import NonBondedForceModel
 import numpy as np
 
-# Initialize the model
 model = NonBondedForceModel(
     pdb_path='protein.pdb',
-    temperature=300.0,  # Kelvin
-    use_gpu=False       # Set True for GPU acceleration
+    temperature=311.75,   # Kelvin
+    pressure=1.0,         # atmospheres
+    padding=1.0,          # nanometers (water box padding around protein)
+    timestep=2.0,         # femtoseconds
+    use_gpu=False,
+    output_dir='output'
 )
 
-# Run the full MD pipeline
-(vdw_e_att, vdw_e_rep, es_e_att, es_e_rep,
- vdw_f_att, vdw_f_rep, es_f_att, es_f_rep, 
- simulated_pdb_stream) = model.run_full_pipeline(
-    npt_steps=50000,           # 100 ps NPT equilibration
-    nvt_steps=50000,           # 100 ps NVT equilibration
-    production_steps=500000,   # 1 ns production
-    energy_calc_interval=10000,# Calculate energies every 20 ps
-    return_simulated_pdb=True  # Return final structure
+# Full MD pipeline. Returns 4 matrices (vdw/es attractive/repulsive).
+vdw_attractive, vdw_repulsive, es_attractive, es_repulsive = model.run_full_pipeline(
+    npt_steps=50000,           # steps (50,000 × 2 fs = 100 ps NPT equilibration)
+    nvt_steps=50000,           # steps (50,000 × 2 fs = 100 ps NVT equilibration)
+    production_steps=500000,   # steps (500,000 × 2 fs = 1 ns production run)
+    energy_calc_interval=10000, # steps between energy snapshots (10,000 × 2 fs = 20 ps; 50 frames total)
+    return_simulated_pdb=False,
+    subtract_solvent_energies=True,
+    debug=True
 )
 
-# Save the final simulated structure
-with open('simulated_structure.pdb', 'w') as f:
-    f.write(simulated_pdb_stream.read())
+print('VdW attractive matrix shape:', vdw_attractive.shape)
+print('Electrostatic repulsive matrix shape:', es_repulsive.shape)
 
-# Save energy and force matrices
-np.save('vdw_energy_attractive.npy', vdw_e_att)
-np.save('vdw_force_attractive.npy', vdw_f_att)
+model.cleanup()
 ```
 
 For detailed information on the MD simulation methodology, force calculations, and energy validation, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).

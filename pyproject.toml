@@ -5,16 +5,22 @@ description = "Protein structure to image manipulation and analysis."
 requires-python = ">=3.11"
 dependencies = [
   "biopython>=1.8",
-  "pandas>=2.2.2",
   "matplotlib>=3.6",
-  "ase==3.23.0",
-  "numpy>=1",
-  "PyYAML>=6.0",
+  "MDAnalysis[analysis,extra_formats,parallel]>=2.10.0",
+  "numpy>=1.26",
+  "openmm>=8.4",
+  "pandas>=3.0",
+  "pdbfixer @ git+https://github.com/openmm/pdbfixer@94cfa4c",
+  "pillow>=12.1",
   "torch>=2.2",
   "torchvision>=0.17",
   "torchsummary>=1.5",
   "kmeans-pytorch>=0.3",
-  "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main"
+  "tqdm>=4.67",
+  "psutil>=7.2.2",
+  "objgraph>=3.6.2",
+  "PyYAML>=6.0",
+  "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main",
 ]
 
 [project.optional-dependencies]

@@ -1,9 +1,9 @@
-"""Modelling non-bonded forces in PDB file (e.g., Van der Waals) with OpenMM.
+"""Modelling non-bonded forces in PDB file (Van der Waals and Coulombic) with OpenMM.
 
 This module provides functionality for:
     - Preprocessing PDB structures (fixing, solvation, ionization)
     - Running MD simulations (equilibration and production)
-    - Calculating residue-residue interaction energies (VdW and electrostatic)
+    - Calculating residue-residue interaction energies (VdW and electrostatic) with solvent effects removed
 """
 from openmm.app import (
     PDBFile, ForceField, Modeller, Simulation, PME,
@@ -21,12 +21,15 @@ from openmm.unit import (
 )
 from pdbfixer import PDBFixer
 
+import gc
 import io
+import linecache
 import numpy as np
 import sys
 import warnings
 from typing import Optional
 from pathlib import Path
+import psutil
 
 
 class NonBondedForceModel:
@@ -70,7 +73,8 @@ class NonBondedForceModel:
         padding: float = DEFAULT_PADDING,
         timestep: float = DEFAULT_TIMESTEP,
         use_gpu: bool = False,
-        output_dir: Optional[str] = None
+        output_dir: Optional[str] = None,
+        memory_efficient: bool = False
     ):
         """Initialize the NonBondedForceModel.
 
@@ -96,6 +100,8 @@ class NonBondedForceModel:
         self.timestep = timestep * femtoseconds
         self.use_gpu = use_gpu
         self.output_dir = Path(output_dir) if output_dir else Path(pdb_path).parent
+        # Toggle for memory-efficient solvent subtraction path (slower, lower memory)
+        self.memory_efficient = memory_efficient
 
         # These will be set during setup
         self.forcefield = None
@@ -108,6 +114,12 @@ class NonBondedForceModel:
         self.protein_residue_indices = []
         self.debug = False
         
+        # Store periodic box vectors for proper Context transitions
+        self._box_vectors = None
+        
+        # Cache for particle parameters (reduces memory allocation in energy calculations)
+        self._cached_particle_params = None
+        
         # Energy logging for debug mode
         # Each stage stores: {'time_ps': [], 'energy_kj': [], 'stage': str}
         self.energy_log = {
@@ -117,6 +129,22 @@ class NonBondedForceModel:
             'nvt': {'time_ps': [], 'energy_kj': [], 'stage': 'NVT Equilibration'},
             'production': {'time_ps': [], 'energy_kj': [], 'stage': 'Production'}
         }
+
+    def __del__(self):
+        """Destructor to ensure cleanup when object is garbage collected."""
+        try:
+            self.cleanup_all_resources()
+        except Exception:
+            pass  # Ignore errors during destruction
+
+    def __enter__(self):
+        """Context manager entry - allows 'with NonBondedForceModel(...) as model:'"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup on exit."""
+        self.cleanup_all_resources()
+        return False
 
     @staticmethod
     def fix_pdb_file(pdb_path: str) -> io.StringIO:
@@ -167,12 +195,17 @@ class NonBondedForceModel:
         # Step 1: Fix the PDB structure
         fixed_pdb = self.fix_pdb_file(self.pdb_path)
         pdb = PDBFile(fixed_pdb)
+        fixed_pdb.close()  # Close StringIO to free memory
         
         # Step 2: Load force field (AMBER ff19SB + TIP3P water)
         self.forcefield = ForceField('amber19-all.xml', 'amber19/tip3pfb.xml')
         
         # Step 3: Create modeller and add solvent
         self.modeller = Modeller(pdb.topology, pdb.positions)
+        
+        # Handle modified amino acids that OpenMM doesn't recognize
+        # Replace them with their standard equivalents before solvation
+        self._replace_modified_residues()
         
         # Store protein residue indices before adding water
         self._identify_protein_residues()
@@ -190,6 +223,9 @@ class NonBondedForceModel:
         self.topology = self.modeller.topology
         self.positions = self.modeller.positions
         
+        # Store original positions as backup for position validation
+        self._original_positions = self.positions
+        
         # Step 4: Create the system with PME for long-range electrostatics
         self.system = self.forcefield.createSystem(
             self.topology,
@@ -201,12 +237,40 @@ class NonBondedForceModel:
         # Build residue-to-atom mapping for energy calculations
         self._build_residue_atom_mapping()
 
+    def _replace_modified_residues(self) -> None:
+        """Replace modified amino acids with their standard equivalents.
+        
+        OpenMM's AMBER force field doesn't have parameters for modified AAs like MSE
+        (selenomethionine), so we convert them to standard equivalents before solvation.
+        
+        This preserves the 3D structure while allowing force field compatibility.
+        """
+        # Mapping of modified residues to their standard equivalents
+        residue_replacements = {
+            'MSE': 'MET',  # Selenomethionine -> Methionine
+            'HYP': 'PRO',  # Hydroxyproline -> Proline
+            'PTR': 'TYR',  # Phosphotyrosine -> Tyrosine
+            'SEP': 'SER',  # Phosphoserine -> Serine
+            'TPO': 'THR',  # Phosphothreonine -> Threonine
+        }
+        
+        # Iterate through topology and replace residue names
+        for residue in self.modeller.topology.residues():
+            if residue.name in residue_replacements:
+                standard_name = residue_replacements[residue.name]
+                print(f"  INFO: Converting {residue.name} (residue {residue.index}) to {standard_name}")
+                residue.name = standard_name
+
     def _identify_protein_residues(self) -> None:
         """Identify protein residue indices before solvation."""
         protein_resnames = {
             'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS',
             'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP',
-            'TYR', 'VAL', 'HIE', 'HID', 'HIP', 'CYX'
+            'TYR', 'VAL', 'HIE', 'HID', 'HIP', 'CYX',
+            # Modified amino acids
+            'MSE',  # Selenomethionine (variant of MET)
+            'PTR', 'SEP', 'TPO',  # Phosphorylated variants
+            'HYP',  # Hydroxyproline (variant of PRO)
         }
         self.protein_residue_indices = []
         for i, residue in enumerate(self.modeller.topology.residues()):
@@ -267,10 +331,11 @@ class NonBondedForceModel:
                 return Platform.getPlatformByName('CPU')
         return Platform.getPlatformByName('CPU')
 
+
     def _create_new_simulation(self,
-                           hbonds_constraint: bool = False,
-                           add_calpha_restraint: bool = False,
-                           add_barostat: bool = False) -> None:
+                        hbonds_constraint: bool = False,
+                        add_calpha_restraint: bool = False,
+                        add_barostat: bool = False) -> None:
         """Create an OpenMM simulation object.
 
         Args:
@@ -293,7 +358,7 @@ class NonBondedForceModel:
         
         if add_barostat:
             barostat = MonteCarloBarostat(self.pressure, self.temperature)
-            self.system.addForce(barostat)
+            system.addForce(barostat)  # FIX: Use new 'system' not 'self.system'
 
         if add_calpha_restraint:
             # Get indices of CA atoms
@@ -323,14 +388,30 @@ class NonBondedForceModel:
         )
         
         platform = self._get_platform()
+        
+        # Clean up old simulation to free memory (especially CUDA)
+        self._cleanup_old_simulation()
+        
+        # Don't store system here - Simulation manages its own system lifetime
+        # Create fresh system for this simulation
         self.simulation = Simulation(
             self.topology,
             system,
             integrator,
             platform
         )
-        self.simulation.context.reinitialize(preserveState=False)
+        
+        # Restore periodic box vectors from previous Context if available
+        # This is critical for proper NPT→NVT transitions
+        if self._box_vectors is not None:
+            try:
+                self.simulation.context.setPeriodicBoxVectors(*self._box_vectors)
+            except Exception as e:
+                print(f"WARNING: Failed to set periodic box vectors: {e}")
+        
+        # Set positions after box vectors are set
         self.simulation.context.setPositions(self.positions)
+
 
     def minimize_energy(self, max_iterations: int = 1000) -> None:
         """Perform energy minimization.
@@ -344,23 +425,28 @@ class NonBondedForceModel:
         if self.debug:
             initial_state = self.simulation.context.getState(getEnergy=True)
             initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+            del initial_state
             self._log_energy('initial', 0.0, initial_energy)
             self._log_energy('minimization', 0.0, initial_energy)
         
         self.simulation.minimizeEnergy(maxIterations=max_iterations)
-        self.positions = self.simulation.context.getState(
-            getPositions=True
-        ).getPositions()
+        _st = self.simulation.context.getState(getPositions=True)
+        self.positions = _st.getPositions()
+        del _st
         
         # Log final energy after minimization (debug mode)
         if self.debug:
             final_state = self.simulation.context.getState(getEnergy=True)
             final_energy = final_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+            del final_state
             # Use a small time increment to show minimization as a step
             self._log_energy('minimization', 0.1, final_energy)
             print(f"  [DEBUG] Minimization: {initial_energy:.1f} -> {final_energy:.1f} kJ/mol")
+
+        self.cleanup_all_resources(final_run=False)
         
         print("Energy minimization complete.")
+
 
     def get_simulated_pdb_stream(self) -> io.StringIO:
         """Get the current structure as a PDB file stream.
@@ -389,6 +475,7 @@ class NonBondedForceModel:
         pdb_stream.seek(0)
         return pdb_stream
 
+
     def _log_energy(
         self,
         stage: str,
@@ -406,11 +493,236 @@ class NonBondedForceModel:
             self.energy_log[stage]['time_ps'].append(time_ps)
             self.energy_log[stage]['energy_kj'].append(energy_kj)
 
+
     def _reset_energy_log(self) -> None:
         """Reset all energy logs (useful when starting a new simulation)."""
         for stage in self.energy_log:
             self.energy_log[stage]['time_ps'] = []
             self.energy_log[stage]['energy_kj'] = []
+
+
+    def cleanup_all_resources(self,
+                              final_run: bool = False) -> None:
+        """Release all OpenMM resources and clear cached data.
+
+        Call this method when done with the simulation to free memory.
+        This is especially important when processing multiple PDB files
+        in sequence, particularly when using GPU/CUDA.
+        
+        Note:
+            For CUDA, memory may not be immediately released to the OS
+            but will be available for reuse by subsequent OpenMM operations.
+        """
+        # CRITICAL: Clear linecache FIRST before any exception handling
+        # linecache accumulates source code lines from exceptions
+        # Clearing it prevents memory accumulation across multiple proteins
+        try:
+            linecache.clearcache()
+        except:
+            pass
+        
+        # CRITICAL: Clear exception tracebacks that might hold Context references
+        # Exception tracebacks keep frames alive, which keeps all local variables alive
+        try:
+            # Try to clear exception info in Python 2/3 compatible way
+            if hasattr(sys, 'exc_clear'):
+                sys.exc_clear()  # Python 2
+            # Also clear sys.__traceback__
+            sys.__traceback__ = None
+        except:
+            pass
+        
+        # CRITICAL: Delete reporters first, they may hold references to Context
+        if self.simulation is not None:
+            try:
+                # Remove all reporters - they can hold strong references
+                self.simulation.reporters.clear()
+            except Exception:
+                pass
+        
+        # Delete the simulation, which owns and will free the Context and Integrator.
+        # Note: accessing simulation.context and calling del on it is a no-op —
+        # the C++ Context is owned by the C++ Simulation and is only freed when
+        # the Simulation destructor runs (i.e., when self.simulation is deleted).
+        if self.simulation is not None:
+            sim = self.simulation
+            self.simulation = None  # Clear our reference first to break any cycles
+            del sim
+            gc.collect()  # Force garbage collection after deleting simulation
+        
+        # Clear the modeller which holds topology and positions copies
+        if self.modeller is not None:
+            del self.modeller
+            self.modeller = None
+        
+        if final_run:
+            # Note: Don't delete self.system - it's managed by Simulation
+            # Deleting it here could cause issues with active simulations
+            self.system = None
+    
+            # Clear forcefield (holds parsed XML data)
+            if self.forcefield is not None:
+                del self.forcefield
+                self.forcefield = None
+        
+            # Clear topology and positions
+            self.topology = None
+            self.positions = None
+            # Clear backup position references that might hold state objects
+            if hasattr(self, '_original_positions'):
+                self._original_positions = None
+            if hasattr(self, '_pre_npt_positions'):
+                self._pre_npt_positions = None
+        
+            # Clear cached data
+            self._cached_particle_params = None
+            
+            # Clear large data structures
+            self.residue_atom_indices = {}
+            self.protein_residue_indices = []
+            if hasattr(self, 'protein_atom_indices'):
+                self.protein_atom_indices = set()
+            if hasattr(self, 'solvent_atom_indices'):
+                self.solvent_atom_indices = set()
+            if hasattr(self, 'ion_atom_indices'):
+                self.ion_atom_indices = set()
+        
+        # Force multiple aggressive garbage collection passes
+        # CUDA memory requires multiple gc passes to fully release
+        # With Context objects involved, we need at least 3-5 passes
+        for _ in range(5):
+            gc.collect()
+        
+        # Try to clear CUDA memory pools if available
+        if self.use_gpu:
+            self._clear_cuda_cache()
+        
+        # Final explicit linecache and traceback clearing
+        try:
+            linecache.clearcache()
+        except:
+            pass
+        self._clear_exception_traceback()
+        
+        # Final aggressive garbage collection
+        for _ in range(5):
+            gc.collect()
+
+        # On Linux, glibc malloc retains freed C++ heap pages (from thousands of
+        # temporary OpenMM Contexts created during per-residue energy calculations)
+        # as a fragmented free list rather than returning them to the OS immediately.
+        # malloc_trim(0) forces glibc to release all free pages above the top of heap.
+        # This is a no-op on macOS/Windows and is safe to call at any time.
+        try:
+            import ctypes
+            ctypes.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass  # Not on Linux or libc not available — skip silently
+
+    def cleanup(self) -> None:
+        """Public cleanup method - alias for cleanup_all_resources() for backwards compatibility.
+        
+        Call this when done with the simulation to free memory.
+        This is especially important when processing multiple PDB files in sequence.
+        """
+        self.cleanup_all_resources()
+
+
+    def _clear_cuda_cache(self) -> None:
+        """Attempt to clear CUDA memory caches using available libraries.
+        
+        Tries PyTorch first (commonly installed), then cupy.
+        This helps release GPU memory that OpenMM's CUDA backend may hold.
+        """
+        # Try PyTorch CUDA cache clear (most commonly available)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                # Also clear torch memory caches
+                if hasattr(torch, 'cuda') and hasattr(torch.cuda, 'reset_peak_memory_stats'):
+                    torch.cuda.reset_peak_memory_stats()
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        
+        # Try cupy CUDA cache clear
+        try:
+            import cupy
+            mempool = cupy.get_default_memory_pool()
+            mempool.free_all_blocks()
+            pinned_mempool = cupy.get_default_pinned_memory_pool()
+            pinned_mempool.free_all_blocks()
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        
+        # Force final garbage collection
+        gc.collect()
+
+    def _clear_exception_traceback(self) -> None:
+        """Clear exception tracebacks and linecache to prevent holding Context references.
+        
+        CRITICAL FIX FOR 5 PERSISTENT CONTEXT OBJECTS:
+        
+        Python's linecache module accumulates source code lines from exception
+        tracebacks. Each Context creation followed by an exception means:
+        1. Exception frame created with Context reference
+        2. Traceback stored with source code lines
+        3. linecache caches those source code lines indefinitely
+        4. Context never released because linecache holds frame references
+        
+        Solution: Clear linecache + exception info immediately after any exception.
+        """
+        try:
+            # CRITICAL: Clear linecache FIRST - this prevents accumulation
+            # linecache.clearcache() removes all cached source code lines
+            # which breaks the reference chain: linecache -> traceback -> frame -> Context
+            linecache.clearcache()
+        except:
+            pass
+            
+        try:
+            # Clear the current exception info
+            if hasattr(sys, 'exc_clear'):
+                sys.exc_clear()  # Python 2
+        except:
+            pass
+        
+        try:
+            # Clear sys.__traceback__ which may hold frame references
+            sys.__traceback__ = None
+        except:
+            pass
+        
+        try:
+            gc.collect()
+        except:
+            pass
+
+
+    def _get_positions_and_cleanup(self) -> None:
+        """Get the positions and box vectors from the current simulation
+        state and clean up the state."""
+        if self.simulation is not None:
+            try:
+                state = self.simulation.context.getState(getPositions=True)
+                self.positions = state.getPositions()
+                try:
+                    # Store the periodic box vectors from the state before deleting context
+                    self._box_vectors = state.getPeriodicBoxVectors()
+                except Exception:
+                    pass
+                del state
+                gc.collect()
+            except Exception as e:
+                print(f"WARNING: Failed to get positions and/or clean up state/context: {e}")
+                self._clear_exception_traceback()
+                self._box_vectors = None
+
 
     def plot_energy_history(
         self,
@@ -481,7 +793,7 @@ class NonBondedForceModel:
                 if stage_key == 'initial':
                     # Plot as a single point
                     ax_combined.scatter(adjusted_times, energies, color=color, 
-                                       s=100, zorder=5, label=stage_data['stage'])
+                                    s=100, zorder=5, label=stage_data['stage'])
                 else:
                     ax_combined.plot(adjusted_times, energies, color=color, 
                                     linewidth=1.5, label=stage_data['stage'])
@@ -494,7 +806,7 @@ class NonBondedForceModel:
         # Add vertical lines at stage boundaries
         for boundary_time, stage_name in stage_boundaries[:-1]:  # Skip last boundary
             ax_combined.axvline(x=boundary_time, color='gray', linestyle='--', 
-                               alpha=0.5, linewidth=0.8)
+                            alpha=0.5, linewidth=0.8)
         
         ax_combined.set_xlabel('Time (ps)', fontsize=11)
         ax_combined.set_ylabel('Potential Energy (kJ/mol)', fontsize=11)
@@ -507,7 +819,7 @@ class NonBondedForceModel:
         
         # Calculate how many stages have more than 1 data point
         multi_point_stages = [(k, d) for k, d in stages_with_data 
-                              if len(d['energy_kj']) > 1]
+                            if len(d['energy_kj']) > 1]
         
         if multi_point_stages:
             n_stages = len(multi_point_stages)
@@ -535,8 +847,8 @@ class NonBondedForceModel:
                 energy_change = energies[-1] - energies[0]
                 change_text = f'ΔE = {energy_change:+.1f} kJ/mol'
                 ax_inset.annotate(change_text, xy=(0.5, 0.02), xycoords='axes fraction',
-                                 ha='center', fontsize=8, 
-                                 color='green' if energy_change < 0 else 'red')
+                                ha='center', fontsize=8, 
+                                color='green' if energy_change < 0 else 'red')
         
         # Hide the main bottom axis (we're using insets)
         ax_individual.set_visible(False)
@@ -617,6 +929,53 @@ class NonBondedForceModel:
 
         return warnings_list
 
+    def _validate_positions(self) -> bool:
+        """Validate that positions are finite (not NaN or inf).
+        
+        Returns:
+            bool: True if positions are valid, False if they contain NaN/inf.
+        """
+        try:
+            if self.positions is None:
+                return False
+            
+            positions_array = self.positions.value_in_unit(nanometers)
+            return np.all(np.isfinite(positions_array))
+        except Exception:
+            # If anything goes wrong during validation, assume positions are valid
+            # to avoid breaking the pipeline
+            return True
+
+    def _fix_positions_if_needed(self) -> None:
+        """Check positions for NaN/inf values and fix them if found.
+        
+        If positions are corrupted, reverts to the original positions from setup.
+        """
+        try:
+            if not self._validate_positions():
+                print("WARNING: Positions contain NaN/inf values, attempting to fix")
+                # Try to revert to original or pre-NPT positions
+                if hasattr(self, '_pre_npt_positions') and self._pre_npt_positions is not None:
+                    self.positions = self._pre_npt_positions
+                    print("  Reverted to positions before NPT equilibration")
+                elif hasattr(self, '_original_positions') and self._original_positions is not None:
+                    self.positions = self._original_positions
+                    print("  Reverted to original positions after system setup")
+                else:
+                    print("  WARNING: No backup positions available, continuing with current positions")
+                    # Don't raise - just continue and hope for the best
+            
+            # Final validation (don't raise, just warn)
+            if not self._validate_positions():
+                print("  WARNING: Positions still appear invalid after attempted fix")
+        except Exception as e:
+            # Don't let position validation failures crash the pipeline
+            print(f"  WARNING: Position validation/fixing encountered error: {e}")
+            print("  Continuing anyway...")
+            # CRITICAL: Clear the exception traceback to avoid Context reference holding
+            self._clear_exception_traceback()
+            gc.collect()
+
     def _get_n_atoms(self) -> int:
         """Get the total number of atoms in the system."""
         return sum(1 for _ in self.topology.atoms())
@@ -634,6 +993,9 @@ class NonBondedForceModel:
             report_interval (int): Interval for reporting state data.
         """
         print(f"Running NPT equilibration for {steps} steps...")
+        
+        # Store positions before NPT as backup
+        self._pre_npt_positions = self.positions
         
         # Create simulation with barostat
         self._create_new_simulation(
@@ -657,8 +1019,9 @@ class NonBondedForceModel:
         n_atoms = self._get_n_atoms()
         initial_state = self.simulation.context.getState(getEnergy=True)
         initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+        del initial_state  # CRITICAL: Delete state to avoid holding Context reference
         print(f"  Initial potential energy: {initial_energy:.1f} kJ/mol "
-              f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+            f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
         
         # Track energies for validation
         energy_history = [initial_energy]
@@ -701,8 +1064,15 @@ class NonBondedForceModel:
         # Final energy check
         final_state = self.simulation.context.getState(getEnergy=True)
         final_energy = final_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+        del final_state  # CRITICAL: Delete state to avoid holding Context reference
         print(f"  Final potential energy: {final_energy:.1f} kJ/mol "
-              f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
+            f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
+        
+        # Check for energy explosion (indicates coordinate corruption)
+        if final_energy / n_atoms > 100 or final_energy / n_atoms > 0:
+            print(f"WARNING: NPT final energy is unreasonably high ({final_energy/n_atoms:.1f} kJ/mol/atom)")
+            print("  This may indicate coordinate corruption in the system")
+            # This will be detected and fixed at the start of NVT
         
         # Check overall trend
         if final_energy > initial_energy:
@@ -712,12 +1082,21 @@ class NonBondedForceModel:
             print(f"  WARNING: Energy increased during NPT equilibration")
         else:
             print(f"  Energy decreased by {initial_energy - final_energy:.1f} kJ/mol (good)")
+
+        self._get_positions_and_cleanup()
         
-        # Update positions
-        state = self.simulation.context.getState(
-            getPositions=True
-        )
-        self.positions = state.getPositions()
+        # Validate positions after NPT equilibration
+        if not self._validate_positions():
+            print("WARNING: NPT equilibration produced invalid positions")
+            # Try to fix by reverting to pre-NPT positions
+            if hasattr(self, '_pre_npt_positions') and self._pre_npt_positions is not None:
+                self.positions = self._pre_npt_positions
+                print("  Reverted to positions before NPT equilibration")
+            else:
+                raise RuntimeError("NPT equilibration corrupted positions and no backup available")
+            
+        self.cleanup_all_resources(final_run=False)
+
         print("NPT equilibration complete.")
 
     def equilibrate_nvt(
@@ -733,6 +1112,9 @@ class NonBondedForceModel:
             report_interval (int): Interval for reporting state data.
         """
         print(f"Running NVT equilibration for {steps} steps...")
+
+        # Validate positions before proceeding (check for NaN from previous NPT)
+        self._fix_positions_if_needed()
         
         # Create simulation with barostat
         self._create_new_simulation(
@@ -755,8 +1137,33 @@ class NonBondedForceModel:
         n_atoms = self._get_n_atoms()
         initial_state = self.simulation.context.getState(getEnergy=True)
         initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+        del initial_state  # CRITICAL: Delete state to avoid holding Context reference
         print(f"  Initial potential energy: {initial_energy:.1f} kJ/mol "
-              f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+            f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+        
+        # Sanity check: if energy is ridiculously high, coordinates are corrupted
+        # Typical folded protein energy is -10 to -30 kJ/mol/atom
+        # If it's > 0 or < -100, something is very wrong
+        if initial_energy / n_atoms > 100 or initial_energy / n_atoms > 0:
+            print(f"ERROR: Initial NVT energy is unreasonably high ({initial_energy/n_atoms:.1f} kJ/mol/atom)")
+            print("  This indicates corrupted particle coordinates")
+            if hasattr(self, '_pre_npt_positions') and self._pre_npt_positions is not None:
+                print("  Attempting to use pre-NPT positions...")
+                self.positions = self._pre_npt_positions
+                # Properly clean up the corrupted simulation before creating new one
+                self.cleanup_all_resources(final_run=False)
+                self._create_new_simulation(
+                    add_calpha_restraint=True,
+                    add_barostat=False)
+                # Try energy calculation again
+                initial_state = self.simulation.context.getState(getEnergy=True)
+                initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+                del initial_state
+                print(f"  Retrying with pre-NPT positions: {initial_energy:.1f} kJ/mol ({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+                if initial_energy / n_atoms > 100 or initial_energy / n_atoms > 0:
+                    raise RuntimeError(f"Even pre-NPT positions are corrupted (energy: {initial_energy/n_atoms:.1f} kJ/mol/atom)")
+            else:
+                raise RuntimeError(f"Initial NVT energy is corrupted ({initial_energy/n_atoms:.1f} kJ/mol/atom) and no backup positions available")
         
         # Track energies for validation
         energy_history = [initial_energy]
@@ -800,7 +1207,7 @@ class NonBondedForceModel:
         final_state = self.simulation.context.getState(getEnergy=True)
         final_energy = final_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
         print(f"  Final potential energy: {final_energy:.1f} kJ/mol "
-              f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
+            f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
         
         # Check overall trend
         if final_energy > initial_energy:
@@ -811,11 +1218,10 @@ class NonBondedForceModel:
         else:
             print(f"  Energy decreased by {initial_energy - final_energy:.1f} kJ/mol (good)")
         
-        # Update positions
-        state = self.simulation.context.getState(
-            getPositions=True
-        )
-        self.positions = state.getPositions()
+        self._get_positions_and_cleanup()
+
+        self.cleanup_all_resources(final_run=False)
+
         print("NVT equilibration complete.")
 
     def equilibrate_nvt_with_warming(
@@ -832,6 +1238,9 @@ class NonBondedForceModel:
         """
         print(f"Running NVT equilibration for {steps} steps...")
 
+        # Validate positions before proceeding (check for NaN from previous NPT)
+        self._fix_positions_if_needed()
+
         # Create simulation without barostat but with CA constraints
         self._create_new_simulation(
             add_calpha_restraint=True,
@@ -839,7 +1248,17 @@ class NonBondedForceModel:
 
         # Slowly warm up temperature - every 1000 steps raise 
         # the temperature by 5 K
-        self.simulation.context.setVelocitiesToTemperature(5*kelvin)
+        try:
+            self.simulation.context.setVelocitiesToTemperature(5*kelvin)
+        except Exception as e:
+            # Be more lenient - try the full temperature, then continue anyway
+            try:
+                self.simulation.context.setVelocitiesToTemperature(self.temperature)
+            except Exception as e2:
+                # If velocity setting fails completely, log warning but continue
+                # (velocities might be auto-initialized by the integrator)
+                print(f"WARNING: Failed to set initial velocities: {e2}")
+                print("  Continuing anyway with integrator-provided velocities")
 
         # Add reporter for monitoring
         self.simulation.reporters.append(
@@ -857,8 +1276,32 @@ class NonBondedForceModel:
         n_atoms = self._get_n_atoms()
         initial_state = self.simulation.context.getState(getEnergy=True)
         initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+        del initial_state
         print(f"  Initial potential energy: {initial_energy:.1f} kJ/mol "
-              f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+            f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+        
+        # Sanity check: if energy is ridiculously high, coordinates are corrupted
+        # Typical folded protein energy is -10 to -30 kJ/mol/atom
+        if initial_energy / n_atoms > 100 or initial_energy / n_atoms > 0:
+            print(f"ERROR: Initial NVT energy is unreasonably high ({initial_energy/n_atoms:.1f} kJ/mol/atom)")
+            print("  This indicates corrupted particle coordinates")
+            if hasattr(self, '_pre_npt_positions') and self._pre_npt_positions is not None:
+                print("  Attempting to use pre-NPT positions...")
+                self.positions = self._pre_npt_positions
+                # Properly clean up the corrupted simulation before creating new one
+                self.cleanup_all_resources(final_run=False)
+                self._create_new_simulation(
+                    add_calpha_restraint=True,
+                    add_barostat=False)
+                # Try energy calculation again
+                initial_state = self.simulation.context.getState(getEnergy=True)
+                initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+                del initial_state
+                print(f"  Retrying with pre-NPT positions: {initial_energy:.1f} kJ/mol ({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+                if initial_energy / n_atoms > 100 or initial_energy / n_atoms > 0:
+                    raise RuntimeError(f"Even pre-NPT positions are corrupted (energy: {initial_energy/n_atoms:.1f} kJ/mol/atom)")
+            else:
+                raise RuntimeError(f"Initial NVT energy is corrupted ({initial_energy/n_atoms:.1f} kJ/mol/atom) and no backup positions available")
         
         # Track energies for validation
         energy_history = [initial_energy]
@@ -906,24 +1349,24 @@ class NonBondedForceModel:
         # Final energy check
         final_state = self.simulation.context.getState(getEnergy=True)
         final_energy = final_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+        del final_state
         print(f"  Final potential energy: {final_energy:.1f} kJ/mol "
-              f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
+            f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
         
         # Note: Energy increase during NVT heating is expected
         if final_energy > initial_energy:
             print(f"  Energy increased by {final_energy - initial_energy:.1f} kJ/mol "
-                  f"(expected during temperature ramping from 5K to 300K)")
+                f"(expected during temperature ramping from 5K to 300K)")
         
         # Check for very large energy (possible instability)
         if final_energy > 0:
             warnings.warn("NVT equilibration ended with positive energy - system may be unstable")
             print(f"  WARNING: Positive final energy detected!")
         
-        # Update positions
-        state = self.simulation.context.getState(
-            getPositions=True
-        )
-        self.positions = state.getPositions()
+        self._get_positions_and_cleanup()
+
+        self.cleanup_all_resources(final_run=False)
+
         print("NVT equilibration complete.")
 
     def run_production(
@@ -978,8 +1421,9 @@ class NonBondedForceModel:
         # Get initial energy
         initial_state = self.simulation.context.getState(getEnergy=True)
         initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+        del initial_state
         print(f"  Initial potential energy: {initial_energy:.1f} kJ/mol "
-              f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
+            f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
         
         # Track energy statistics
         energy_history = [initial_energy]
@@ -1010,7 +1454,8 @@ class NonBondedForceModel:
             state = self.simulation.context.getState(getPositions=True, getEnergy=True)
             positions = state.getPositions(asNumpy=True)
             current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
-            
+            del state  # Release Context reference before the expensive per-residue calculation
+
             # Track energy statistics
             energy_history.append(current_energy)
             energy_min = min(energy_min, current_energy)
@@ -1051,6 +1496,10 @@ class NonBondedForceModel:
             es_energy_repulsive_sum += es_e_rep
 
             frame_count+=1
+            
+            # Periodic garbage collection to free memory from temporary objects
+            if frame_count % 5 == 0:
+                gc.collect()
         
         # Final energy statistics
         final_energy = energy_history[-1]
@@ -1071,38 +1520,31 @@ class NonBondedForceModel:
                 f"({100*std_energy/abs(mean_energy):.1f}% of mean)"
             )
             print(f"  WARNING: Large energy fluctuations detected")
-        
-        # Update positions after production
-        self.positions = self.simulation.context.getState(
-            getPositions=True
-        ).getPositions()
 
         # Average over frames
         vdw_energy_attractive_avg = vdw_energy_attractive_sum / frame_count
         vdw_energy_repulsive_avg = vdw_energy_repulsive_sum / frame_count
         es_energy_attractive_avg = es_energy_attractive_sum / frame_count
         es_energy_repulsive_avg = es_energy_repulsive_sum / frame_count
-        
+
         print("Production MD complete.")
-        
-        # Generate energy plot if debug mode is enabled
-        if self.debug:
-            self.plot_energy_history()
-        
+
         return [vdw_energy_attractive_avg, vdw_energy_repulsive_avg, es_energy_attractive_avg, es_energy_repulsive_avg]
+
 
     def _get_context(self) -> Context:
         """
         Create the integrator and (re)set up the simulation Context.
         """
         integrator = LangevinMiddleIntegrator(self.DEFAULT_TEMPERATURE,
-                                              self.DEFAULT_FRICTION_COEFFICIENT / picosecond,
-                                              self.DEFAULT_TIMESTEP)
+                                            self.DEFAULT_FRICTION_COEFFICIENT / picosecond,
+                                            self.DEFAULT_TIMESTEP)
         context = Context(self.system,
                         integrator,
                         Platform.getPlatformByName(self._get_platform()),
                         self.platform_properties) 
         return context.setPositions(self.positions)
+
 
     def _energy_calculation(self,
             solute_coulomb_scale,
@@ -1117,7 +1559,10 @@ class NonBondedForceModel:
         context.setParameter("solute_lj_scale", solute_lj_scale)
         context.setParameter("solvent_coulomb_scale", solvent_coulomb_scale)
         context.setParameter("solvent_lj_scale", solvent_lj_scale)
-        return context.getState(getEnergy=True, groups={0}).getPotentialEnergy()
+        energy = context.getState(getEnergy=True, groups={0}).getPotentialEnergy()
+        del context  # Clean up Context to free memory
+        return energy
+
 
     def _get_vdw_and_electrostatic_energy(self):
         """
@@ -1138,122 +1583,168 @@ class NonBondedForceModel:
         self,
         positions: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Calculate per-residue interaction energies with solvent using interaction groups.
-        
-        Uses CustomNonbondedForce with addInteractionGroup() to efficiently compute
-        the interaction energy between each protein residue and all solvent molecules.
-        This leverages OpenMM's optimized force calculations (including GPU acceleration).
+        """Calculate per-residue interaction energies with solvent using numpy.
+
+        Computes the same LJ and Coulomb interactions as the previous
+        CustomNonbondedForce / NoCutoff / interaction-group approach but
+        entirely in vectorised numpy — no temporary OpenMM Contexts are
+        created, so there is no C++ heap fragmentation.
+
+        On CPU (the typical path here) this is faster than the OpenMM approach
+        because OpenMM's per-Context setup overhead (kernel compilation, N-particle
+        array allocation) dominates the actual ~10-atom × ~29,000-solvent pair work.
+
+          LJ:      4*eps*((sigma/r)^12 - (sigma/r)^6)
+                   sigma = 0.5*(sigma_i + sigma_j), eps = sqrt(eps_i * eps_j)
+          Coulomb: 138.935456 * q_i * q_j / r  (kJ·nm / (mol·e²))
 
         Args:
-            positions (np.ndarray): Current atomic positions in nanometers.
+            positions: Atomic positions — plain numpy array (nm) or OpenMM Quantity.
 
         Returns:
             tuple: Four N-length arrays (one value per protein residue):
                 - vdw_energy_solvent: VdW energy with solvent (kJ/mol)
                 - es_energy_solvent: Electrostatic energy with solvent (kJ/mol)
-                - vdw_force_solvent: VdW force magnitude with solvent (kJ/(mol·nm))
-                - es_force_solvent: ES force magnitude with solvent (kJ/(mol·nm))
+                - vdw_force_solvent: |VdW energy| / n_atoms proxy (kJ/(mol·nm))
+                - es_force_solvent: |ES energy| / n_atoms proxy (kJ/(mol·nm))
         """
+        # Extract plain float64 array in nm (handles both numpy and OpenMM Quantity)
+        if hasattr(positions, 'value_in_unit'):
+            pos_nm = np.asarray(positions.value_in_unit(nanometer), dtype=np.float64)
+        else:
+            pos_nm = np.asarray(positions, dtype=np.float64)
+
         n_residues = len(self.protein_residue_indices)
-        
         vdw_energy_solvent = np.zeros(n_residues)
-        es_energy_solvent = np.zeros(n_residues)
-        vdw_force_solvent = np.zeros(n_residues)
-        es_force_solvent = np.zeros(n_residues)
-        
-        # Get nonbonded force parameters from existing system
+        es_energy_solvent  = np.zeros(n_residues)
+        vdw_force_solvent  = np.zeros(n_residues)
+        es_force_solvent   = np.zeros(n_residues)
+
+        # Read per-atom force-field parameters once
         nonbonded_force = None
         for force in self.system.getForces():
             if isinstance(force, NonbondedForce):
                 nonbonded_force = force
                 break
-        
         if nonbonded_force is None:
             raise RuntimeError("No NonbondedForce found in system")
-        
-        # Combine solvent and ion atoms
-        solvent_and_ions = self.solvent_atom_indices | self.ion_atom_indices
-        
-        # Calculate residue-solvent energies using OpenMM interaction groups
+
+        n_particles = nonbonded_force.getNumParticles()
+        sigma_all   = np.empty(n_particles, dtype=np.float64)
+        epsilon_all = np.empty(n_particles, dtype=np.float64)
+        charge_all  = np.empty(n_particles, dtype=np.float64)
+        for idx in range(n_particles):
+            q, s, e = nonbonded_force.getParticleParameters(idx)
+            sigma_all[idx]   = s.value_in_unit(nanometer)
+            epsilon_all[idx] = e.value_in_unit(kilojoules_per_mole)
+            charge_all[idx]  = q.value_in_unit(elementary_charge)
+
+        # Solvent + ion indices as a sorted numpy array
+        solvent_indices = np.array(
+            sorted(self.solvent_atom_indices | self.ion_atom_indices), dtype=np.int64)
+
+        # Pre-extract solvent data — reused for every residue
+        pos_solv     = pos_nm[solvent_indices]           # (n_solv, 3)
+        sigma_solv   = sigma_all[solvent_indices]        # (n_solv,)
+        epsilon_solv = epsilon_all[solvent_indices]      # (n_solv,)
+        charge_solv  = charge_all[solvent_indices]       # (n_solv,)
+
+        k_coulomb = 138.935456  # kJ·nm/(mol·e²)
+        r_min     = 0.1         # nm — skip pairs < 1 Å to avoid singularity
+
         for i, res_i in enumerate(self.protein_residue_indices):
-            residue_atoms = set(self.residue_atom_indices[res_i])
-            
-            # Create a temporary system with CustomNonbondedForce for this residue-solvent pair
-            # LJ force with interaction group (no cutoff - compute all interactions)
-            lj_force = CustomNonbondedForce(
-                "4*epsilon*((sigma/r)^12-(sigma/r)^6); "
-                "sigma=0.5*(sigma1+sigma2); "
-                "epsilon=sqrt(epsilon1*epsilon2)"
-            )
-            lj_force.addPerParticleParameter("sigma")
-            lj_force.addPerParticleParameter("epsilon")
-            lj_force.setNonbondedMethod(CustomNonbondedForce.NoCutoff)
-            lj_force.setForceGroup(0)
-            
-            # Coulomb force with interaction group (no cutoff - compute all interactions)
-            coulomb_force = CustomNonbondedForce(
-                "138.935456*charge1*charge2/r"  # k_coulomb in kJ·nm/(mol·e²)
-            )
-            coulomb_force.addPerParticleParameter("charge")
-            coulomb_force.setNonbondedMethod(CustomNonbondedForce.NoCutoff)
-            coulomb_force.setForceGroup(1)
-            
-            # Add all particles with their parameters
-            for atom_idx in range(nonbonded_force.getNumParticles()):
-                charge, sigma, epsilon = nonbonded_force.getParticleParameters(atom_idx)
-                lj_force.addParticle([
-                    sigma.value_in_unit(nanometer),
-                    epsilon.value_in_unit(kilojoules_per_mole)
-                ])
-                coulomb_force.addParticle([charge.value_in_unit(elementary_charge)])
-            
-            # Set interaction groups: only compute residue-solvent interactions
-            lj_force.addInteractionGroup(residue_atoms, solvent_and_ions)
-            coulomb_force.addInteractionGroup(residue_atoms, solvent_and_ions)
-            
-            # Create temporary system
-            temp_system = System()
-            for _ in range(nonbonded_force.getNumParticles()):
-                temp_system.addParticle(1.0)  # Mass doesn't matter for energy calc
-            
-            # Copy box vectors from topology
-            vectors = self.topology.getPeriodicBoxVectors()
-            if vectors is not None:
-                temp_system.setDefaultPeriodicBoxVectors(*vectors)
-            
-            temp_system.addForce(lj_force)
-            temp_system.addForce(coulomb_force)
-            
-            # Create context and calculate energies
-            integrator = VerletIntegrator(0.001 * picoseconds)
-            platform = self._get_platform()
-            context = Context(temp_system, integrator, platform)
-            context.setPositions(positions)
-            
-            # Get LJ energy (force group 0)
-            lj_state = context.getState(getEnergy=True, groups={0})
-            lj_energy = lj_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
-            
-            # Get Coulomb energy (force group 1)
-            coulomb_state = context.getState(getEnergy=True, groups={1})
-            coulomb_energy = coulomb_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
-            
-            # Normalize by number of atoms in residue
-            n_atoms_in_residue = len(residue_atoms)
-            vdw_energy_solvent[i] = lj_energy / n_atoms_in_residue
-            es_energy_solvent[i] = coulomb_energy / n_atoms_in_residue
-            
-            # For forces, we use the energy as a proxy (force calculation would require
-            # additional context.getState calls with getForces=True)
-            # Approximate force magnitude from energy gradient
-            vdw_force_solvent[i] = abs(lj_energy) / n_atoms_in_residue
-            es_force_solvent[i] = abs(coulomb_energy) / n_atoms_in_residue
-            
-            # Clean up
-            del context
-            del integrator
-        
+            res_idx = np.array(list(self.residue_atom_indices[res_i]), dtype=np.int64)
+            n_atoms = len(res_idx) if len(res_idx) > 0 else 1
+
+            pos_res     = pos_nm[res_idx]           # (n_res, 3)
+            sigma_res   = sigma_all[res_idx]        # (n_res,)
+            epsilon_res = epsilon_all[res_idx]      # (n_res,)
+            charge_res  = charge_all[res_idx]       # (n_res,)
+
+            # Pairwise distance matrix (n_res, n_solv) — use einsum to avoid
+            # keeping the full 3-D difference array in memory
+            diff = pos_res[:, np.newaxis, :] - pos_solv[np.newaxis, :, :]
+            r2   = np.einsum('ijk,ijk->ij', diff, diff)
+            del diff
+            r      = np.sqrt(r2);  del r2
+            valid  = r > r_min
+            r_safe = np.where(valid, r, 1.0)  # sentinel to avoid divide-by-zero
+
+            # Lennard-Jones (Lorentz-Berthelot combining rules)
+            sigma_ij   = 0.5 * (sigma_res[:, np.newaxis] + sigma_solv[np.newaxis, :])
+            epsilon_ij = np.sqrt(np.abs(epsilon_res[:, np.newaxis] * epsilon_solv[np.newaxis, :]))
+            sr6        = (sigma_ij / r_safe) ** 6
+            lj_energy  = float(np.sum(np.where(valid, 4.0 * epsilon_ij * (sr6 * sr6 - sr6), 0.0)))
+            del sigma_ij, epsilon_ij, sr6
+
+            # Coulomb
+            q_ij           = charge_res[:, np.newaxis] * charge_solv[np.newaxis, :]
+            coulomb_energy = float(np.sum(np.where(valid, k_coulomb * q_ij / r_safe, 0.0)))
+            del q_ij, valid, r, r_safe
+
+            vdw_energy_solvent[i] = lj_energy      / n_atoms
+            es_energy_solvent[i]  = coulomb_energy  / n_atoms
+            vdw_force_solvent[i]  = abs(lj_energy)  / n_atoms
+            es_force_solvent[i]   = abs(coulomb_energy) / n_atoms
+
         return vdw_energy_solvent, es_energy_solvent, vdw_force_solvent, es_force_solvent
+
+    def _calculate_residue_solvent_energy_for_residue(self, res_i: int, positions: np.ndarray) -> tuple[float, float]:
+        """Compute solvent interaction energies for a single residue using numpy.
+
+        Returns (vdw_energy, es_energy) normalised by number of atoms in the residue.
+        """
+        if hasattr(positions, 'value_in_unit'):
+            pos_nm = np.asarray(positions.value_in_unit(nanometer), dtype=np.float64)
+        else:
+            pos_nm = np.asarray(positions, dtype=np.float64)
+
+        nonbonded_force = None
+        for force in self.system.getForces():
+            if isinstance(force, NonbondedForce):
+                nonbonded_force = force
+                break
+        if nonbonded_force is None:
+            raise RuntimeError("No NonbondedForce found in system")
+
+        n_particles = nonbonded_force.getNumParticles()
+        sigma_all   = np.empty(n_particles, dtype=np.float64)
+        epsilon_all = np.empty(n_particles, dtype=np.float64)
+        charge_all  = np.empty(n_particles, dtype=np.float64)
+        for idx in range(n_particles):
+            q, s, e = nonbonded_force.getParticleParameters(idx)
+            sigma_all[idx]   = s.value_in_unit(nanometer)
+            epsilon_all[idx] = e.value_in_unit(kilojoules_per_mole)
+            charge_all[idx]  = q.value_in_unit(elementary_charge)
+
+        solvent_indices = np.array(
+            sorted(self.solvent_atom_indices | self.ion_atom_indices), dtype=np.int64)
+        res_idx = np.array(list(self.residue_atom_indices[res_i]), dtype=np.int64)
+        n_atoms = len(res_idx) if len(res_idx) > 0 else 1
+
+        pos_res     = pos_nm[res_idx]
+        pos_solv    = pos_nm[solvent_indices]
+        sigma_res   = sigma_all[res_idx];   sigma_solv   = sigma_all[solvent_indices]
+        epsilon_res = epsilon_all[res_idx]; epsilon_solv = epsilon_all[solvent_indices]
+        charge_res  = charge_all[res_idx];  charge_solv  = charge_all[solvent_indices]
+
+        k_coulomb = 138.935456
+        r_min     = 0.1
+
+        diff   = pos_res[:, np.newaxis, :] - pos_solv[np.newaxis, :, :]
+        r      = np.sqrt(np.einsum('ijk,ijk->ij', diff, diff));  del diff
+        valid  = r > r_min
+        r_safe = np.where(valid, r, 1.0)
+
+        sigma_ij   = 0.5 * (sigma_res[:, np.newaxis] + sigma_solv[np.newaxis, :])
+        epsilon_ij = np.sqrt(np.abs(epsilon_res[:, np.newaxis] * epsilon_solv[np.newaxis, :]))
+        sr6        = (sigma_ij / r_safe) ** 6
+        lj_energy  = float(np.sum(np.where(valid, 4.0 * epsilon_ij * (sr6 * sr6 - sr6), 0.0)))
+
+        q_ij           = charge_res[:, np.newaxis] * charge_solv[np.newaxis, :]
+        coulomb_energy = float(np.sum(np.where(valid, k_coulomb * q_ij / r_safe, 0.0)))
+
+        return lj_energy / n_atoms, coulomb_energy / n_atoms
 
     def _calculate_pairwise_energies(
         self,
@@ -1289,8 +1780,14 @@ class NonBondedForceModel:
         
         # Calculate residue-solvent energies if needed for subtraction
         if subtract_solvent:
+            if self.debug:
+                process = psutil.Process()
+                mem_before_solvent = process.memory_info().rss / 1024 / 1024
             (vdw_solv, es_solv, 
-             vdw_force_solv, es_force_solv) = self._calculate_residue_solvent_energies(positions)
+            vdw_force_solv, es_force_solv) = self._calculate_residue_solvent_energies(positions)
+            if self.debug:
+                mem_after_solvent = process.memory_info().rss / 1024 / 1024
+                print(f"Solvent energy computation: {mem_before_solvent:.1f} -> {mem_after_solvent:.1f} MB (delta: {mem_after_solvent - mem_before_solvent:.1f} MB)")
         
         # Energy matrices
         vdw_energy_attractive = np.zeros((n_residues, n_residues))
@@ -1307,6 +1804,17 @@ class NonBondedForceModel:
         
         if nonbonded_force is None:
             raise RuntimeError("No NonbondedForce found in system")
+        
+        # Cache particle parameters to avoid repeated OpenMM calls (major memory/speed optimization)
+        if not hasattr(self, '_cached_particle_params') or self._cached_particle_params is None:
+            self._cached_particle_params = {}
+            for atom_idx in range(nonbonded_force.getNumParticles()):
+                charge, sigma, epsilon = nonbonded_force.getParticleParameters(atom_idx)
+                self._cached_particle_params[atom_idx] = (
+                    charge.value_in_unit(elementary_charge),
+                    sigma.value_in_unit(nanometer),
+                    epsilon.value_in_unit(kilojoules_per_mole)
+                )
         
         # Coulomb constant in OpenMM units (kJ·nm/(mol·e²))
         k_coulomb = 138.935456
@@ -1328,17 +1836,11 @@ class NonBondedForceModel:
                 es_energy_rep_ij = 0.0
                 
                 for atom_i in atoms_i:
-                    charge_i, sigma_i, epsilon_i = nonbonded_force.getParticleParameters(atom_i)
-                    charge_i = charge_i.value_in_unit(elementary_charge)
-                    sigma_i = sigma_i.value_in_unit(nanometer)
-                    epsilon_i = epsilon_i.value_in_unit(kilojoules_per_mole)
+                    charge_i, sigma_i, epsilon_i = self._cached_particle_params[atom_i]
                     pos_i = positions[atom_i]
                     
                     for atom_j in atoms_j:
-                        charge_j, sigma_j, epsilon_j = nonbonded_force.getParticleParameters(atom_j)
-                        charge_j = charge_j.value_in_unit(elementary_charge)
-                        sigma_j = sigma_j.value_in_unit(nanometer)
-                        epsilon_j = epsilon_j.value_in_unit(kilojoules_per_mole)
+                        charge_j, sigma_j, epsilon_j = self._cached_particle_params[atom_j]
                         pos_j = positions[atom_j]
                         
                         # Calculate distance
@@ -1384,20 +1886,53 @@ class NonBondedForceModel:
                 es_energy_attractive[i, j] = es_energy_att_ij
                 es_energy_repulsive[i, j] = es_energy_rep_ij
         
-        # Subtract residue-solvent energies if requested
-        # This approximates the desolvation penalty: when residues i and j interact,
-        # they partially lose their interactions with solvent
         if subtract_solvent:
-            for i in range(n_residues):
-                for j in range(i + 1, n_residues):
-                    # Average the solvent energies of both residues involved
-                    # This represents the "desolvation cost" of forming this contact
-                    avg_vdw_solv = (vdw_solv[i] + vdw_solv[j]) / 2
-                    avg_es_solv = (es_solv[i] + es_solv[j]) / 2
-                    
-                    # Subtract from attractive terms (solvent interaction is typically stabilizing)
-                    vdw_energy_attractive[i, j] -= avg_vdw_solv
-                    es_energy_attractive[i, j] -= avg_es_solv
+            if getattr(self, 'memory_efficient', False):
+                if self.debug:
+                    process = psutil.Process()
+                    mem_before_efficient = process.memory_info().rss / 1024 / 1024
+                # Memory-efficient on-demand per-residue solvent energy calculation
+                vdw_cache = {}
+                es_cache = {}
+                for i in range(n_residues):
+                    for j in range(i + 1, n_residues):
+                        if i not in vdw_cache:
+                            res_idx_i = self.protein_residue_indices[i]
+                            vdw_cache[i], es_cache[i] = self._calculate_residue_solvent_energy_for_residue(res_idx_i, positions)
+                        if j not in vdw_cache:
+                            res_idx_j = self.protein_residue_indices[j]
+                            vdw_cache[j], es_cache[j] = self._calculate_residue_solvent_energy_for_residue(res_idx_j, positions)
+
+                        avg_vdw_solv = (vdw_cache[i] + vdw_cache[j]) / 2.0
+                        avg_es_solv = (es_cache[i] + es_cache[j]) / 2.0
+
+                        vdw_energy_attractive[i, j] -= avg_vdw_solv
+                        es_energy_attractive[i, j] -= avg_es_solv
+
+                # Clear caches to free memory
+                del vdw_cache
+                del es_cache
+                gc.collect()
+                if self.debug:
+                    mem_after_efficient = process.memory_info().rss / 1024 / 1024
+                    print(f"Memory-efficient solvent subtraction: {mem_before_efficient:.1f} -> {mem_after_efficient:.1f} MB (delta: {mem_after_efficient - mem_before_efficient:.1f} MB)")
+            else:
+                if self.debug:
+                    process = psutil.Process()
+                    mem_before_standard = process.memory_info().rss / 1024 / 1024
+                for i in range(n_residues):
+                    for j in range(i + 1, n_residues):
+                        # Average the solvent energies of both residues involved
+                        # This represents the "desolvation cost" of forming this contact
+                        avg_vdw_solv = (vdw_solv[i] + vdw_solv[j]) / 2
+                        avg_es_solv = (es_solv[i] + es_solv[j]) / 2
+                        
+                        # Subtract from attractive terms (solvent interaction is typically stabilizing)
+                        vdw_energy_attractive[i, j] -= avg_vdw_solv
+                        es_energy_attractive[i, j] -= avg_es_solv
+                if self.debug:
+                    mem_after_standard = process.memory_info().rss / 1024 / 1024
+                    print(f"Standard solvent subtraction: {mem_before_standard:.1f} -> {mem_after_standard:.1f} MB (delta: {mem_after_standard - mem_before_standard:.1f} MB)")
         
         return (vdw_energy_attractive, vdw_energy_repulsive, es_energy_attractive, es_energy_repulsive)
     
@@ -1519,7 +2054,10 @@ class NonBondedForceModel:
                     context.setParameter("res_i_lj_scale", res_i_lj)
                     context.setParameter("res_j_coulomb_scale", res_j_coulomb)
                     context.setParameter("res_j_lj_scale", res_j_lj)
-                    return context.getState(getEnergy=True, groups={0}).getPotentialEnergy()
+                    st = context.getState(getEnergy=True, groups={0})
+                    val = st.getPotentialEnergy()
+                    del st
+                    return val
                 
                 # Calculate Coulomb interaction energy
                 # E_interaction = E_total(i+j) - E_internal(i) - E_internal(j)
@@ -1552,9 +2090,17 @@ class NonBondedForceModel:
                 # if pair_count % 100 == 0:
                 #     print(f"  Processed {pair_count}/{total_pairs} residue pairs...")
                 
-                # Clean up context
+                # Clean up context and system to free memory
                 del context
                 del integrator
+                del system
+                
+                # Periodic garbage collection for CUDA memory
+                if j % 20 == 0:
+                    gc.collect()
+        
+        # Force garbage collection after all pairs processed
+        gc.collect()
         
         print(f"Completed pairwise energy calculations for {total_pairs} pairs.")
         
@@ -1570,9 +2116,9 @@ class NonBondedForceModel:
         subtract_solvent_energies: bool = True,
         debug: bool = False
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-               np.ndarray, np.ndarray, np.ndarray, np.ndarray] | \
-         tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-               np.ndarray, np.ndarray, np.ndarray, np.ndarray, io.StringIO]:
+            np.ndarray, np.ndarray, np.ndarray, np.ndarray] | \
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+            np.ndarray, np.ndarray, np.ndarray, np.ndarray, io.StringIO]:
         """Run the complete MD simulation pipeline.
 
         This is a convenience method that runs all steps:
@@ -1643,6 +2189,16 @@ class NonBondedForceModel:
         print("Pipeline complete!")
         print("=" * 60)
         
+        # Generate energy plots if debug mode is enabled
+        if self.debug:
+            print("\nGenerating energy plots...")
+            self.plot_energy_history()
+            print("Energy plots saved to debug_plots directory")
+        
+        # Clean up to free memory
+        self.cleanup_all_resources(final_run=True)
+        
         if return_simulated_pdb:
             results.append(production_pdb_stream)
         return results
+

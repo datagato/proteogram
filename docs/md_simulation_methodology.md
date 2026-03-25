@@ -278,35 +278,93 @@ The pipeline produces **8 NxN matrices** (where N = number of protein residues):
 
 ## Usage Example
 
+### Minimal API usage (in-memory)
+
 ```python
 from proteogram.nonbonded_forces import NonBondedForceModel
 import numpy as np
 
-# Initialize model
 model = NonBondedForceModel(
     pdb_path='protein.pdb',
-    temperature=311.75,
-    use_gpu=False
+    temperature=311.75,   # Kelvin
+    pressure=1.0,         # atmospheres
+    padding=1.0,          # nanometers (water box padding around protein)
+    timestep=2.0,         # femtoseconds
+    use_gpu=False,
+    output_dir='output'
 )
 
-# Run full pipeline
-(vdw_e_att, vdw_e_rep, es_e_att, es_e_rep, \
-    simulated_pdb_stream) = model.run_full_pipeline(
-    npt_steps=50000,
-    nvt_steps=50000,
-    production_steps=500000,
-    energy_calc_interval=10000,
-    return_simulated_pdb=True
+# Full MD pipeline. Returns 4 matrices (vdw/es attractive/repulsive).
+vdw_attractive, vdw_repulsive, es_attractive, es_repulsive = model.run_full_pipeline(
+    npt_steps=50000,           # steps (50,000 × 2 fs = 100 ps NPT equilibration)
+    nvt_steps=50000,           # steps (50,000 × 2 fs = 100 ps NVT equilibration)
+    production_steps=500000,   # steps (500,000 × 2 fs = 1 ns production run)
+    energy_calc_interval=10000, # steps between energy snapshots (10,000 × 2 fs = 20 ps; 50 frames total)
+    return_simulated_pdb=False,
+    subtract_solvent_energies=True,
+    debug=True
 )
 
-# Save the final production simulation structure
-with open('production_pdb_file.pdb', 'w') as f:
-    f.write(simulated_pdb_stream.read())
+print('VdW attractive matrix shape:', vdw_attractive.shape)
+print('Electrostatic repulsive matrix shape:', es_repulsive.shape)
 
-# Save VdW results
-np.save('vdw_energy_attractive.npy', vdw_e_att)
-np.save('vdw_force_attractive.npy', vdw_f_att)
-# ... etc.
+model.cleanup()
+```
+
+### Script form (CLI-friendly)
+
+```python
+#!/usr/bin/env python
+import argparse
+from pathlib import Path
+import numpy as np
+from proteogram.nonbonded_forces import NonBondedForceModel
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Run residue-residue nonbonded force pipeline')
+    parser.add_argument('pdb_path', type=Path, help='Input protein PDB file')
+    parser.add_argument('--outdir', type=Path, default=Path('output'), help='Output directory')
+    parser.add_argument('--steps', type=int, default=500000, help='Production steps')
+    parser.add_argument('--no-gpu', action='store_true', help='Force CPU execution')
+    args = parser.parse_args()
+
+    args.outdir.mkdir(parents=True, exist_ok=True)
+
+    model = NonBondedForceModel(
+        pdb_path=str(args.pdb_path),
+        temperature=310.15,
+        use_gpu=not args.no_gpu,
+        output_dir=str(args.outdir),
+        memory_efficient=True  # optional, recommends low memory usage for large systems
+    )
+
+    vdw_att, vdw_rep, es_att, es_rep = model.run_full_pipeline(
+        npt_steps=50000,
+        nvt_steps=50000,
+        production_steps=args.steps,
+        energy_calc_interval=10000,
+        return_simulated_pdb=True,
+        subtract_solvent_energies=True,
+        debug=False
+    )
+
+    # Save final structure
+    pdb_out = args.outdir / f'{args.pdb_path.stem}_production.pdb'
+    with open(pdb_out, 'w') as f:
+        f.write(model.get_simulated_pdb_stream().read())
+
+    # Save energy matrices
+    np.save(args.outdir / 'vdw_attractive.npy', vdw_att)
+    np.save(args.outdir / 'vdw_repulsive.npy', vdw_rep)
+    np.save(args.outdir / 'es_attractive.npy', es_att)
+    np.save(args.outdir / 'es_repulsive.npy', es_rep)
+
+    model.cleanup()
+
+
+if __name__ == '__main__':
+    main()
 ```
 
 ---

@@ -1,7 +1,10 @@
 from proteogram.proteogram_v2 import ProteogramV2
+import gc
 import glob
 import os
 from time import time
+import matplotlib
+matplotlib.use('agg')  # Use non-interactive backend to avoid memory buildup
 import matplotlib.pyplot as plt
 import torch
 import warnings
@@ -9,6 +12,12 @@ import argparse
 from tqdm import tqdm
 from Bio.PDB.PDBParser import PDBConstructionWarning
 from proteogram.utils import read_yaml
+import psutil
+import tracemalloc
+try:
+    import objgraph
+except ImportError:
+    objgraph = None
 # Ignore PDB construction warnings
 warnings.filterwarnings("ignore", category=PDBConstructionWarning)
 
@@ -30,13 +39,34 @@ if __name__ == '__main__':
     parser.add_argument('--debug',
                         action='store_true',
                         help="Enable debug mode with additional logging and plots.")
+    parser.add_argument('--memory-efficient',
+                        action='store_true',
+                        help="Use memory-efficient solvent subtraction (slower).")
     parser.add_argument('--save_simulated_pdb',
                         action='store_true',
-                        help="Save the final simulated PDB structure and energy graphs from MD simulation.")
+                        help="Save the final simulated PDB structure.")
     args = parser.parse_args()
 
     start = time()
-    
+
+    # Tell glibc to route large allocations (>= 128 KB) through mmap rather than
+    # the sbrk heap.  mmap-allocated pages are returned to the OS via munmap as
+    # soon as they are freed, bypassing the per-arena free-list fragmentation that
+    # otherwise causes RSS to grow by ~2 GB per protein.  M_TRIM_THRESHOLD=0
+    # additionally tells glibc to trim the heap break after every free that leaves
+    # space at the top of the main arena.
+    # These are no-ops on macOS/Windows; set them once before any OpenMM objects
+    # are created so all subsequent large C++ allocations take the mmap path.
+    try:
+        import ctypes as _ctypes
+        _libc = _ctypes.CDLL("libc.so.6")
+        _M_TRIM_THRESHOLD = -1   # mallopt param: trim heap after free
+        _M_MMAP_THRESHOLD = -3   # mallopt param: mmap allocations >= this size
+        _libc.mallopt(_M_TRIM_THRESHOLD, 0)           # trim aggressively
+        _libc.mallopt(_M_MMAP_THRESHOLD, 128 * 1024)  # mmap for allocations >= 128 KB
+    except Exception:
+        pass  # not Linux or libc unavailable — skip silently
+
     if args.overwrite:
         recreate = True
     else:
@@ -115,8 +145,31 @@ if __name__ == '__main__':
     # Insert regular loop over files using ProteogramV2 here
     problem_files = []
     problem_pdb_cnts = 0
-    for pdb_file, image_file in tqdm(file_list):
+    process = psutil.Process()
+    if args.debug:
+        # Record baseline OpenMM Context count BEFORE any protein is processed.
+        # OpenMM creates a small number of Contexts internally when benchmarking
+        # platforms (Platform.findPlatform).  Any count seen after cleanup that
+        # equals this baseline is NOT a leak — it is expected class-level state.
         try:
+            import openmm as _omm_baseline
+            _baseline_ctx_count = sum(
+                1 for obj in gc.get_objects() if type(obj) is _omm_baseline.Context)
+            print(f"=== BASELINE OpenMM Context count (platform init): {_baseline_ctx_count} ===")
+        except Exception:
+            _baseline_ctx_count = 0
+        if objgraph:
+            print("=== BASELINE OBJECT COUNTS ===")
+            objgraph.show_most_common_types(limit=15)
+            print("="*40)
+    for pdb_file, image_file in tqdm(file_list):
+        if args.debug:
+            mem_before = process.memory_info().rss / 1024 / 1024
+            if torch.cuda.is_available():
+                gpu_mem_before = torch.cuda.memory_allocated() / 1024 / 1024
+                print(f"GPU memory before: {gpu_mem_before:.1f} MB")
+        try:
+            print(f'Processing {pdb_file}...')
             bname =  os.path.basename(pdb_file)
             chain_id = bname[5].upper()
             # Create ProteogramV2 instance
@@ -126,23 +179,32 @@ if __name__ == '__main__':
             # with sequence length cutoffs based on the specific proteins 
             # being analyzed.
             proteogram = ProteogramV2(pdb_file,
-                                      chain_id,
+                                      output_dir=proteograms_output_dir,
+                                      chain_id=chain_id,
                                       atom_distance_cutoff=20,
                                       hydrophobicity_delta_cutoff=30,
                                       sequence_len_lower_cutoff=20,
                                       sequence_len_upper_cutoff=1000,
                                       use_gpu=use_gpu)
             
+            # Skip chains that don't meet the sequence length cutoffs
+            if not proteogram.is_valid_chain():
+                print(f'Skipping {pdb_file}: sequence length {len(proteogram.sequence)} outside [{proteogram.sequence_len_lower_cutoff}, {proteogram.sequence_len_upper_cutoff}]')
+                del proteogram
+                continue
+
             # Calculate Proteogram with optional simulated PDB output
             if args.save_simulated_pdb:
                 final_data, err, simulated_pdb_stream = proteogram.calculate_proteogram(
                     return_simulated_pdb=True,
                     subtract_solvent_energies=True,
-                    debug=args.debug)
+                    debug=args.debug,
+                    memory_efficient=args.memory_efficient)
             else:
                 final_data, err = proteogram.calculate_proteogram(
                     subtract_solvent_energies=True,
-                    debug=args.debug)
+                    debug=args.debug,
+                    memory_efficient=args.memory_efficient)
                 simulated_pdb_stream = None
 
             if err is not None and args.verbose:
@@ -152,6 +214,8 @@ if __name__ == '__main__':
             if final_data is not None:
                 # Save image
                 plt.imsave(image_file, final_data.astype('uint8'))
+                plt.close('all')  # Clear matplotlib figures from memory
+                plt.clf()  # Clear current figure
             
             # Save production simulation PDB structure if requested
             if simulated_pdb_stream is not None and production_pdb_output_dir is not None:
@@ -165,6 +229,26 @@ if __name__ == '__main__':
                     f.write(simulated_pdb_stream.read())
                 if args.verbose:
                     print(f'Saved production structure to {production_pdb_file}')
+            
+            # Clean up to free memory between proteins
+            del proteogram
+            if final_data is not None:
+                del final_data
+            if simulated_pdb_stream is not None:
+                simulated_pdb_stream.close()
+                del simulated_pdb_stream
+            
+            # Force aggressive garbage collection
+            gc.collect()
+        
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if args.debug:
+                mem_after = process.memory_info().rss / 1024 / 1024
+                print(f"\nMemory after cleanup: {mem_after:.1f} MB (delta: {mem_after - mem_before:.1f} MB)")
+                if torch.cuda.is_available():
+                    gpu_mem_after = torch.cuda.memory_allocated() / 1024 / 1024
+                    print(f"GPU memory after: {gpu_mem_after:.1f} MB (delta: {gpu_mem_after - gpu_mem_before:.1f} MB)")
                     
         except Exception as e:
             problem_files.append(pdb_file)

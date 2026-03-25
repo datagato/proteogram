@@ -1,8 +1,11 @@
-"""Proteogram V2 module for protein structure analysis and visualization."""
+"""Proteogram V2 module for protein structure analysis and visualization.
+
+This module defines the ProteogramV2 class, which provides methods for generating proteogram maps from PDB files. The proteogram maps include distance, hydrophobicity,
+Van der Waals, and electrostatic interaction maps. The class also integrates with the NonBondedForceModel module to perform molecular dynamics simulations for calculating the non-bonded interaction energies."""
 
 import numpy as np
 import warnings
-import io
+import gc
 
 from Bio.PDB.PDBParser import PDBParser, PDBConstructionWarning
 from Bio.PDB.Polypeptide import PPBuilder
@@ -35,6 +38,7 @@ class ProteogramV2:
 
     def __init__(self,
                  pdb_path,
+                 output_dir,
                  chain_id,
                  atom_distance_cutoff=10,
                  hydrophobicity_delta_cutoff=30,
@@ -60,6 +64,7 @@ class ProteogramV2:
             KeyError: If the specified chain_id is not found in the PDB file.
         """
         self.pdb_path = pdb_path
+        self.output_dir = output_dir
         parser = PDBParser()
         self.structure = parser.get_structure("protein_id", self.pdb_path)
         self.model = self.structure[0]
@@ -89,7 +94,8 @@ class ProteogramV2:
     def calculate_proteogram(self,
                              return_simulated_pdb: bool = False,
                              debug: bool = False,
-                             subtract_solvent_energies: bool = True):
+                             subtract_solvent_energies: bool = True,
+                             memory_efficient: bool = False):
         """Calculate the proteogram maps.
 
         Computes distance, hydrophobicity, Van der Waals, and electrostatic maps
@@ -120,21 +126,33 @@ class ProteogramV2:
         # Initialize the model
         model = NonBondedForceModel(
             pdb_path=self.pdb_path,
+            output_dir=self.output_dir,
             temperature=310.15, # Kelvin (37 C)
             timestep=2.0, # Femtoseconds
-            use_gpu=self.use_gpu # Set True for GPU acceleration
+            use_gpu=self.use_gpu, # Set True for GPU acceleration
+            memory_efficient=memory_efficient
         )
+
+        energy_calc_interval = 10000  # Default: Calculate energies every 20 ps
+        if memory_efficient:
+            energy_calc_interval = 50000  # Calculate energies every 100 ps
 
         # Run the full pipeline (recommended)
         pipeline_result = model.run_full_pipeline(
             npt_steps=50000,      # 100 ps NPT equilibration
             nvt_steps=50000,      # 100 ps NVT equilibration
             production_steps=500000,  # 1 ns production
-            energy_calc_interval=10000,  # Calculate energies every 20 ps
+            energy_calc_interval=energy_calc_interval,
             return_simulated_pdb=return_simulated_pdb,
             debug=debug,
             subtract_solvent_energies=subtract_solvent_energies # Subtract solvent-only energies
         )
+
+        # Explicit clean-up of OpenMM resources after pipeline completion
+        model.cleanup_all_resources()
+        model._clear_cuda_cache()
+        model._cleanup_old_simulation()  # Ensure any old simulations are cleaned up
+        del model
         
         # Unpack results based on whether simulated PDB was requested
         if return_simulated_pdb:
@@ -151,6 +169,11 @@ class ProteogramV2:
         norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep)
         norm_es_att_map, es_att_err = self.normalize_map(es_e_att)
         norm_es_rep_map, es_rep_err = self.normalize_map(es_e_rep)
+        
+        # Clear the original energy maps to save memory
+        del disto_map, hydro_map, vdw_e_att, vdw_e_rep, es_e_att, es_e_rep
+        del pipeline_result
+        gc.collect()  # Force garbage collection after deleting large arrays
         
         # Check for normalization errors
         errors = {
@@ -173,10 +196,15 @@ class ProteogramV2:
                 2
             )
             final_data = final_upper + final_lower
+            # Clear intermediate arrays
+            del norm_disto_map, norm_hydro_map, norm_vdw_att_map, norm_vdw_rep_map
+            del norm_es_att_map, norm_es_rep_map, final_upper, final_lower
+            gc.collect()  # Force garbage collection after large array operations
             if return_simulated_pdb:
                 return final_data, None, simulated_pdb
             return final_data, None
         except Exception as e:
+            gc.collect()  # Force garbage collection even on error
             if return_simulated_pdb:
                 return None, {'Error stacking maps': str(e)}, simulated_pdb
             return None, {'Error stacking maps': str(e)}
