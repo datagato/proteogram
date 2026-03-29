@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Proteogram is a novel approach to protein structure similarity search that represents protein structures as image data, enabling the use of computer vision models for efficient and accurate similarity detection.
+Proteogram is a novel approach to protein structure similarity search that represents protein structures as image data, enabling the use of computer vision models for efficient and accurate similarity detection. This repository leverages the SCOPe 2.08 protein structure dataset and classification hierarchy (https://scop.berkeley.edu) both to train as well as evaluate models.
 
 ### Proteogram v1: Distance, Hydrophobicity, and Charge Maps
 
@@ -21,7 +21,7 @@ Proteogram v2 extends the original approach by incorporating molecular dynamics 
 - **Van der Waals energies** - Attractive and repulsive Lennard-Jones interactions
 - **Electrostatic energies** - Attractive and repulsive Coulomb interactions
 
-The MD pipeline includes energy minimization, NPT and NVT equilibration, and production dynamics with harmonic restraints on alpha-carbon atoms. The resulting 3-channel data (with 6 attributes total) provides a richer representation of protein structure that accounts for dynamic conformational sampling and explicit solvent effects.
+The MD pipeline includes energy minimization, NPT and NVT equilibration, and production dynamics. The resulting 3-channel data (with 6 attributes in total) provides a richer representation of protein structure that accounts for dynamic conformational sampling and explicit solvent effects.
 
 For detailed information on the MD simulation methodology, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).
 
@@ -87,24 +87,24 @@ uv add --dev <packagename>
    - `all_proteograms_dir`: Path where generated proteograms will be saved
    - `limit_file`: (Optional) Path to a file listing specific structures to process
 
-### Creating proteograms
+### Creating Proteograms
 
-To create proteograms for your protein structures, run the following from the `scripts` folder:
+To create Proteograms for your protein structures, run the following from the `scripts` folder:
 ```bash
 cd scripts
 uv run python create_v2_proteograms.py
 ```
 
 Optional arguments:
-- `--overwrite`: Recreate proteograms even if they already exist
+- `--overwrite`: Recreate Proteograms even if they already exist
 - `--verbose`: Enable verbose output and logging
 - `--save_simulated_pdb`: Save the final MD simulation structure as a PDB file to a subfolder
 
-### Measure similarity of a single domain to a database of proteograms
+### Measure similarity of a single domain to a database of Proteograms
 
-To compare a new structure against an existing database of proteograms and retrieve the top-k most similar proteins:
+To compare a new structure against an existing database of Proteograms and retrieve the top-k most similar proteins:
 
-1. Ensure you have a database of pre-computed proteograms (supplied separately or generated using the step above)
+1. Ensure you have a database of pre-computed Proteograms (supplied separately or generated using the step above)
 
 2. Run the similarity search from the `scripts` folder:
    ```bash
@@ -113,10 +113,6 @@ To compare a new structure against an existing database of proteograms and retri
    ```
    
    Modify the script to specify your query structure and the path to the proteogram database.
-
-Example resulting search image (scores and proteogram files are also output):
-
-![example set of 5 search hits](assets/AF-A0A3M6TU40-F1-model_v4_A_top_sims.jpg)
 
 ### Running an MD simulation
 
@@ -161,12 +157,11 @@ The following table provides an overview of all scripts in the `scripts/` folder
 
 | Script | Purpose | Config Variables (`config.yml`) | Command-Line Arguments |
 |--------|---------|--------------------------------|------------------------|
-| `create_v2_proteograms.py` | Create proteograms using MD-based nonbonded force calculations | `limit_file`, `scope_structures_dir`, `all_proteograms_dir` | `--max_workers`, `--overwrite`, `--verbose`, `--save_simulated_pdb` |
-| `create_proteograms.py` | Create proteograms using distance/hydrophobicity/charge maps (v1) | `scope_structures_dir`, `eval_proteograms_dir`, `limit_file` | None |
+| `create_v2_proteograms.py` | Create proteograms using MD-based nonbonded energy calculations, distances, and hydrophobicity deltas (v2) | `limit_file`, `scope_structures_dir`, `all_proteograms_dir` | `--max_workers`, `--overwrite`, `--verbose`, `--save_simulated_pdb` |
+| `create_proteograms.py` | Create proteograms using distances, hydrophobicity deltas, and charge maps (v1) | `scope_structures_dir`, `eval_proteograms_dir`, `limit_file` | None |
 | `measure_similarity_single_domain.py` | Search a single structure against a proteogram database | `top_k`, `model_file`, `embed_file`, `embed_file_exists`, `proteogram_sim_results`, `proteograms_dir_single_search` | None |
 | `measure_similarity.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | None |
-| `train_resnet_model.py` | Fine-tune a ResNet18 model for proteogram classification | `training_data_dir`, `model_file`, `num_epochs`, `learning_rate`, `batch_size`, `pretrained` | None |
-| `train_cnn_model.py` | Train an alternative CNN model for proteogram classification | `num_epochs_cnn`, `learning_rate_cnn`, `batch_size_cnn`, `cnn_model_file_prefix` | Uses `argparse` (see script) |
+| `train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping, class balancing, and per-class evaluation | `training_data_dir`, `num_epochs_cnn`, `learning_rate_cnn`, `batch_size_cnn`, `cnn_model_file_prefix`, `scope_level` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
 | `evaluate_methods.py` | Evaluate proteogram approach vs GTalign and USalign | `gtalign_results_dir`, `usalign_results`, `save_bad_searches_dir`, `save_good_searches_dir` | None |
 | `make_training_and_eval_data.py` | Create training/validation datasets with SCOPe annotations | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out` | None |
 | `make_training_data_exclude_eval.py` | Create training data excluding evaluation set proteins | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out`, `scope_level` | None |
@@ -177,8 +172,7 @@ The following table provides an overview of all scripts in the `scripts/` folder
 
 > **Note:** Scripts with "None (hardcoded paths in script)" require editing the script directly to set file paths. See `config.example.yml` for descriptions of all configuration variables.
 
-## Workflow for paper where the proteogram approach was compared to GTalign and USalign
-
+## Workflow for paper where the Proteogram approach was compared to GTalign and USalign
 
 ### Overview of v1 approach
 
@@ -187,6 +181,10 @@ The following table provides an overview of all scripts in the `scripts/` folder
 ### Proteogram v1 generation
 
 ![](assets/proteogram_generation.png)
+
+Example of resulting top 5 most similar Proteograms using the v1 approach:
+
+![](assets/AF-A0A3M6TU40-F1-model_v4_A_top_sims.jpg)
 
 ## References
 
