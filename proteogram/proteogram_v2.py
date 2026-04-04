@@ -120,9 +120,6 @@ class ProteogramV2:
                 - io.StringIO | None: Production PDB structure stream
                     (only if return_simulated_pdb=True).
         """
-        disto_map = self.calc_dist_matrix()
-        hydro_map = self.calc_hydrophobicity_map(self.sequence, disto_map)
-
         # Initialize the model
         model = NonBondedForceModel(
             pdb_path=self.pdb_path,
@@ -149,18 +146,20 @@ class ProteogramV2:
         )
 
         # Explicit clean-up of OpenMM resources after pipeline completion
-        model.cleanup_all_resources()
+        model.cleanup_all_resources(final_run=True)
         model._clear_cuda_cache()
-        model._cleanup_old_simulation()  # Ensure any old simulations are cleaned up
         del model
         
         # Unpack results based on whether simulated PDB was requested
         if return_simulated_pdb:
             vdw_e_att, vdw_e_rep, es_e_att, es_e_rep, \
-                simulated_pdb = pipeline_result
+                disto_map, simulated_pdb = pipeline_result
         else:
-            vdw_e_att, vdw_e_rep, es_e_att, es_e_rep = pipeline_result
+            vdw_e_att, vdw_e_rep, es_e_att, es_e_rep, disto_map = pipeline_result
             simulated_pdb = None
+
+        # Hydrophobicity map depends on the MD-derived distance matrix
+        hydro_map = self.calc_hydrophobicity_map(self.sequence, disto_map)
         
         # Normalize all maps to [0-255]
         norm_disto_map, disto_err = self.normalize_map(disto_map)

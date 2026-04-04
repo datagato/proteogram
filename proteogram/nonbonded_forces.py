@@ -64,6 +64,7 @@ class NonBondedForceModel:
     DEFAULT_NVT_STEPS = 50000  # 100 ps  with 2 fs timestep
     DEFAULT_PRODUCTION_STEPS = 500000  # 1 ns with 2 fs timestep
     DEFAULT_REPORTING_INTERVAL = 5000  # Report every 10 ps
+    VDW_RECORDING_CUTOFF = 0.8  # nm — atom pairs beyond this are excluded from LJ recording
 
     def __init__(
         self,
@@ -390,7 +391,7 @@ class NonBondedForceModel:
         platform = self._get_platform()
         
         # Clean up old simulation to free memory (especially CUDA)
-        self._cleanup_old_simulation()
+        self.cleanup_all_resources(final_run=False)
         
         # Don't store system here - Simulation manages its own system lifetime
         # Create fresh system for this simulation
@@ -1437,11 +1438,25 @@ class NonBondedForceModel:
         if self.debug:
             self._log_energy('production', 0.0, initial_energy)
         
-        # Accumulators for energies
+        # Build ordered list of Cα atom indices for protein residues
+        _protein_res_set = set(self.protein_residue_indices)
+        _ca_atom_for_residue = {}
+        for _residue in self.topology.residues():
+            if _residue.index in _protein_res_set:
+                for _atom in _residue.atoms():
+                    if _atom.name == 'CA':
+                        _ca_atom_for_residue[_residue.index] = _atom.index
+                        break
+        ca_indices = [_ca_atom_for_residue[r] for r in self.protein_residue_indices
+                      if r in _ca_atom_for_residue]
+        n_ca = len(ca_indices)
+
+        # Accumulators for energies and Cα distances
         vdw_energy_attractive_sum = np.zeros((n_residues, n_residues))
         vdw_energy_repulsive_sum = np.zeros((n_residues, n_residues))
         es_energy_attractive_sum = np.zeros((n_residues, n_residues))
         es_energy_repulsive_sum = np.zeros((n_residues, n_residues))
+        dist_sum = np.zeros((n_ca, n_ca))
         
         steps_run = 0
         frame_count = 0
@@ -1495,6 +1510,16 @@ class NonBondedForceModel:
             es_energy_attractive_sum += es_e_att
             es_energy_repulsive_sum += es_e_rep
 
+            # Accumulate Cα pairwise distances (upper triangle, Å)
+            _pos_nm = (positions.value_in_unit(nanometer)
+                       if hasattr(positions, 'value_in_unit')
+                       else np.asarray(positions, dtype=np.float64))
+            _ca_pos = np.asarray(_pos_nm)[ca_indices]          # (n_ca, 3) nm
+            _diff = _ca_pos[:, np.newaxis, :] - _ca_pos[np.newaxis, :, :]
+            _dist = np.sqrt(np.einsum('ijk,ijk->ij', _diff, _diff)) * 10.0  # nm → Å
+            dist_sum += np.triu(_dist, k=1)
+            del _pos_nm, _ca_pos, _diff, _dist
+
             frame_count+=1
             
             # Periodic garbage collection to free memory from temporary objects
@@ -1526,10 +1551,13 @@ class NonBondedForceModel:
         vdw_energy_repulsive_avg = vdw_energy_repulsive_sum / frame_count
         es_energy_attractive_avg = es_energy_attractive_sum / frame_count
         es_energy_repulsive_avg = es_energy_repulsive_sum / frame_count
+        dist_avg = dist_sum / frame_count
 
         print("Production MD complete.")
 
-        return [vdw_energy_attractive_avg, vdw_energy_repulsive_avg, es_energy_attractive_avg, es_energy_repulsive_avg]
+        return [vdw_energy_attractive_avg, vdw_energy_repulsive_avg,
+                es_energy_attractive_avg, es_energy_repulsive_avg,
+                dist_avg]
 
 
     def _get_context(self) -> Context:
@@ -1849,23 +1877,22 @@ class NonBondedForceModel:
                         
                         if r < 0.1:  # Skip if too close (< 1 Angstrom)
                             continue
-                        
+
                         # Lennard-Jones combining rules (Lorentz-Berthelot)
                         sigma_ij = (sigma_i + sigma_j) / 2
                         epsilon_ij = np.sqrt(epsilon_i * epsilon_j)
-                        
+
                         # LJ potential: 4*eps*[(sigma/r)^12 - (sigma/r)^6]
-                        sigma_over_r = sigma_ij / r
-                        sr6 = sigma_over_r ** 6
-                        sr12 = sr6 ** 2
-                        
-                        # LJ Energy terms
-                        # Repulsive term (r^-12)
-                        vdw_energy_rep_ij += 4 * epsilon_ij * sr12
-                        # Attractive term (r^-6)
-                        vdw_energy_att_ij += -4 * epsilon_ij * sr6
-                        
-                        # Coulomb potential: k * q1 * q2 / r
+                        # Applied only within VDW_RECORDING_CUTOFF — LJ decays as r^-6
+                        # and is negligible beyond ~0.8 nm; excluding it removes noise.
+                        if r <= self.VDW_RECORDING_CUTOFF:
+                            sigma_over_r = sigma_ij / r
+                            sr6 = sigma_over_r ** 6
+                            sr12 = sr6 ** 2
+                            vdw_energy_rep_ij += 4 * epsilon_ij * sr12   # repulsive r^-12
+                            vdw_energy_att_ij += -4 * epsilon_ij * sr6   # attractive r^-6
+
+                        # Coulomb potential: k * q1 * q2 / r (no cutoff)
                         es_energy = k_coulomb * charge_i * charge_j / r
                         
                         if es_energy > 0:
@@ -2139,12 +2166,13 @@ class NonBondedForceModel:
                 such as energy statistics and graphs.
 
         Returns:
-            tuple[np.ndarray, ...]: Eight NxN matrices (or nine items if
-                return_simulated_pdb is True):
-                - vdw_attractive: Attractive VdW energies (kJ/mol)
-                - vdw_repulsive: Repulsive VdW energies (kJ/mol)
-                - es_attractive: Attractive electrostatic energies (kJ/mol)
-                - es_repulsive: Repulsive electrostatic energies (kJ/mol)
+            list[np.ndarray, ...]: Five arrays (six if return_simulated_pdb is True):
+                - vdw_attractive: Attractive VdW energies, NxN (kJ/mol)
+                - vdw_repulsive: Repulsive VdW energies, NxN (kJ/mol)
+                - es_attractive: Attractive electrostatic energies, NxN (kJ/mol)
+                - es_repulsive: Repulsive electrostatic energies, NxN (kJ/mol)
+                - dist_avg: Frame-averaged Cα pairwise distances, NxN upper
+                    triangle (Å)
                 - production_pdb (io.StringIO): Final production structure as PDB
                     stream (only if return_simulated_pdb=True)
         """
