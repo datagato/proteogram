@@ -14,6 +14,9 @@ The original Proteogram approach creates an NxN 3-channel image representation (
 
 This representation captures both spatial similarity through distograms and physicochemical properties through hydrophobicity and charge maps. The resulting RGB image is inherently sequence-alignment independent and can be processed by standard computer vision models to generate embedding vectors for cosine-similarity-based search.
 
+Example proteogram v1 (3 properties - symmetric):
+![](assets/3KFD_A.jpg)
+
 ### Proteogram v2: Incorporating MD Simulations
 
 Proteogram v2 extends the original approach by incorporating molecular dynamics (MD) simulations to compute physics-based residue-residue interaction energies. Instead of using static distance and property maps, v2 runs a complete MD simulation pipeline using OpenMM with the AMBER ff19SB force field to calculate:
@@ -24,6 +27,9 @@ Proteogram v2 extends the original approach by incorporating molecular dynamics 
 The MD pipeline includes energy minimization, NPT and NVT equilibration, and production dynamics. The resulting 3-channel data (with 6 attributes in total) provides a richer representation of protein structure that accounts for dynamic conformational sampling and explicit solvent effects.
 
 For detailed information on the MD simulation methodology, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).
+
+Example Proteogram v2 (6 properties - asymmetric):
+![](assets/d3kfda_.jpg)
 
 ## Getting started
 
