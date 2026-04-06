@@ -15,6 +15,7 @@ The original Proteogram approach creates an NxN 3-channel image representation (
 This representation captures both spatial similarity through distograms and physicochemical properties through hydrophobicity and charge maps. The resulting RGB image is inherently sequence-alignment independent and can be processed by standard computer vision models to generate embedding vectors for cosine-similarity-based search.
 
 Example proteogram v1 (3 properties - symmetric):
+
 ![](assets/3KFD_A.jpg)
 
 ### Proteogram v2: Incorporating MD Simulations
@@ -29,6 +30,7 @@ The MD pipeline includes energy minimization, NPT and NVT equilibration, and pro
 For detailed information on the MD simulation methodology, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).
 
 Example Proteogram v2 (6 properties - asymmetric):
+
 ![](assets/d3kfda_.jpg)
 
 ## Getting started
