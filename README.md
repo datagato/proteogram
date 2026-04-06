@@ -29,6 +29,32 @@ For detailed information on the MD simulation methodology, see the [MD Simulatio
 
 This repo uses Python 3.11+.
 
+### System Requirements
+
+**Operating System**
+- Ubuntu 22.04.5 LTS or 24.04 LTS
+
+**GPU (required for MD simulations and recommended for training/inference):**
+- NVIDIA GPU with CUDA 12 support (e.g. RTX 3090, A100, H100)
+- NVIDIA driver ≥ 525.x (required for CUDA 12)
+- NVIDIA Container Toolkit (for Docker GPU workflows)
+
+**CPU and RAM:**
+- x86-64 CPU (AVX2 recommended for PyTorch performance)
+- Minimum 32 GB system RAM; 64 GB recommended for large proteogram datasets (with creation run in parallel)
+
+**Software:**
+- Python 3.11+
+- CUDA Toolkit 12.x (non-Docker GPU workflows)
+- `uv` package manager (see [installation instructions](https://docs.astral.sh/uv/getting-started/installation/))
+
+**MD simulation resource usage by protein length** (GPU-accelerated with an NVIDIA GeForce RTX 4090, Driver Version 535.288.01, CUDA Version 12.2, via OpenMM CUDA platform):
+
+| Protein Length | Approx. Max RAM | Approx. Max GPU VRAM | Approx. Time (Minutes) |
+|----------------|---------|--------------|--------------|
+| 50 residues   |    900 MB     |      800 MB        |       5       |
+| 200 residues   |    1 GB     |      900 MB        |      53        |
+
 ### Installing the package
 
 This project uses [uv](https://docs.astral.sh/uv/) as the package manager. To install `uv`, follow the [installation instructions](https://docs.astral.sh/uv/getting-started/installation/).
@@ -151,7 +177,7 @@ model.cleanup()
 
 For detailed information on the MD simulation methodology, force calculations, and energy validation, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).
 
-## Scripts Reference
+## Scripts reference
 
 The following table provides an overview of all scripts in the `scripts/` folder, their purpose, and the configuration variables or command-line arguments they use.
 
@@ -161,7 +187,7 @@ The following table provides an overview of all scripts in the `scripts/` folder
 | `create_proteograms.py` | Create proteograms using distances, hydrophobicity deltas, and charge maps (v1) | `scope_structures_dir`, `eval_proteograms_dir`, `limit_file` | None |
 | `measure_similarity_single_domain.py` | Search a single structure against a proteogram database | `top_k`, `model_file`, `embed_file`, `embed_file_exists`, `proteogram_sim_results`, `proteograms_dir_single_search` | None |
 | `measure_similarity.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | None |
-| `train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping, class balancing, and per-class evaluation | `training_data_dir`, `num_epochs_cnn`, `learning_rate_cnn`, `batch_size_cnn`, `cnn_model_file_prefix`, `scope_level` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
+| `train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping and per-class evaluation | `training_data_dir`, `num_epochs_cnn`, `learning_rate_cnn`, `batch_size_cnn`, `cnn_model_file_prefix`, `scope_level` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
 | `evaluate_methods.py` | Evaluate proteogram approach vs GTalign and USalign | `gtalign_results_dir`, `usalign_results`, `save_bad_searches_dir`, `save_good_searches_dir` | None |
 | `make_training_and_eval_data.py` | Create training/validation datasets with SCOPe annotations | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out` | None |
 | `make_training_data_exclude_eval.py` | Create training data excluding evaluation set proteins | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out`, `scope_level` | None |
@@ -199,8 +225,6 @@ Example of resulting top 5 most similar Proteograms using the v1 approach:
 5. **AMBER ff19SB** - Tian, C., Kasavajhala, K., Belfon, K.A.A., Raguette, L., Huang, H., Migues, A.N., Bickel, J., Wang, Y., Pincay, J., Wu, Q., & Simmerling, C. (2020). ff19SB: Amino-Acid-Specific Protein Backbone Parameters Trained against Quantum Mechanics Energy Surfaces in Solution. *Journal of Chemical Theory and Computation*, 16(1), 528-552. https://doi.org/10.1021/acs.jctc.9b00591
 
 6. **ResNet** - He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep Residual Learning for Image Recognition. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 770-778. https://doi.org/10.1109/CVPR.2016.90
-
-7. **Foldseek** - van Kempen, M., Kim, S.S., Tumescheit, C., Mirdita, M., Lee, J., Gilchrist, C.L.M., Söding, J., & Steinegger, M. (2024). Fast and accurate protein structure search with Foldseek. *Nature Biotechnology*, 42, 243–246. https://doi.org/10.1038/s41587-023-01773-0
 
 
 # Docker Guide (uv based)
