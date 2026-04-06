@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "proteogram"
+version = "0.0.2"
+description = "Protein structure to image manipulation and analysis."
+authors = ["Micheleen Harris"]
+license = "LICENSE"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+nglview = "^3.1.2"
+biopython = "^1.8"
+pandas = "^2.2.2"
+matplotlib = "^3.6"
+rcsbsearchapi = "1.5.1"
+ase = "3.23.0"
+numpy = "^1"
+torch = "^2.2"
+torchvision = "^0.17"
+torchsummary = "^1.5"
+kmeans-pytorch = "^0.3"
+pyrotein = { git = "https://github.com/carbonscott/pyrotein.git", branch = "main" }
+
+[tool.poetry.dev-dependencies]
+jupyterlab = "4.2.5"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

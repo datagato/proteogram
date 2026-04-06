@@ -1,29 +1,45 @@
-[tool.poetry]
+[project]
 name = "proteogram"
-version = "0.0.2"
+version = "0.0.3"
 description = "Protein structure to image manipulation and analysis."
-authors = ["Micheleen Harris"]
-license = "LICENSE"
-readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "biopython>=1.8",
+  "matplotlib>=3.6",
+  "MDAnalysis[analysis,extra_formats,parallel]>=2.10.0",
+  "numpy>=1.26",
+  "openmm>=8.4",
+  "pandas>=3.0",
+  "pdbfixer @ git+https://github.com/openmm/pdbfixer@94cfa4c",
+  "pillow>=12.1",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "torchsummary>=1.5",
+  "kmeans-pytorch>=0.3",
+  "tqdm>=4.67",
+  "psutil>=7.2.2",
+  "objgraph>=3.6.2",
+  "PyYAML>=6.0",
+  "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main",
+]
 
-[tool.poetry.dependencies]
-python = "^3.11"
-nglview = "^3.1.2"
-biopython = "^1.8"
-pandas = "^2.2.2"
-matplotlib = "^3.6"
-rcsbsearchapi = "1.5.1"
-ase = "3.23.0"
-numpy = "^1"
-torch = "^2.2"
-torchvision = "^0.17"
-torchsummary = "^1.5"
-kmeans-pytorch = "^0.3"
-pyrotein = { git = "https://github.com/carbonscott/pyrotein.git", branch = "main" }
+[project.optional-dependencies]
+cuda12 = [
+  "openmm==8.4.0",
+  "nvidia-cuda-nvcc-cu12==12.9.86",
+  "openmm-cuda-12==8.4.0.post2"
+]
+test = ["pytest", "pytest-cov"]
+notebook = [
+  "jupyterlab>=4.2.5",
+  "nglview>=3.1.4",
+  "rcsbsearchapi>=1.5.1"
+]
 
-[tool.poetry.dev-dependencies]
-jupyterlab = "4.2.5"
+[tool.setuptools.packages.find]
+# Exclude patterns should match the full package name
+exclude = ["assets", "docs", "paper", "notebooks", "scripts", "tmp"] 
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
