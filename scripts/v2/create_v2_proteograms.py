@@ -166,8 +166,7 @@ if __name__ == '__main__':
             proteogram = ProteogramV2(pdb_file,
                                       output_dir=proteograms_output_dir,
                                       chain_id=chain_id,
-                                      atom_distance_cutoff=20,
-                                      hydrophobicity_delta_cutoff=30,
+                                      calpha_atom_distance_cutoff=10,
                                       sequence_len_lower_cutoff=20,
                                       sequence_len_upper_cutoff=1000,
                                       use_gpu=use_gpu)

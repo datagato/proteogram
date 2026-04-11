@@ -14,7 +14,7 @@ The original Proteogram approach creates an NxN 3-channel image representation (
 
 This representation captures both spatial similarity through distograms and physicochemical properties through hydrophobicity and charge maps. The resulting RGB image is inherently sequence-alignment independent and can be processed by standard computer vision models to generate embedding vectors for cosine-similarity-based search.
 
-Example proteogram v1 (3 properties - symmetric):
+Example proteogram v1 (symmetric):
 
 ![](assets/3KFD_A.jpg)
 
@@ -29,11 +29,31 @@ The MD pipeline includes energy minimization, NPT and NVT equilibration, and pro
 
 For detailed information on the MD simulation methodology, see the [MD Simulation Methodology documentation](docs/md_simulation_methodology.md).
 
-Example Proteogram v2 (6 properties - asymmetric):
+The v2 Proteogram approach creates an NxN 3-channel image representation (where N is the residue length) by stacking three categories of physicochemical residue-level information in the upper triangle and three categories in the lower triangle, making v2 proteograms **asymmetric**:
+
+**Upper triangle** — MD-derived pairwise energies (AMBER ff19SB, averaged over 1 ns production trajectory) and Cα distances:
+
+| Channel | Property | Description |
+|---------|----------|-------------|
+| R | VdW attractive energy | London dispersion ($r^{-6}$ term), kJ/mol; atom pairs within 0.8 nm recording cutoff |
+| G | VdW repulsive energy | Pauli repulsion ($r^{-12}$ term), kJ/mol; atom pairs within 0.8 nm recording cutoff |
+| B | Cα pairwise distance | All-pairs distogram from production MD trajectory (no cutoff) |
+
+**Lower triangle** — complementary MD-pairwise energies and a chemical property:
+
+| Channel | Property | Description |
+|---------|----------|-------------|
+| R | Electrostatic attractive energy | Opposite-charge residue pairs ($q_i \cdot q_j < 0$), kJ/mol; direct Coulomb, no distance cutoff |
+| G | Electrostatic repulsive energy | Like-charge residue pairs ($q_i \cdot q_j > 0$), kJ/mol; direct Coulomb, no distance cutoff |
+| B | Hydrophobicity delta | Absolute difference in hydrophobicity between residue pairs within the 10 Å Cα distance cutoff |
+
+All six maps are normalized to [0–255] before combining into the final RGB image.
+
+Example Proteogram v2 (asymmetric):
 
 ![](assets/d3kfda_.jpg)
 
-## Getting started
+## Getting started with Proteogram v2
 
 This repo uses Python 3.11+.
 
@@ -113,44 +133,34 @@ uv add --dev <packagename>
 
 1. Copy the example configuration file:
    ```bash
-   cp scripts/config.example.yml scripts/config.yml
+   cp scripts/v2/config.example.yml scripts/v2/config.yml
    ```
 
-2. Edit `scripts/config.yml` to configure:
+2. Edit `scripts/v2/config.yml` to configure:
    - `scope_structures_dir`: Path to your input PDB structure files (here we used SCOPe 2.08 structures)
    - `all_proteograms_dir`: Path where generated proteograms will be saved
-   - `limit_file`: (Optional) Path to a file listing specific structures to process
+   - `limit_file`: (Optional) Path to a file listing specific structures to process (one per line)
 
 ### Creating Proteograms
 
-To create Proteograms for your protein structures, run the following from the `scripts` folder:
+To create Proteograms for your protein structure(s), run the following from the `scripts/v2` folder:
 ```bash
-cd scripts
+cd scripts/v2
 uv run python create_v2_proteograms.py
 ```
 
-Optional arguments:
+Optional arguments/flags:
 - `--overwrite`: Recreate Proteograms even if they already exist
 - `--verbose`: Enable verbose output and logging
 - `--save_simulated_pdb`: Save the final MD simulation structure as a PDB file to a subfolder
 
-### Measure similarity of a single domain to a database of Proteograms
+### Measure similarity of a single domain against a database of Proteograms
 
-To compare a new structure against an existing database of Proteograms and retrieve the top-k most similar proteins:
+> Coming soon
 
-1. Ensure you have a database of pre-computed Proteograms (supplied separately or generated using the step above)
+### Running an MD simulation (without creating a Proteogram)
 
-2. Run the similarity search from the `scripts` folder:
-   ```bash
-   cd scripts
-   uv run python measure_similarity_single_domain.py
-   ```
-   
-   Modify the script to specify your query structure and the path to the proteogram database.
-
-### Running an MD simulation
-
-The `NonBondedForceModel` module provides a complete pipeline for running molecular dynamics simulations and calculating residue-residue interaction energies. Here's an example:
+The `NonBondedForceModel` module provides a complete pipeline for running molecular dynamics simulations by themselves and calculating residue-residue interaction energies (Van der Waals and electrostatics). Here's an example:
 
 ```python
 from proteogram.v2 import NonBondedForceModel
@@ -228,13 +238,13 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 
 > **Note:** Scripts with "None (hardcoded paths in script)" require editing the script directly to set file paths. See `config.example.yml` in the relevant subfolder for descriptions of all configuration variables.
 
-## Workflow for paper where the Proteogram approach was compared to GTalign and USalign
+## Workflow for paper where the Proteogram approach was compared to popular methods for structure alignment and search
 
 ### Overview of v1 approach
 
 ![](assets/Workflow-Structure-Compression.png)
 
-### Proteogram v1 generation
+#### Proteogram v1 generation
 
 ![](assets/proteogram_generation.png)
 

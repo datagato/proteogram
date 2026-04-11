@@ -30,8 +30,7 @@ class ProteogramV2:
         chain: Selected chain from the model.
         allowed_amino_acids (dict): Mapping of residue names to single-letter codes.
         sequence (str): Amino acid sequence of the chain.
-        atom_distance_cutoff (float): Distance cutoff for atom interactions in Angstroms.
-        hydrophobicity_delta_cutoff (float): Cutoff for hydrophobicity delta calculations.
+        calpha_atom_distance_cutoff (float): Cα distance cutoff for hydrophobicity map in Angstroms.
         sequence_len_lower_cutoff (int): Minimum sequence length for valid chains.
         sequence_len_upper_cutoff (float): Maximum sequence length for valid chains.
     """
@@ -40,8 +39,7 @@ class ProteogramV2:
                  pdb_path,
                  output_dir,
                  chain_id,
-                 atom_distance_cutoff=10,
-                 hydrophobicity_delta_cutoff=30,
+                 calpha_atom_distance_cutoff=10,
                  sequence_len_lower_cutoff=20,
                  sequence_len_upper_cutoff=1e9,
                  use_gpu=False):
@@ -50,10 +48,8 @@ class ProteogramV2:
         Args:
             pdb_path (str): Path to the PDB file.
             chain_id (str): Chain identifier to extract from the PDB file.
-            atom_distance_cutoff (float, optional): Distance cutoff for atom
-                interactions in Angstroms. Defaults to 15.
-            hydrophobicity_delta_cutoff (float, optional): Cutoff for
-                hydrophobicity delta calculations. Defaults to 20.
+            calpha_atom_distance_cutoff (float, optional): Cα distance cutoff
+                for hydrophobicity map in Angstroms. Defaults to 10.
             sequence_len_lower_cutoff (int, optional): Minimum sequence length
                 for valid chains. Defaults to 20.
             sequence_len_upper_cutoff (float, optional): Maximum sequence length
@@ -75,8 +71,7 @@ class ProteogramV2:
         self.allowed_amino_acids = {b: a for a, b in RESIDUE_LIST}
         self.sequence = ''.join(
             [self.allowed_amino_acids[res.resname] for res in self.chain])
-        self.atom_distance_cutoff = atom_distance_cutoff
-        self.hydrophobicity_delta_cutoff = hydrophobicity_delta_cutoff
+        self.calpha_atom_distance_cutoff = calpha_atom_distance_cutoff
         self.sequence_len_lower_cutoff = sequence_len_lower_cutoff
         self.sequence_len_upper_cutoff = sequence_len_upper_cutoff
         self.use_gpu = use_gpu
@@ -272,7 +267,7 @@ class ProteogramV2:
         for row in range(len(sequence)):
             for col in range(row+1, len(sequence)):
                 # If residues less than cutoff num of Angstroms
-                if disto_map[row,col] < self.atom_distance_cutoff:
+                if disto_map[row,col] < self.calpha_atom_distance_cutoff:
                     try:
                         row_val = np.abs(HYDROPHOBICITY_LIST[sequence[row]])
                         col_val = np.abs(HYDROPHOBICITY_LIST[sequence[col]])

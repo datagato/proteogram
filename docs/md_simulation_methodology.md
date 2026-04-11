@@ -256,7 +256,7 @@ This approach isolates the direct non-bonded interactions within the protein str
 
 ## Output Matrices
 
-The pipeline produces **8 NxN matrices** (where N = number of protein residues):
+The pipeline produces **4 NxN matrices** (where N = number of protein residues):
 
 ### Energy Matrices (units: kJ/mol)
 

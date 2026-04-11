@@ -1,9 +1,9 @@
 # for create_proteograms.py and create_v2_proteograms.py
 limit_file: '' # optional, limit to these structures, .ent file base name one per line
-scope_structures_dir: '' # input structures, .ent file format
+scope_structures_dir: '' # input structures, .ent/.pdb file format
 eval_proteograms_dir: '' # input proteogram dir for eval set
 all_proteograms_dir: '' # input proteogram dir for all structures
-eval_structures_dir: '' # input structures for eval set, .ent file format
+eval_structures_dir: '' # input structures for eval set, .ent/.pdb file format
 
 # for measure_similarity_single_domain.py
 proteograms_dir_single_search: '' # dir of proteograms to search against
