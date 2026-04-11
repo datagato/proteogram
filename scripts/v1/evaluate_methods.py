@@ -17,7 +17,7 @@ from collections import OrderedDict
 
 from Bio.SCOP import Scop
 
-from proteogram.utils import read_yaml
+from proteogram.common.utils import read_yaml
 
 
 def read_gtalign_results(gtalign_results_dir):

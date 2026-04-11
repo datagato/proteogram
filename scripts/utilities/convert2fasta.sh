@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define the directory you want to start from
-start_dir="./data/pdbstyle-2.08" # Change this to your directory of PDB files
+start_dir="../data/pdbstyle-2.08" # Change this to your directory of PDB files
 
 echo "Starting recursive loop using find in $start_dir"
 

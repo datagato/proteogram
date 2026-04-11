@@ -32,7 +32,7 @@ import torch.optim as optim
 import torchvision.models as tv_models
 import torchvision.transforms as transforms
 
-from proteogram.utils import read_yaml
+from proteogram.common import read_yaml
 
 
 matplotlib.use('agg')
@@ -548,8 +548,7 @@ if __name__ == '__main__':
     image_resize = 200  # pad to largest possible size; GAP makes the FC layer size-agnostic
 
     # ResNet18 was trained with ImageNet normalisation — apply the same preprocessing
-    # so the pretrained feature detectors remain valid.  The from-scratch CNN does not
-    # need this (no pretrained assumptions), so we skip it there.
+    # so the pretrained feature detectors remain valid. The ConvNet was not pretrained, so it doesn't strictly require ImageNet normalisation, but applying the same normalisation to both models allows for a more controlled comparison.
     _imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                           std=[0.229, 0.224, 0.225])
     _augment = [
@@ -565,7 +564,7 @@ if __name__ == '__main__':
         transform_eval  = transforms.Compose([transforms.ToTensor(), _imagenet_norm])
     
     tsv_file = args.tsv_file or os.path.join(
-        root_dir, 'ProteogramData_SCOP_RCSB_PDBe_AnnotationsLookup.tsv')
+        root_dir, '..', 'ProteogramData_SCOP_RCSB_PDBe_AnnotationsLookup_AllSCOPe208.tsv')
 
     exclude_classes = [c.strip() for c in args.exclude_classes.split(',')] \
         if args.exclude_classes else None

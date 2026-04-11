@@ -24,7 +24,6 @@ Class column options:
     - SCOPeSuperfamily: Superfamily level classification  
     - SCOPeFamily: Family level classification
 """
-
 import argparse
 import math
 import pandas as pd

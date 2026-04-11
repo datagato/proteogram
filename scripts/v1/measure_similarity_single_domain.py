@@ -12,9 +12,9 @@ import pickle
 import torch
 import matplotlib.pyplot as plt
 
-from proteogram.image_similarity import Img2Vec
-from proteogram.utils import read_yaml, split_by_chain_and_save
-from proteogram.proteogram import Proteogram
+from proteogram.v1.image_similarity import Img2Vec
+from proteogram.common.utils import read_yaml, split_by_chain_and_save
+from proteogram.v1.proteogram import Proteogram
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ from Bio.PDB.PDBParser import PDBParser, PDBConstructionWarning
 from Bio.PDB.Polypeptide import PPBuilder
 from Bio.SCOP import Scop
 
-from proteogram.utils import read_yaml
+from proteogram.common import read_yaml
 
 
 # Ignore PDB construction warnings
@@ -35,7 +35,7 @@ def get_sequence(pdb_path):
 
 if __name__ == '__main__':
 
-    config = read_yaml('config.yml')
+    config = read_yaml('../config.yml')
     limit_file = config['limit_file']
     structures_dir = config['scope_structures_dir']
     annot_file = config['annot_file']

@@ -18,7 +18,7 @@ from collections import OrderedDict
 
 from Bio.SCOP import Scop
 
-from proteogram.utils import read_yaml
+from proteogram.common import read_yaml
 
 
 def lookup(df, filter_col, filter_val, value_col):
@@ -175,6 +175,7 @@ if __name__ == '__main__':
     config = read_yaml('config.yml')
     top_k = config['top_k']
     scope_eval_set = config['scope_eval_set']
+    label_df_dir = os.path.dirname(scope_eval_set)
     proteogram_sim_results = config['proteogram_sim_results']
     gtalign_results_dir = config['gtalign_results_dir']
     usalign_results = config['usalign_results']
@@ -241,7 +242,7 @@ if __name__ == '__main__':
 
     print(label_df.nunique())
 
-    label_df.to_csv(os.path.join('data', scope_eval_set.split('.')[0]+'_labels.tsv'),
+    label_df.to_csv(os.path.join(label_df_dir, 'scope_eval_set_labels.tsv'),
                     sep='\t', index=False)
 
     # Calculate Precision@K's and MAP@K's

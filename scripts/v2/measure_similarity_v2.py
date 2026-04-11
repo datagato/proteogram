@@ -13,8 +13,8 @@ import torch
 import torchvision.transforms as transforms
 from PIL import Image
 
-from proteogram.image_similarity_v2 import Img2Vec
-from proteogram.utils import read_yaml
+from proteogram.v2 import Img2Vec
+from proteogram.common import read_yaml
 
 
 def pad_to_200(img, target=200, fill=128):

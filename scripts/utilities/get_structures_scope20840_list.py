@@ -19,7 +19,7 @@ import warnings
 from Bio.PDB.PDBList import PDBList
 from Bio import SeqIO, PDB
 
-from proteogram.utils import split_by_chain_and_save, ChainSelect
+from proteogram.common.utils import split_by_chain_and_save, ChainSelect
 
 
 warnings.filterwarnings("ignore", category=PDB.PDBParser.PDBConstructionWarning)

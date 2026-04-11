@@ -5,7 +5,7 @@ import pyrotein as pr
 from Bio.PDB.PDBParser import PDBParser, PDBConstructionWarning
 from Bio.PDB.Polypeptide import PPBuilder
 
-from .constants import (
+from ..common.constants import (
     HYDROPHOBICITY_LIST_BINARY,
     HYDROPHOBICITY_LIST,
     CHARGE_LIST

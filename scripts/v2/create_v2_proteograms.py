@@ -1,4 +1,4 @@
-from proteogram.proteogram_v2 import ProteogramV2
+from proteogram.v2 import ProteogramV2
 import gc
 import glob
 import os
@@ -11,7 +11,7 @@ import warnings
 import argparse
 from tqdm import tqdm
 from Bio.PDB.PDBParser import PDBConstructionWarning
-from proteogram.utils import read_yaml
+from proteogram.common import read_yaml
 import psutil
 import tracemalloc
 try:
@@ -146,22 +146,7 @@ if __name__ == '__main__':
     problem_files = []
     problem_pdb_cnts = 0
     process = psutil.Process()
-    if args.debug:
-        # Record baseline OpenMM Context count BEFORE any protein is processed.
-        # OpenMM creates a small number of Contexts internally when benchmarking
-        # platforms (Platform.findPlatform).  Any count seen after cleanup that
-        # equals this baseline is NOT a leak — it is expected class-level state.
-        try:
-            import openmm as _omm_baseline
-            _baseline_ctx_count = sum(
-                1 for obj in gc.get_objects() if type(obj) is _omm_baseline.Context)
-            print(f"=== BASELINE OpenMM Context count (platform init): {_baseline_ctx_count} ===")
-        except Exception:
-            _baseline_ctx_count = 0
-        if objgraph:
-            print("=== BASELINE OBJECT COUNTS ===")
-            objgraph.show_most_common_types(limit=15)
-            print("="*40)
+
     for pdb_file, image_file in tqdm(file_list):
         if args.debug:
             mem_before = process.memory_info().rss / 1024 / 1024

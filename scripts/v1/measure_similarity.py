@@ -9,8 +9,8 @@ import pickle
 import shutil
 import torch
 
-from proteogram.image_similarity import Img2Vec
-from proteogram.utils import read_yaml
+from proteogram.v1.image_similarity import Img2Vec
+from proteogram.common.utils import read_yaml
 
 
 if __name__ == '__main__':

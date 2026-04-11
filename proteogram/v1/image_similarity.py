@@ -102,7 +102,7 @@ class Img2Vec:
             model_name = "resnet_ft"
         else:
             if model_name_or_path not in self.embed_dict.keys():
-                raise ValueError(f"The model {model_name_or_path} is not supported")
+                raise ValueError(f"The model {model_name_or_path} is not supported or is not found.")
             else:
                 model_name = model_name_or_path
         return model_name
@@ -129,7 +129,6 @@ class Img2Vec:
             preprocess = transforms.Compose(
                 [
                     transforms.Resize(224),
-                    transforms.Lambda(lambda img: img.convert('RGB')),
                     transforms.ToTensor(),
                     transforms.Normalize(
                         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -144,89 +143,17 @@ class Img2Vec:
 
     def initiate_model(self):
         if self.architecture == "resnet_ft":
-            loaded = torch.load(self.weights, weights_only=False,
-                                map_location=self.device)
-            if isinstance(loaded, nn.Module):
-                model = loaded
-            else:
-                # State dict saved with torch.save(model.state_dict()).
-                # Auto-detect architecture from key signatures.
-                model = self._model_from_state_dict(loaded)
-                model.load_state_dict(loaded)
+            model = torch.load(self.weights,
+                               weights_only=False,
+                               map_location=self.device)
         else:
-            m = getattr(models, self.architecture)
-            model = m(weights=self.weights)
+            m = getattr(
+                models, self.architecture
+            )  # equ to assigning m as models.resnet50()
+            model = m(weights=self.weights)  # equ to models.resnet50(weights=...)
         model.to(self.device)
+
         return model.eval()
-
-    def _model_from_state_dict(self, state_dict):
-        """Reconstruct a model object from a bare state dict.
-
-        Detects architecture by inspecting state dict keys:
-          - 'fc.1.weight'  -> ResNet18 with nn.Sequential(Dropout, Linear) head
-                              (saved by train_multiple_models.py --model resnet18)
-          - 'fc.weight'    -> ResNet18 with plain nn.Linear head (legacy format)
-          - 'fc2.weight'   -> From-scratch ConvNet
-                              (saved by train_multiple_models.py --model cnn)
-        """
-        import torchvision.models as tv_models
-
-        if 'fc.1.weight' in state_dict:
-            # ResNet18 with nn.Sequential(Dropout(0.5), Linear) head
-            num_classes = state_dict['fc.1.weight'].shape[0]
-            model = tv_models.resnet18()
-            model.fc = nn.Sequential(
-                nn.Dropout(0.5),
-                nn.Linear(model.fc.in_features, num_classes),
-            )
-        elif 'fc.weight' in state_dict:
-            # ResNet18 with plain nn.Linear head (legacy)
-            num_classes = state_dict['fc.weight'].shape[0]
-            model = tv_models.resnet18()
-            model.fc = nn.Linear(model.fc.in_features, num_classes)
-        elif 'fc2.weight' in state_dict:
-            # From-scratch ConvNet
-            num_classes = state_dict['fc2.weight'].shape[0]
-            model = self._build_convnet(num_classes)
-        else:
-            raise ValueError(
-                f"Cannot infer model architecture from state dict keys. "
-                f"First 10 keys: {list(state_dict.keys())[:10]}"
-            )
-        return model
-
-    @staticmethod
-    def _build_convnet(num_classes):
-        """Reconstruct the from-scratch ConvNet used in train_multiple_models.py."""
-        import torch.nn.functional as F
-
-        def _block(in_ch, out_ch):
-            return nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2, 2),
-            )
-
-        class _ConvNet(nn.Module):
-            def __init__(self, n):
-                super().__init__()
-                self.block1 = _block(3, 64)
-                self.block2 = _block(64, 128)
-                self.block3 = _block(128, 256)
-                self.block4 = _block(256, 256)
-                self.gap = nn.AdaptiveAvgPool2d(1)
-                self.fc1 = nn.Linear(256, 128)
-                self.fc2 = nn.Linear(128, n)
-
-            def forward(self, x):
-                x = self.block1(x); x = self.block2(x)
-                x = self.block3(x); x = self.block4(x)
-                x = self.gap(x).view(x.size(0), -1)
-                x = F.dropout(F.relu(self.fc1(x)), p=0.5, training=self.training)
-                return self.fc2(x)
-
-        return _ConvNet(num_classes)
 
     def assign_layer(self):
         model_embed = self.embed_dict[self.architecture]()
@@ -234,15 +161,8 @@ class Img2Vec:
         return model_embed
 
     def obtain_children(self):
-        children = list(self.model.children())
-        # ConvNet: children[-1]=fc2, children[-2]=fc1 — strip both and add Flatten
-        # so the GAP output (batch, 256, 1, 1) is correctly flattened to (batch, 256).
-        # ResNet18: children[-1]=fc, children[-2]=avgpool — strip only fc; the
-        # (batch, 512, 1, 1) avgpool output works fine with CosineSimilarity(dim=1).
-        if isinstance(children[-2], nn.Linear):
-            model_embed = nn.Sequential(*children[:-2], nn.Flatten())
-        else:
-            model_embed = nn.Sequential(*children[:-1])
+        model_embed = nn.Sequential(*list(self.model.children())[:-1])
+
         return model_embed
 
     def obtain_classifier(self):
@@ -437,7 +357,7 @@ class Img2Vec:
                      n=10,
                      save_results_dir=None,
                      save_result_images_dir=None,
-                     pad_fn=None):
+                     use_prev_embeddings=True):
         """
         Function for creating the similarity matrix between embeddings in the dataset
         using cosine similarity.
@@ -449,30 +369,88 @@ class Img2Vec:
             save as images).
         save_results_dir : str
             Directory to save the search results tsv file.
-        save_result_images_dir : str
+        save_result_images : str
             Directory to store search image results (top K images).
+        use_prev_embeddings : bool
+            Use self.dataset calculated embeddings (this requires a lot of memory)
+            otherwise calculate embeddings with multiprocessing and do not store
+            (better memory performance).
         """
+        #torch.set_num_threads(1)
+        #mp.set_start_method('spawn')
         start_sim_calc = time()
 
-        # initiate computation of cosine similarity
+        # Get all pairs of files
+        file_pairs = []
+        for i in range(len(self.files)):
+            for j in range(i+1, len(self.files)):
+                file_pairs.append((self.files[i], self.files[j]))
+        print(f'done making file_pairs')
+
+        # initiate computation of consine similarity
         cosine = nn.CosineSimilarity(dim=1).to(self.device)
-        for image_path_i, embedding_i in tqdm(self.dataset.items()):
-            scores = {}
-            for image_path_j, embedding_j in self.dataset.items():
-                sim = cosine(embedding_i, embedding_j)[0].item()
-                scores[image_path_j] = sim
-            scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-            self.sim_dict[image_path_i] = [
-                (image_path_j, sim) for k, (image_path_j, sim) in enumerate(scores)
-                if k < n
-            ]
+        if use_prev_embeddings:
+            print(f'Using previous embeddings')
+            # Create a dict of similarities (a dict of dict of scores), e.g:
+            # this looks like --> sim_dict[image_i] = {dict[image_0], dict[image_1], ...}
+            for image_path_i, embedding_i in tqdm(self.dataset.items()):
+                scores = {}
+                for image_path_j, embedding_j in self.dataset.items():
+                    sim = cosine(embedding_i, embedding_j)[0].item()
+                    scores[image_path_j] = sim
+                # Sort the scores
+                scores = sorted(scores.items(),
+                                key=lambda item: item[1],
+                                reverse=True)
+                scores_arr = []
+                for k, (image_path_j, sim) in enumerate(scores):
+                    scores_arr.append((image_path_j, sim))
+                    if k == n-1:
+                        break
+                self.sim_dict[image_path_i] = scores_arr
+            sim_calc_time = time() - start_sim_calc
+        else:
+            print(f'# CPUs = {os.cpu_count()}')
+            with mp.Pool(os.cpu_count() - 2) as pool:
+                results = pool.imap(self.sim_calc_new_embedding_scratch,
+                                    tqdm(file_pairs, total=len(file_pairs)))
+            # this looks like --> sim_dict[image_i] = {dict[image_0], dict[image_1], ...}
+            for (image_path_query, image_path_target, sim) in results:
+                if image_path_query in scores:
+                    item1 = self.sim_dict[image_path_query] # dict[image_0]
+                    if image_path_target not in item1:
+                        item1[image_path_target] = sim
+                        self.sim_dict[image_path_query] = item1
+                else:
+                    tmp = {}
+                    tmp[image_path_target] = sim # dict[image_0]
+                    self.sim_dict[image_path_query] = tmp
+            for img_path in self.sim_dict.keys():
+                scores = self.sim_dict[img_path]
+                # Sort the target images by sim scores
+                self.sim_dict[img_path] = sorted(scores.items(),
+                                                    key=lambda item: item[1],
+                                                    reverse=True)
+            # Modify data structure to tuples and capture top k results if n is defined
+            # this looks like --> sim_dict[image_i] = [(image_0, score_0), (image_1, score_1), ...]
+            for image_path_i, scores_dict in self.sim_dict.items():
+                scores_arr = []
+                for k, (image_path_j, score) in enumerate(scores_dict.items()):
+                    scores_arr.append((image_path_j, score))
+                    if n:
+                        # Reached top k if n is specified so stop
+                        if k == n-1:
+                            break
+                if len(scores_arr) < n:
+                    print(f'Something is wrong because len of scores array = {len(scores_arr)}')
+                self.sim_dict[image_path_i] = scores_arr
 
         sim_calc_time = time() - start_sim_calc
 
         # If there's a dir specified in save_result_images_dir, create result images
         if save_result_images_dir:
             for image_path in self.sim_dict.keys():
-                self.save_images(image_path, save_result_images_dir, pad_fn=pad_fn)
+                self.save_images(image_path, save_result_images_dir)
 
         # Save the search results and scores as json file
         if save_results_dir:
@@ -481,7 +459,7 @@ class Img2Vec:
 
         return sim_calc_time
 
-    def save_images(self, query_file, save_dir, scores_n_arr=None, pad_fn=None):
+    def save_images(self, query_file, save_dir, scores_n_arr=None):
         """Save similar images from similarity search"""
         images_files = [query_file]
         if not scores_n_arr:
@@ -491,8 +469,8 @@ class Img2Vec:
         else:
             images_files.extend([file for file, _ in scores_n_arr])
             scores = ['']
-            scores.extend([f'{score:.2f}' for _, score in scores_n_arr])
-        images = [pad_fn(Image.open(t)) if pad_fn else Image.open(t) for t in images_files]
+            scores.extend([f'{score:.2f}' for _, score in scores_n_arr])            
+        images = [Image.open(target) for target in images_files]
 
         max_height = 1000
         total_width = max_height * len(images)

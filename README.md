@@ -153,7 +153,7 @@ To compare a new structure against an existing database of Proteograms and retri
 The `NonBondedForceModel` module provides a complete pipeline for running molecular dynamics simulations and calculating residue-residue interaction energies. Here's an example:
 
 ```python
-from proteogram.nonbonded_forces import NonBondedForceModel
+from proteogram.v2 import NonBondedForceModel
 import numpy as np
 
 model = NonBondedForceModel(
@@ -187,24 +187,46 @@ For detailed information on the MD simulation methodology, force calculations, a
 
 ## Scripts reference
 
-The following table provides an overview of all scripts in the `scripts/` folder, their purpose, and the configuration variables or command-line arguments they use.
+Scripts are organized into three subfolders under `scripts/`:
+
+- `scripts/v2/` — Proteogram v2 pipeline (MD-based, recommended)
+- `scripts/v1/` — Proteogram v1 pipeline (distance/hydrophobicity/charge maps)
+- `scripts/utilities/` — Data preparation utilities
+
+The `v1` and `v2` subfolders have their own `config.yml` (copy from the corresponding `config.example.yml`). The following table lists all scripts, their purpose, and the configuration variables or command-line arguments they use. It is recommended to have the main `data` folder directly under the `scripts` folder for common access.
+
+### `scripts/v2/`
 
 | Script | Purpose | Config Variables (`config.yml`) | Command-Line Arguments |
 |--------|---------|--------------------------------|------------------------|
-| `create_v2_proteograms.py` | Create proteograms using MD-based nonbonded energy calculations, distances, and hydrophobicity deltas (v2) | `limit_file`, `scope_structures_dir`, `all_proteograms_dir` | `--max_workers`, `--overwrite`, `--verbose`, `--save_simulated_pdb` |
-| `create_proteograms.py` | Create proteograms using distances, hydrophobicity deltas, and charge maps (v1) | `scope_structures_dir`, `eval_proteograms_dir`, `limit_file` | None |
-| `measure_similarity_single_domain.py` | Search a single structure against a proteogram database | `top_k`, `model_file`, `embed_file`, `embed_file_exists`, `proteogram_sim_results`, `proteograms_dir_single_search` | None |
-| `measure_similarity.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | None |
-| `train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping and per-class evaluation | `training_data_dir`, `num_epochs_cnn`, `learning_rate_cnn`, `batch_size_cnn`, `cnn_model_file_prefix`, `scope_level` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
-| `evaluate_methods.py` | Evaluate proteogram approach vs GTalign and USalign | `gtalign_results_dir`, `usalign_results`, `save_bad_searches_dir`, `save_good_searches_dir` | None |
-| `make_training_and_eval_data.py` | Create training/validation datasets with SCOPe annotations | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out` | None |
-| `make_training_data_exclude_eval.py` | Create training data excluding evaluation set proteins | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out`, `scope_level` | None |
-| `create_annotation_file.py` | Generate annotation lookup file from SCOPe/RCSB/PDBe | `limit_file`, `scope_structures_dir`, `annot_file`, `fasta_style_file`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | None |
-| `find_structures_in_scope.py` | Find PDB structures in SCOPe 2.08 database | None (hardcoded paths in script) | None |
-| `get_structures_scope20840_list.py` | Download and parse PDB structures by chain | None (hardcoded paths in script) | None |
-| `copy_structures.py` | Copy structure files filtered by amino acid length | None (hardcoded paths in script) | None |
+| `v2/create_v2_proteograms.py` | Create proteograms using MD-based nonbonded energy calculations, distances, and hydrophobicity deltas | `limit_file`, `scope_structures_dir`, `all_proteograms_dir` | `--max_workers/-w`, `--overwrite`, `--verbose`, `--debug`, `--memory-efficient`, `--save_simulated_pdb` |
+| `v2/measure_similarity_v2.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | `--exclude_classes/-x`, `--overwrite`, `--embed/--no-embed` |
+| `v2/train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping and per-class evaluation | `training_data_dir`, `num_epochs`, `learning_rate`, `batch_size`, `scope_level`, `model_file_prefix` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
+| `v2/evaluate_methods_v2.py` | Evaluate proteogram approach vs GTalign and USalign | `top_k`, `scope_eval_set`, `proteogram_sim_results`, `gtalign_results_dir`, `usalign_results`, `search_images_dir`, `save_bad_searches_dir`, `save_good_searches_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | `--overwrite`, `--exclude_classes/-x` |
+| `v2/create_annotation_file.py` | Generate annotation lookup file from SCOPe/RCSB/PDBe | `limit_file`, `scope_structures_dir`, `annot_file`, `fasta_style_file`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | None |
+| `v2/create_balanced_scope_train_eval_lists.py` | Create balanced train/eval splits from CD-HIT clustered results | None | `--lst-file/-l`, `--lookup-tsv/-t`, `--class-column/-c`, `--n-per-class/-n`, `--eval-fraction/-e`, `--train-output`, `--eval-output`, `--split-train`, `--seed` |
 
-> **Note:** Scripts with "None (hardcoded paths in script)" require editing the script directly to set file paths. See `config.example.yml` for descriptions of all configuration variables.
+### `scripts/v1/`
+
+| Script | Purpose | Config Variables (`config.yml`) | Command-Line Arguments |
+|--------|---------|--------------------------------|------------------------|
+| `v1/create_proteograms.py` | Create proteograms using distances, hydrophobicity deltas, and charge maps | `scope_structures_dir`, `eval_proteograms_dir`, `limit_file` | None |
+| `v1/measure_similarity_single_domain.py` | Search a single structure against a proteogram database (query path hardcoded in script) | `top_k`, `model_file`, `embed_file`, `embed_file_exists`, `proteogram_sim_results`, `proteograms_dir_single_search` | None |
+| `v1/measure_similarity.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | None |
+| `v1/evaluate_methods.py` | Evaluate proteogram approach vs GTalign and USalign | `top_k`, `scope_eval_set`, `proteogram_sim_results`, `gtalign_results_dir`, `usalign_results`, `search_images_dir`, `save_bad_searches_dir`, `save_good_searches_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | None |
+| `v1/make_training_and_eval_data.py` | Create training/validation datasets with SCOPe annotations | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out` | None |
+| `v1/make_training_data_exclude_eval.py` | Create training data excluding evaluation set proteins | `scope_eval_set`, `scope_structures_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file`, `training_structures_dir`, `training_proteograms_dir`, `eval_structures_dir`, `eval_proteograms_dir`, `label_df_out`, `scope_level` | None |
+
+### `scripts/utilities/`
+
+| Script | Purpose | Config Variables | Command-Line Arguments |
+|--------|---------|-----------------|------------------------|
+| `utilities/copy_structures.py` | Copy structure files filtered by amino acid length | None (hardcoded paths in script) | None |
+| `utilities/copy_structures_by_prefix.py` | Copy structure files matching a prefix list from a source to destination directory | None | `--prefix_file/-p`, `--src_dir/-s`, `--dst_dir/-d`, `--overwrite/-o` |
+| `utilities/find_structures_in_scope.py` | Find PDB structures present in the SCOPe 2.08 database | None (hardcoded paths in script) | None |
+| `utilities/get_structures_scope20840_list.py` | Download and parse PDB structures by chain from SCOPe 2.08 | None (hardcoded paths in script) | None |
+
+> **Note:** Scripts with "None (hardcoded paths in script)" require editing the script directly to set file paths. See `config.example.yml` in the relevant subfolder for descriptions of all configuration variables.
 
 ## Workflow for paper where the Proteogram approach was compared to GTalign and USalign
 

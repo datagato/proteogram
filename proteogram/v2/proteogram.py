@@ -10,7 +10,7 @@ import gc
 from Bio.PDB.PDBParser import PDBParser, PDBConstructionWarning
 from Bio.PDB.Polypeptide import PPBuilder
 
-from .constants import HYDROPHOBICITY_LIST, RESIDUE_LIST
+from ..common.constants import HYDROPHOBICITY_LIST, RESIDUE_LIST
 from .nonbonded_forces import NonBondedForceModel
 
 

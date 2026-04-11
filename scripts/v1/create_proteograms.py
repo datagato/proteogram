@@ -7,8 +7,8 @@ from tqdm import tqdm
 
 from Bio.PDB.PDBParser import PDBConstructionWarning
 
-from proteogram.utils import read_yaml
-from proteogram.proteogram import Proteogram
+from proteogram.common.utils import read_yaml
+from proteogram.v1.proteogram import Proteogram
 
 
 # Seq length cutoffs for using domain
