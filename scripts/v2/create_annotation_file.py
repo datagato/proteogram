@@ -35,7 +35,7 @@ def get_sequence(pdb_path):
 
 if __name__ == '__main__':
 
-    config = read_yaml('../config.yml')
+    config = read_yaml('config.yml')
     limit_file = config['limit_file']
     structures_dir = config['scope_structures_dir']
     annot_file = config['annot_file']
