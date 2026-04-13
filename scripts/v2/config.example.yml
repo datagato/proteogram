@@ -12,7 +12,8 @@ proteograms_dir_single_search: '' # dir of proteograms to search against
 annot_file: './<path>/ProteogramData_SCOP_RCSB_PDBe_AnnotationsLookup.tsv'
 fasta_style_file: './<path>/structure_based_seqs.fa'
   
-# for make_training_data.pyscope_level: '' # family, superfamily, fold or class
+# for make_training_data.py
+scope_level: '' # family, superfamily, fold or class
 scope_eval_set: '' # file to indicate proteins to be excluded, .ent file base name one per line
 scope_cla_file: './data/dir.cla.scope.2.08-stable.txt'
 scope_des_file: './data/dir.des.scope.2.08-stable.txt'

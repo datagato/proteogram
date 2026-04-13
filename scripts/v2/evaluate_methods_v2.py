@@ -1,11 +1,30 @@
 """
 Evaluate proteogram approach vs. gtalign.
+
+PRECISION@K AND MAP@K METRICS FOR CLASS-LEVEL EVALUATION:
+
+Precision@K for Classes:
+    P@K = (# of top-K results in same class as query) / K
+        
+    Explanation: Measures what fraction of the top K search results belong to the 
+    same structural class as the query protein. Not rank-aware; treats all top-K 
+    results equally. A score of 1.0 means all top-K results are in the correct class.
+
+Mean Average Precision@K for Classes:
+    MAP@K = (1 / min(R, K)) × Σ(i=1 to K) [P(i) × rel(i)]
+        
+    where:
+        - R = total number of proteins in corpus with same class as query
+        - P(i) = precision at rank i = (# relevant results up to rank i) / i
+        - rel(i) = 1 if result at rank i is in correct class, 0 otherwise
+    
+    Explanation: Rank-aware metric that gives higher scores when relevant results 
+    appear earlier in the ranking. Normalizes by min(R, K) to account for queries 
+    with fewer than K relevant items in the corpus. A score of 1.0 means all top-K 
+    results are in the correct class AND they all appear first in the ranking.
+
 Pertinent metric calculation info can be found at 
 https://weaviate.io/blog/retrieval-evaluation-metrics
-The precision@K metric measures how many of the retrieved items are relevant, but
-this metric is not rank-aware.
-The Mean Average Precision@K (MAP@K) metric measures the system's ability to 
-return relevant items in the top K results while placing more relevant items at the top.
 """
 import argparse
 import pandas as pd
@@ -49,6 +68,7 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
     levels = ('family', 'superfamily', 'fold', 'class')
     patk   = {lv: [] for lv in levels}
     mapk   = {lv: [] for lv in levels}
+    n_queries = 0
 
     for i in range(results_df.shape[0]):
         query_id = query_id_fn(results_df.iloc[i, 0])
@@ -56,6 +76,7 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
         if any(v is None for v in query_labels.values()):
             print(f'Query not found in labels: {query_id}')
             continue
+        n_queries += 1
 
         r = {lv: max((label_df[lv] == query_labels[lv]).sum() - 1, 0) for lv in levels}
         tp   = {lv: 0   for lv in levels}
@@ -79,6 +100,7 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
             mapk[lv].append(prec[lv] / min(r[lv], top_k) if r[lv] > 0 else 0.0)
 
     return {
+        'n_queries': n_queries,
         **{f'patk_{lv}': np.mean(patk[lv]) for lv in levels},
         **{f'map_{lv}':  np.mean(mapk[lv])  for lv in levels},
     }
@@ -174,6 +196,7 @@ if __name__ == '__main__':
     # Files and folders
     config = read_yaml('config.yml')
     top_k = config['top_k']
+    scope_level = config['scope_level']
     scope_eval_set = config['scope_eval_set']
     label_df_dir = os.path.dirname(scope_eval_set)
     proteogram_sim_results = config['proteogram_sim_results']
@@ -241,6 +264,7 @@ if __name__ == '__main__':
               + ', '.join(sorted(excluded - unknown)))
 
     print(label_df.nunique())
+    print(f'label_df size: {len(label_df)}')
 
     label_df.to_csv(os.path.join(label_df_dir, 'scope_eval_set_labels.tsv'),
                     sep='\t', index=False)
@@ -283,6 +307,9 @@ if __name__ == '__main__':
         prec_at_k_fold = 0
         prec_at_k_class = 0
 
+        # Track number of valid results processed
+        valid_results = 0
+
         # Iterate through results and find matches for family, superfamily,
         # fold and class SCOPe levels
         k = 0
@@ -297,6 +324,7 @@ if __name__ == '__main__':
             if any(v is None for v in (target_fam, target_sfam, target_fold, target_class)):
                 continue
             k += 1
+            valid_results += 1
             if query_fam == target_fam:
                 tp_fam += 1
                 prec_at_k_fam += (tp_fam / k)
@@ -322,20 +350,27 @@ if __name__ == '__main__':
         precision_at_ks_folds_map.append(prec_at_k_fold / min(r_fold, top_k) if r_fold > 0 else 0.0)
         precision_at_ks_classes_map.append(prec_at_k_class / min(r_class, top_k) if r_class > 0 else 0.0)
 
-        # Save images of those with no family agreement (tp/top_k)
+        # Save images of those with no/full agreement at the configured scope_level
         stem = os.path.splitext(os.path.basename(prot_file))[0]
-        score_for_top_sims = tp_fold/top_k
-        if score_for_top_sims == 0.2:
+        # Use precision based on valid results found, not fixed top_k
+        _tp_for_level = {'family': tp_fam, 'superfamily': tp_sfam,
+                         'fold': tp_fold, 'class': tp_class}
+        _query_for_level = {'family': query_fam, 'superfamily': query_sfam,
+                            'fold': query_fold, 'class': query_class}
+        tp_level = _tp_for_level.get(scope_level, tp_class)
+        query_level = _query_for_level.get(scope_level, query_class)
+        score_for_top_sims = tp_level / valid_results if valid_results > 0 else 0.0
+        if score_for_top_sims <= 0.2:
             to_copy = f'{stem}_top_sims.jpg'
             shutil.copy(os.path.join(search_images_dir,
                                      to_copy),
-                        os.path.join(save_bad_searches_dir, to_copy.replace('top_sims', f'top_sims_{query_fold}_pk{score_for_top_sims:.4f}')))
-        # Save images of those with complete family agreement (tp_fam/TOP_K is 1)
+                        os.path.join(save_bad_searches_dir, to_copy.replace('top_sims', f'top_sims_{query_level}_pk{score_for_top_sims:.4f}')))
+        # Save images of those with complete agreement at scope_level (score == 1.0)
         if score_for_top_sims == 1.0:
             to_copy = f'{stem}_top_sims.jpg'
             shutil.copy(os.path.join(search_images_dir,
                                      to_copy),
-                                     os.path.join(save_good_searches_dir, to_copy.replace('top_sims', f'top_sims_{query_fold}_pk{score_for_top_sims:.4f}')))
+                                     os.path.join(save_good_searches_dir, to_copy.replace('top_sims', f'top_sims_{query_level}_pk{score_for_top_sims:.4f}')))
 
     proteogram_patk_fam = np.mean(precision_at_ks_fams)
     proteogram_patk_sfam = np.mean(precision_at_ks_sfams)
@@ -348,17 +383,20 @@ if __name__ == '__main__':
 
     # Calculate Precision@K's and MAP@K's
     gtalign_res_df = read_gtalign_results(gtalign_results_dir)
+    print(f'GTalign DataFrame rows: {gtalign_res_df.shape[0]}')
     gtalign_res_df.to_csv(os.path.join(gtalign_results_dir, 'combined_gtalign_results.tsv'),
                           sep='\t', index=False)
     gtalign_metrics = calc_patk_mapk(
         gtalign_res_df, label_df, top_k,
-        query_id_fn=lambda x: x.replace('.out', '').split('__')[0])
+        query_id_fn=lambda x: x.replace('.ent.out', '').replace('.out', '')[:7])
 
     usalign_res_df = read_usalign_results(usalign_results)
     usalign_metrics = calc_patk_mapk(usalign_res_df, label_df, top_k)
 
     gt = gtalign_metrics
     us = usalign_metrics
+    proteogram_n = len(precision_at_ks_fams)
+    print(f'Proteins compared — Proteogram: {proteogram_n} | GTalign: {gt["n_queries"]} | USalign: {us["n_queries"]}')
     print('Measure                       | Proteogram  | GTalign     | USalign    |')
     print(f'Precision@K for families      | {proteogram_patk_fam:.4f}      | {gt["patk_family"]:.4f}      | {us["patk_family"]:.4f}')
     print(f'Precision@K for superfamilies | {proteogram_patk_sfam:.4f}      | {gt["patk_superfamily"]:.4f}      | {us["patk_superfamily"]:.4f}')
