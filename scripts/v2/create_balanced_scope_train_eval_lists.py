@@ -16,7 +16,8 @@ Usage:
         --train-output train_set.txt \
         --eval-output eval_set.txt \
         [--split-train 10] \
-        [--seed 42]
+        [--seed 42] \
+        [--exclude-classes e,f,g]
 
 Class column options:
     - SCOPeClass: Major structural class (e.g., a, b, c, d)
@@ -290,6 +291,14 @@ def main():
         help='Split training set into N separate files for parallel processing '
              '(e.g., --split-train 10 creates train_part01.txt through train_part10.txt)'
     )
+
+    parser.add_argument(
+        '--split-eval',
+        type=int,
+        default=None,
+        help='Split evaluation set into N separate files '
+             '(e.g., --split-eval 4 creates eval_part01.txt through eval_part04.txt)'
+    )
     
     parser.add_argument(
         '--id-column', '-i',
@@ -303,19 +312,34 @@ def main():
         default=None,
         help='Random seed for reproducibility'
     )
-    
+
+    parser.add_argument(
+        '--exclude-classes',
+        default=None,
+        help='Comma-separated list of class values to exclude (e.g., "e,f,g")'
+    )
+
     args = parser.parse_args()
-    
+
+    exclude_classes = set()
+    if args.exclude_classes:
+        exclude_classes = {c.strip() for c in args.exclude_classes.split(',')}
+
     # Parse the .lst file
     print(f"Reading identifiers from: {args.lst_file}")
     identifiers = parse_lst_file(args.lst_file)
     print(f"Found {len(identifiers)} identifiers in .lst file")
-    
+
     # Load lookup table
     print(f"Loading lookup table from: {args.lookup_tsv}")
     lookup_df = load_lookup_table(args.lookup_tsv, args.class_column)
     print(f"Lookup table has {len(lookup_df)} entries")
-    
+
+    if exclude_classes:
+        before = len(lookup_df)
+        lookup_df = lookup_df[~lookup_df[args.class_column].isin(exclude_classes)]
+        print(f"Excluded classes {sorted(exclude_classes)}: {before} -> {len(lookup_df)} entries")
+
     # Create balanced dataset
     print(f"\nCreating balanced dataset with {args.n_per_class} proteins per {args.class_column}...")
     sampled_by_class, class_counts = create_balanced_dataset(
@@ -366,10 +390,17 @@ def main():
     # Save evaluation set
     eval_path = Path(args.eval_output)
     eval_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(eval_path, 'w') as f:
-        for identifier in eval_ids:
-            f.write(f"{identifier}\n")
-    print(f"Saved evaluation set to: {args.eval_output}")
+
+    if args.split_eval and args.split_eval > 1:
+        created_files = split_into_files(eval_ids, eval_path, args.split_eval)
+        print(f"\nSplit evaluation set into {len(created_files)} files:")
+        for f in created_files:
+            print(f"  {f}")
+    else:
+        with open(eval_path, 'w') as f:
+            for identifier in eval_ids:
+                f.write(f"{identifier}\n")
+        print(f"Saved evaluation set to: {args.eval_output}")
 
 
 if __name__ == '__main__':

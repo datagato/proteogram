@@ -17,7 +17,7 @@ from proteogram.v2 import Img2Vec
 from proteogram.common import read_yaml
 
 
-def pad_to_200(img, target=200, fill=128):
+def pad_to_size(img, target=200, fill=128):
     """Pad a PIL image to target×target with gray (matching training script).
 
     Images smaller than target are center-padded; images larger are cropped
@@ -117,7 +117,7 @@ if __name__ == '__main__':
     img_sim = Img2Vec(model_file, dataset_dir=prot_files, weights='DEFAULT', device=device)
     # Override transform to match training: pad to 200x200 with gray rather than resize
     img_sim.transform = transforms.Compose([
-        transforms.Lambda(pad_to_200),
+        transforms.Lambda(pad_to_size(target=200)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -137,24 +137,34 @@ if __name__ == '__main__':
                 with open(embed_file, 'rb') as pklin:
                     img_sim.dataset = pickle.load(pklin)
             
-        # Search to find similar images using cosine-similarity amongst embeddings
-        # Save search results as images (TOP_K) to save_images_dir
+        # Search to find similar images using cosine-similarity amongst embeddings.
+        # Save all corpus results (including self-hit) so Recall@K can be computed at
+        # any K and with/without self-hit at eval time.
+        # Image saving is done separately at top_k to avoid PIL's 65500px dimension limit.
         start = time()
-        sim_time = img_sim.similarities(n=top_k,
-                                        save_result_images_dir=save_images_dir,
-                                        pad_fn=pad_to_200)
-        
+        n_results = len(prot_files)  # all including self-hit
+        sim_time = img_sim.similarities(n=n_results,
+                                        save_result_images_dir=None,
+                                        pad_fn=pad_to_size)
+
+        # Save top-k result images with padding
+        full_sim_dict = {k: list(v) for k, v in img_sim.sim_dict.items()}
+        for image_path in img_sim.sim_dict:
+            img_sim.sim_dict[image_path] = full_sim_dict[image_path][:top_k]
+            img_sim.save_images(image_path, save_images_dir, pad_fn=pad_to_size)
+        img_sim.sim_dict = full_sim_dict  # restore all results for CSV
+
         print(f'Took {sim_time} seconds to calculate similarities / perform search.')
         print(f'Took {time()-start} seconds overall (including optional image result saving).')
 
         # Create dataframe of results
-        scores_tmp = [[''] * top_k] * len(prot_files)
-        df_res = pd.DataFrame(scores_tmp, columns=[[str(i) for i in range(top_k)]])
+        scores_tmp = [[''] * n_results] * len(prot_files)
+        df_res = pd.DataFrame(scores_tmp, columns=[[str(i) for i in range(n_results)]])
         df_res['query_image'] = prot_files
         for i, image_path in enumerate(prot_files):
             try:
                 scores = img_sim.sim_dict[image_path]
-                df_res.iloc[i, :top_k] = [f'{a},{b}' for (a, b) in scores]
+                df_res.iloc[i, :n_results] = [f'{a},{b}' for (a, b) in scores]
             except KeyError as e:
                 print(f'Key error for {e}')
         # Reorder cols

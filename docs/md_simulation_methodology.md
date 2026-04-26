@@ -85,7 +85,7 @@ RESP charges are specifically parameterized to work synergistically with the oth
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Temperature | 300 K | Simulation temperature |
+| Temperature | 310.15 K (37 C) | Simulation temperature |
 | Pressure | 1 atm | Simulation pressure |
 | Timestep | 2 fs | Integration timestep |
 | Integrator | Langevin Middle | With 1 $ps^{-1}$ friction |
@@ -131,7 +131,7 @@ The system's potential energy is minimized by adjusting atomic positions until f
 | Reporting interval | 5,000 steps (10 ps) |
 | Constraints | Alpha-carbon (CA) position restraints (1000 kJ/mol/nm²) |
 
-The Monte Carlo Barostat adjusts the simulation box volume to maintain constant pressure. Alpha-carbon atoms are restrained to their initial positions using harmonic restraints with a force constant of **1000 kJ/mol/nm²** to prevent large-scale protein conformational changes during equilibration while allowing side chains and solvent to relax.
+The Monte Carlo Barostat adjusts the simulation box volume to maintain constant pressure. Alpha-carbon atoms are restrained using Cartesian harmonic restraints with a force constant of **1000 kJ/mol/nm²** to prevent large-scale protein conformational changes during equilibration while allowing side chains and solvent to relax. After each monitoring chunk, the CA reference positions are updated to the current (in-box) coordinates so that the harmonic restraints track the barostat coordinate rescaling rather than accumulating an artificial restoring force against the original positions.
 
 ---
 
@@ -448,21 +448,35 @@ NPT equilibration complete.
 
 ### Appendix B: Alpha-Carbon Restraint Implementation
 
-During energy minimization, NPT equilibration, and NVT equilibration, alpha-carbon (CA) atoms are restrained to their initial positions using OpenMM's [3] `CustomExternalForce` with a harmonic restraint potential that is periodic boundary condition (PBC) aware:
+During energy minimization, NPT equilibration, and NVT equilibration, alpha-carbon (CA) atoms are restrained using OpenMM's [3] `CustomExternalForce` with a **Cartesian harmonic** potential:
 
-$$U_{restraint} = k \cdot d_{PBC}^2$$
+$$U_{restraint} = \frac{1}{2} k \left[(x - x_0)^2 + (y - y_0)^2 + (z - z_0)^2\right]$$
 
 Where:
 - $k$ = 1000 kJ/mol/nm² (force constant)
-- $d_{PBC}$ = minimum-image distance to reference position $(x_0, y_0, z_0)$
+- $(x_0, y_0, z_0)$ = per-particle reference position in nanometers
+
+A Cartesian harmonic form is used instead of `periodicdistance` because the gradient of `periodicdistance` is discontinuous at periodic box boundaries. When a CA atom's minimum image flips, the gradient direction reverses instantaneously, producing a large impulsive force that can drive the simulation to NaN — especially during NPT where the box is actively changing.
+
+**NPT reference-position tracking**: The Monte Carlo Barostat accepts trial volume changes by rescaling all particle coordinates proportionally, but does *not* update per-particle parameters in `CustomExternalForce`. Without correction, the mismatch between rescaled coordinates and fixed reference positions creates a growing artificial restoring force. To prevent this, after each monitoring chunk the CA reference positions are updated to the current in-box coordinates before the next chunk runs:
+
+```python
+# Update reference positions to track barostat coordinate rescaling
+pos_state = context.getState(getPositions=True, enforcePeriodicBox=True)
+current_positions = pos_state.getPositions()
+for i, atom_idx in enumerate(ca_indices):
+    pos = list(current_positions[atom_idx].value_in_unit(nanometers))
+    restraint_force.setParticleParameters(i, atom_idx, pos)
+restraint_force.updateParametersInContext(context)
+```
 
 **Implementation**:
 ```python
 # Get indices of CA atoms
 ca_indices = [atom.index for atom in topology.atoms() if atom.name == 'CA']
 
-# Custom external force to restrain CA atoms to their initial positions
-restraint_force = CustomExternalForce("k*periodicdistance(x, y, z, x0, y0, z0)^2")
+# Cartesian harmonic restraint — numerically stable across box boundaries
+restraint_force = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
 
 # Add per-particle parameters for reference positions
 restraint_force.addPerParticleParameter('x0') # reference x

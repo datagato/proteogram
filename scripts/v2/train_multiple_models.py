@@ -547,13 +547,13 @@ if __name__ == '__main__':
 
     image_resize = 200  # pad to largest possible size; GAP makes the FC layer size-agnostic
 
-    # ResNet18 was trained with ImageNet normalisation — apply the same preprocessing
+    # ResNet18 was trained with ImageNet normalisation (standardize input images to the same distribution as the data the model was pre-trained on)
     # so the pretrained feature detectors remain valid. The ConvNet was not pretrained, so it doesn't strictly require ImageNet normalisation, but applying the same normalisation to both models allows for a more controlled comparison.
     _imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                           std=[0.229, 0.224, 0.225])
     _augment = [
-        transforms.RandomApply([transforms.ColorJitter(brightness=0.1, contrast=0.1)], p=0.2),
-        transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2)], p=0.2),
+        transforms.RandomApply([transforms.ColorJitter(brightness=0.1, contrast=0.1)], p=0.1),
+        transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2)], p=0.1),
     ]
 
     if args.model == 'resnet18':

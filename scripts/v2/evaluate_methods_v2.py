@@ -46,7 +46,7 @@ def lookup(df, filter_col, filter_val, value_col):
     return match.iloc[0] if not match.empty else None
 
 
-def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
+def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None, limit_to_ids=None):
     """Calculate Precision@K and MAP@K for a structural alignment results DataFrame.
 
     Column 0 is the query identifier; columns 1+ are retrieved target identifiers.
@@ -58,6 +58,8 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
         top_k: K for Precision@K and MAP@K.
         query_id_fn: Optional callable to transform the raw col-0 value into a
             pdb_id_chain key (e.g. stripping a filename suffix). Defaults to identity.
+        limit_to_ids: Optional set of pdb_id_chain strings. If provided, only rows
+            whose transformed query ID is in this set are evaluated.
 
     Returns:
         dict with keys patk_{fam,sfam,fold,class} and map_{fam,sfam,fold,class}.
@@ -68,13 +70,17 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
     levels = ('family', 'superfamily', 'fold', 'class')
     patk   = {lv: [] for lv in levels}
     mapk   = {lv: [] for lv in levels}
+    ratk   = {lv: [] for lv in levels}
     n_queries = 0
+    n_skipped = 0
 
     for i in range(results_df.shape[0]):
         query_id = query_id_fn(results_df.iloc[i, 0])
+        if limit_to_ids is not None and query_id not in limit_to_ids:
+            continue
         query_labels = {lv: lookup(label_df, 'pdb_id_chain', query_id, lv) for lv in levels}
         if any(v is None for v in query_labels.values()):
-            print(f'Query not found in labels: {query_id}')
+            n_skipped += 1
             continue
         n_queries += 1
 
@@ -84,8 +90,6 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
 
         k = 0
         for target in results_df.iloc[i, 1:]:
-            if target == query_id:
-                continue
             target_labels = {lv: lookup(label_df, 'pdb_id_chain', target, lv) for lv in levels}
             if any(v is None for v in target_labels.values()):
                 continue
@@ -94,15 +98,21 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None):
                 if query_labels[lv] == target_labels[lv]:
                     tp[lv] += 1
                     prec[lv] += tp[lv] / k
+            if k >= top_k:
+                break
 
         for lv in levels:
             patk[lv].append(tp[lv] / top_k)
             mapk[lv].append(prec[lv] / min(r[lv], top_k) if r[lv] > 0 else 0.0)
+            ratk[lv].append(tp[lv] / r[lv] if r[lv] > 0 else 0.0)
 
+    if n_skipped:
+        print(f'WARNING: {n_skipped} queries skipped (not found in label_df).')
     return {
         'n_queries': n_queries,
         **{f'patk_{lv}': np.mean(patk[lv]) for lv in levels},
         **{f'map_{lv}':  np.mean(mapk[lv])  for lv in levels},
+        **{f'ratk_{lv}': np.mean(ratk[lv])  for lv in levels},
     }
 
 
@@ -127,9 +137,11 @@ def read_gtalign_results(gtalign_results_dir):
                 if not m:
                     continue
                 rank = int(m.group(1))
-                if rank < 1 or rank > top_k:
+                if rank == 1 or rank > top_k+1:  # skip self-hit (rank 1) and anything beyond top_k
                     continue
                 path_m = path_re.search(line)
+                if not path_m:
+                    print(f'WARNING: no SCOPe domain ID found at rank {rank} in {os.path.basename(file)} — empty string appended.')
                 tmp.append(path_m.group(1) if path_m else '')
                 collected += 1
                 if collected >= top_k:
@@ -279,6 +291,12 @@ if __name__ == '__main__':
     precision_at_ks_sfams_map = []
     precision_at_ks_folds_map = []
     precision_at_ks_classes_map = []
+    recall_at_ks_fams = []
+    recall_at_ks_sfams = []
+    recall_at_ks_folds = []
+    recall_at_ks_classes = []
+    n_queries_skipped = 0
+    proteogram_evaluated_ids = set()
     for i in range(proteogram_res_df.shape[0]):
         prot_file = os.path.basename(proteogram_res_df.iloc[i,0])
         query_fam   = lookup(label_df, 'proteogram_file', prot_file, 'family')
@@ -286,8 +304,9 @@ if __name__ == '__main__':
         query_fold  = lookup(label_df, 'proteogram_file', prot_file, 'fold')
         query_class = lookup(label_df, 'proteogram_file', prot_file, 'class')
         if any(v is None for v in (query_fam, query_sfam, query_fold, query_class)):
-            print(f'Query not found in labels: {prot_file}')
+            n_queries_skipped += 1
             continue
+        proteogram_evaluated_ids.add(os.path.splitext(prot_file)[0])
         
         # Relevant item counts in corpus (excluding self) for MAP@K normalisation
         r_fam   = max((label_df['family'] == query_fam).sum() - 1, 0)
@@ -337,6 +356,8 @@ if __name__ == '__main__':
             if query_class == target_class:
                 tp_class += 1
                 prec_at_k_class += (tp_class / k)
+            if k >= top_k:
+                break
 
         # For Precision@K
         precision_at_ks_fams.append(tp_fam/top_k)
@@ -349,6 +370,12 @@ if __name__ == '__main__':
         precision_at_ks_sfams_map.append(prec_at_k_sfam / min(r_sfam, top_k) if r_sfam > 0 else 0.0)
         precision_at_ks_folds_map.append(prec_at_k_fold / min(r_fold, top_k) if r_fold > 0 else 0.0)
         precision_at_ks_classes_map.append(prec_at_k_class / min(r_class, top_k) if r_class > 0 else 0.0)
+
+        # For Recall@K: tp / R
+        recall_at_ks_fams.append(tp_fam / r_fam if r_fam > 0 else 0.0)
+        recall_at_ks_sfams.append(tp_sfam / r_sfam if r_sfam > 0 else 0.0)
+        recall_at_ks_folds.append(tp_fold / r_fold if r_fold > 0 else 0.0)
+        recall_at_ks_classes.append(tp_class / r_class if r_class > 0 else 0.0)
 
         # Save images of those with no/full agreement at the configured scope_level
         stem = os.path.splitext(os.path.basename(prot_file))[0]
@@ -372,6 +399,9 @@ if __name__ == '__main__':
                                      to_copy),
                                      os.path.join(save_good_searches_dir, to_copy.replace('top_sims', f'top_sims_{query_level}_pk{score_for_top_sims:.4f}')))
 
+    if n_queries_skipped:
+        print(f'WARNING: {n_queries_skipped} proteogram queries skipped (not found in label_df).')
+
     proteogram_patk_fam = np.mean(precision_at_ks_fams)
     proteogram_patk_sfam = np.mean(precision_at_ks_sfams)
     proteogram_patk_fold = np.mean(precision_at_ks_folds)
@@ -380,6 +410,10 @@ if __name__ == '__main__':
     proteogram_map_sfam = np.mean(precision_at_ks_sfams_map)
     proteogram_map_fold = np.mean(precision_at_ks_folds_map)
     proteogram_map_class = np.mean(precision_at_ks_classes_map)
+    proteogram_ratk_fam = np.mean(recall_at_ks_fams)
+    proteogram_ratk_sfam = np.mean(recall_at_ks_sfams)
+    proteogram_ratk_fold = np.mean(recall_at_ks_folds)
+    proteogram_ratk_class = np.mean(recall_at_ks_classes)
 
     # Calculate Precision@K's and MAP@K's
     gtalign_res_df = read_gtalign_results(gtalign_results_dir)
@@ -388,21 +422,38 @@ if __name__ == '__main__':
                           sep='\t', index=False)
     gtalign_metrics = calc_patk_mapk(
         gtalign_res_df, label_df, top_k,
-        query_id_fn=lambda x: x.replace('.ent.out', '').replace('.out', '')[:7])
+        query_id_fn=lambda x: x.replace('.ent.out', '').replace('.out', '')[:7],
+        limit_to_ids=proteogram_evaluated_ids)
 
     usalign_res_df = read_usalign_results(usalign_results)
-    usalign_metrics = calc_patk_mapk(usalign_res_df, label_df, top_k)
+    usalign_metrics = calc_patk_mapk(usalign_res_df, label_df, top_k,
+                                     limit_to_ids=proteogram_evaluated_ids)
 
     gt = gtalign_metrics
     us = usalign_metrics
     proteogram_n = len(precision_at_ks_fams)
     print(f'Proteins compared — Proteogram: {proteogram_n} | GTalign: {gt["n_queries"]} | USalign: {us["n_queries"]}')
-    print('Measure                       | Proteogram  | GTalign     | USalign    |')
-    print(f'Precision@K for families      | {proteogram_patk_fam:.4f}      | {gt["patk_family"]:.4f}      | {us["patk_family"]:.4f}')
-    print(f'Precision@K for superfamilies | {proteogram_patk_sfam:.4f}      | {gt["patk_superfamily"]:.4f}      | {us["patk_superfamily"]:.4f}')
-    print(f'Precision@K for folds         | {proteogram_patk_fold:.4f}      | {gt["patk_fold"]:.4f}      | {us["patk_fold"]:.4f}')
-    print(f'Precision@K for classes       | {proteogram_patk_class:.4f}      | {gt["patk_class"]:.4f}      | {us["patk_class"]:.4f}')
-    print(f'MAP@K for families            | {proteogram_map_fam:.4f}      | {gt["map_family"]:.4f}      | {us["map_family"]:.4f}')
-    print(f'MAP@K for superfamilies       | {proteogram_map_sfam:.4f}      | {gt["map_superfamily"]:.4f}      | {us["map_superfamily"]:.4f}')
-    print(f'MAP@K for folds               | {proteogram_map_fold:.4f}      | {gt["map_fold"]:.4f}      | {us["map_fold"]:.4f}')
-    print(f'MAP@K for classes             | {proteogram_map_class:.4f}      | {gt["map_class"]:.4f}      | {us["map_class"]:.4f}')
+
+    hdr  = f'{"Method":<15} | {"Class":>8} | {"Fold":>8} | {"Superfamily":>11} | {"Family":>8}'
+    sep  = '-' * len(hdr)
+
+    print(f'\nPrecision@K (K={top_k})')
+    print(hdr)
+    print(sep)
+    print(f'{"GTalign":<15} | {gt["patk_class"]:>8.4f} | {gt["patk_fold"]:>8.4f} | {gt["patk_superfamily"]:>11.4f} | {gt["patk_family"]:>8.4f}')
+    print(f'{"USalign":<15} | {us["patk_class"]:>8.4f} | {us["patk_fold"]:>8.4f} | {us["patk_superfamily"]:>11.4f} | {us["patk_family"]:>8.4f}')
+    print(f'{"Proteogram":<15} | {proteogram_patk_class:>8.4f} | {proteogram_patk_fold:>8.4f} | {proteogram_patk_sfam:>11.4f} | {proteogram_patk_fam:>8.4f}')
+
+    print(f'\nMAP@K (K={top_k})')
+    print(hdr)
+    print(sep)
+    print(f'{"GTalign":<15} | {gt["map_class"]:>8.4f} | {gt["map_fold"]:>8.4f} | {gt["map_superfamily"]:>11.4f} | {gt["map_family"]:>8.4f}')
+    print(f'{"USalign":<15} | {us["map_class"]:>8.4f} | {us["map_fold"]:>8.4f} | {us["map_superfamily"]:>11.4f} | {us["map_family"]:>8.4f}')
+    print(f'{"Proteogram":<15} | {proteogram_map_class:>8.4f} | {proteogram_map_fold:>8.4f} | {proteogram_map_sfam:>11.4f} | {proteogram_map_fam:>8.4f}')
+
+    print(f'\nRecall@K (K={top_k})')
+    print(hdr)
+    print(sep)
+    print(f'{"GTalign":<15} | {gt["ratk_class"]:>8.4f} | {gt["ratk_fold"]:>8.4f} | {gt["ratk_superfamily"]:>11.4f} | {gt["ratk_family"]:>8.4f}')
+    print(f'{"USalign":<15} | {us["ratk_class"]:>8.4f} | {us["ratk_fold"]:>8.4f} | {us["ratk_superfamily"]:>11.4f} | {us["ratk_family"]:>8.4f}')
+    print(f'{"Proteogram":<15} | {proteogram_ratk_class:>8.4f} | {proteogram_ratk_fold:>8.4f} | {proteogram_ratk_sfam:>11.4f} | {proteogram_ratk_fam:>8.4f}')

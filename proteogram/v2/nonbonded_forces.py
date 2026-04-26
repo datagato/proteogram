@@ -31,6 +31,8 @@ from typing import Optional
 from pathlib import Path
 import psutil
 
+from ..common.constants import MODIFIED_RESIDUES_TO_STANDARD, SOLVENT_RESIDUES
+
 
 class NonBondedForceModel:
     """Model for computing non-bonded forces between residues using MD simulation.
@@ -168,6 +170,24 @@ class NonBondedForceModel:
         fixer.findMissingResidues()
         fixer.findNonstandardResidues()
         fixer.replaceNonstandardResidues()
+
+        # Rename any modified residues that PDBFixer didn't handle BEFORE calling
+        # removeHeterogens. Modified residues are stored as HETATM records in PDB
+        # files, so removeHeterogens would silently delete them if they haven't
+        # already been converted to a standard residue name.
+        _MODIFIED_TO_STANDARD = {
+            'MSE': 'MET', 'FME': 'MET', 'CXM': 'MET',
+            'M3L': 'LYS', 'MLY': 'LYS', 'MLZ': 'LYS', 'KCX': 'LYS', 'ALY': 'LYS', 'LLP': 'LYS',
+            'CSO': 'CYS', 'CME': 'CYS', 'OCS': 'CYS', 'SEC': 'CYS', 'SMC': 'CYS', 'CSD': 'CYS',
+            'SEP': 'SER', 'TPO': 'THR', 'PTR': 'TYR', 'TYS': 'TYR',
+            'HYP': 'PRO', 'CGU': 'GLU', 'PCA': 'GLN', 'NEP': 'HIS', 'HIC': 'HIS',
+            'BHD': 'ASP',
+        }
+        for res in fixer.topology.residues():
+            if res.name in _MODIFIED_TO_STANDARD:
+                print(f"  INFO: Pre-renaming {res.name} → {_MODIFIED_TO_STANDARD[res.name]} before hetatm removal")
+                res.name = _MODIFIED_TO_STANDARD[res.name]
+
         fixer.removeHeterogens(keepWater=False)
         fixer.findMissingAtoms()
         fixer.addMissingAtoms()
@@ -207,7 +227,31 @@ class NonBondedForceModel:
         # Handle modified amino acids that OpenMM doesn't recognize
         # Replace them with their standard equivalents before solvation
         self._replace_modified_residues()
-        
+
+        # Remove any non-standard heavy atoms that were part of a modified residue
+        # (e.g. M3L's trimethyl carbons after renaming to LYS).  These atoms are
+        # not in the AMBER template and would cause createSystem() to fail.
+        self._delete_extra_atoms_from_templates()
+
+        # Strip ALL existing H from the topology and re-add via addHydrogens.
+        # This handles two classes of wrong H:
+        #   1. H on modified residues that PDBFixer placed incorrectly after
+        #      partial conversion (e.g. H-O on CSO's OD after OD is deleted).
+        #   2. H on standard residues that were in the raw PDB with the wrong
+        #      protonation state — most commonly HXT on C-terminal OXT, which
+        #      is present in many PDB files but should be absent at pH 7.0
+        #      (C-terminal pKa ~3.5).  addHydrogens only *adds* missing H; it
+        #      does not remove existing ones, so we must strip first.
+        all_h = [
+            atom
+            for residue in self.modeller.topology.residues()
+            for atom in residue.atoms()
+            if atom.element is not None and atom.element.symbol == 'H'
+        ]
+        if all_h:
+            self.modeller.delete(all_h)
+        self.modeller.addHydrogens(self.forcefield, pH=7.0)
+
         # Store protein residue indices before adding water
         self._identify_protein_residues()
         
@@ -240,27 +284,88 @@ class NonBondedForceModel:
 
     def _replace_modified_residues(self) -> None:
         """Replace modified amino acids with their standard equivalents.
-        
+
         OpenMM's AMBER force field doesn't have parameters for modified AAs like MSE
         (selenomethionine), so we convert them to standard equivalents before solvation.
-        
+
         This preserves the 3D structure while allowing force field compatibility.
         """
-        # Mapping of modified residues to their standard equivalents
-        residue_replacements = {
-            'MSE': 'MET',  # Selenomethionine -> Methionine
-            'HYP': 'PRO',  # Hydroxyproline -> Proline
-            'PTR': 'TYR',  # Phosphotyrosine -> Tyrosine
-            'SEP': 'SER',  # Phosphoserine -> Serine
-            'TPO': 'THR',  # Phosphothreonine -> Threonine
+        # Atom name remappings required per modified residue.
+        # Renaming the residue alone is insufficient — the force field template
+        # for the standard residue expects different atom names (e.g. MET needs
+        # 'SD' but MSE has 'SE' for the chalcogen).
+        atom_name_fixes = {
+            'MSE': {'SE': 'SD'},  # Selenium -> Sulfur
         }
-        
-        # Iterate through topology and replace residue names
+
+        # Iterate through topology and replace residue names AND atom names
         for residue in self.modeller.topology.residues():
-            if residue.name in residue_replacements:
-                standard_name = residue_replacements[residue.name]
-                print(f"  INFO: Converting {residue.name} (residue {residue.index}) to {standard_name}")
+            if residue.name in MODIFIED_RESIDUES_TO_STANDARD:
+                original_name = residue.name
+                standard_name = MODIFIED_RESIDUES_TO_STANDARD[original_name]
+                print(f"  INFO: Converting {original_name} (residue {residue.index}) to {standard_name}")
                 residue.name = standard_name
+                if original_name in atom_name_fixes:
+                    for atom in residue.atoms():
+                        if atom.name in atom_name_fixes[original_name]:
+                            atom.name = atom_name_fixes[original_name][atom.name]
+
+    def _delete_extra_atoms_from_templates(self) -> None:
+        """Delete non-standard heavy atoms left over from renamed modified residues.
+
+        After renaming a modified residue to its standard equivalent (e.g. M3L → LYS),
+        any atoms that don't belong to the standard AMBER template remain in the topology
+        (e.g. M3L's three trimethyl carbons C7/C8/C9 on NZ). Those extra atoms cause
+        ForceField.createSystem() to fail with "No template found". This method removes
+        them using the force field's own template definitions as the reference.
+
+        Terminal atoms (OXT, OC1, OC2) are explicitly preserved — they are not in the
+        *internal* residue template but are legitimate C-terminal atoms added by PDBFixer.
+        Deleting them would break C-terminal template matching.
+
+        H atoms bonded to deleted heavy atoms are also deleted to avoid dangling
+        hydrogens (e.g. H71/H72/H73 bonded to M3L's C7 after C7 is removed).
+        """
+        # These atom names are legitimate even though they're absent from the
+        # internal residue template (they appear in terminal-residue templates).
+        _PRESERVE = {'OXT', 'OC1', 'OC2', 'HXT'}
+
+        # Pass 1: collect non-standard heavy atoms to remove
+        non_standard_heavy: set = set()
+        for residue in self.modeller.topology.residues():
+            template = self.forcefield._templates.get(residue.name)
+            if template is None:
+                continue
+            template_atom_names = {a.name for a in template.atoms}
+            for atom in residue.atoms():
+                if atom.element is not None and atom.element.symbol == 'H':
+                    continue  # H atoms handled in pass 2
+                if atom.name in _PRESERVE:
+                    continue  # Never delete terminal oxygen/hydrogen atoms
+                if atom.name not in template_atom_names:
+                    non_standard_heavy.add(atom)
+
+        # Pass 2: collect ALL H atoms from any residue that had non-standard heavy
+        # atoms. Removing only the H atoms directly bonded to deleted heavy atoms
+        # is not sufficient: PDBFixer may have placed an H on the modification's
+        # oxygen (e.g. OD in CSO) rather than on SG, leaving a wrong H-O bond after
+        # OD is deleted.  Stripping every H from the affected residues gives
+        # addHydrogens a clean slate so it can re-protonate correctly.
+        affected_residue_indices: set = {atom.residue.index for atom in non_standard_heavy}
+        h_to_delete: set = set()
+        for residue in self.modeller.topology.residues():
+            if residue.index not in affected_residue_indices:
+                continue
+            for atom in residue.atoms():
+                if atom.element is not None and atom.element.symbol == 'H':
+                    if atom.name not in _PRESERVE:
+                        h_to_delete.add(atom)
+
+        atoms_to_delete = list(non_standard_heavy | h_to_delete)
+        if atoms_to_delete:
+            print(f"  INFO: Removing {len(atoms_to_delete)} non-standard/misplaced atom(s) from renamed modified residues "
+                  f"({len(non_standard_heavy)} heavy + {len(h_to_delete)} H from affected residues)")
+            self.modeller.delete(atoms_to_delete)
 
     def _identify_protein_residues(self) -> None:
         """Identify protein residue indices before solvation."""
@@ -268,10 +373,14 @@ class NonBondedForceModel:
             'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS',
             'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP',
             'TYR', 'VAL', 'HIE', 'HID', 'HIP', 'CYX',
-            # Modified amino acids
-            'MSE',  # Selenomethionine (variant of MET)
-            'PTR', 'SEP', 'TPO',  # Phosphorylated variants
-            'HYP',  # Hydroxyproline (variant of PRO)
+            # Modified amino acids (kept here for the case where _replace_modified_residues
+            # hasn't run yet at identification time)
+            'MSE', 'FME', 'CXM',
+            'M3L', 'MLY', 'MLZ', 'KCX', 'ALY', 'LLP',
+            'CSO', 'CME', 'OCS', 'SEC', 'SMC', 'CSD',
+            'SEP', 'TPO', 'PTR', 'TYS',
+            'HYP', 'CGU', 'PCA', 'NEP', 'HIC',
+            'BHD',
         }
         self.protein_residue_indices = []
         for i, residue in enumerate(self.modeller.topology.residues()):
@@ -365,9 +474,10 @@ class NonBondedForceModel:
             # Get indices of CA atoms
             ca_indices = [atom.index for atom in self.topology.atoms() if atom.name == 'CA']
 
-            # Custom external force to restrain CA atoms to their initial positions
-            # restraint_force = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-            restraint_force = CustomExternalForce("k*periodicdistance(x, y, z, x0, y0, z0)^2")
+            # Cartesian harmonic restraint — avoids periodicdistance discontinuities
+            # and is compatible with NPT barostat coordinate rescaling when reference
+            # positions are updated after each chunk (see equilibrate_npt).
+            restraint_force = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
 
             # Add per-particle parameters for reference positions
             restraint_force.addPerParticleParameter('x0') # reference x
@@ -381,6 +491,13 @@ class NonBondedForceModel:
             for idx in ca_indices:
                 restraint_force.addParticle(idx, self.positions[idx].value_in_unit(nanometers))
             system.addForce(restraint_force)
+
+            # Store for reference-position updates during NPT barostat rescaling
+            self._restraint_force = restraint_force
+            self._ca_indices = ca_indices
+        else:
+            self._restraint_force = None
+            self._ca_indices = []
         
         integrator = LangevinMiddleIntegrator(
             self.temperature,
@@ -431,8 +548,12 @@ class NonBondedForceModel:
             self._log_energy('minimization', 0.0, initial_energy)
         
         self.simulation.minimizeEnergy(maxIterations=max_iterations)
-        _st = self.simulation.context.getState(getPositions=True)
+        _st = self.simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
         self.positions = _st.getPositions()
+        try:
+            self._box_vectors = _st.getPeriodicBoxVectors()
+        except Exception:
+            pass
         del _st
         
         # Log final energy after minimization (debug mode)
@@ -454,7 +575,9 @@ class NonBondedForceModel:
 
         This method writes the current positions to an in-memory PDB file
         that can be saved or further processed. Can be called after any
-        simulation step (minimization, equilibration, or production).
+        simulation step (minimization, equilibration, or production). This
+        method strips solvent atoms from the output to focus on the protein
+        structure and interactions.
 
         Returns:
             io.StringIO: An in-memory PDB file containing the current structure.
@@ -471,8 +594,16 @@ class NonBondedForceModel:
                 "No topology available. Run setup_system() first."
             )
 
+        # Create a modeller to strip solvent, then extract topology/positions
+        from openmm.app import Modeller
+        modeller = Modeller(self.topology, self.positions)
+        modeller.delete(
+            atom for atom in self.topology.atoms()
+            if atom.residue.name in SOLVENT_RESIDUES
+        )
+
         pdb_stream = io.StringIO()
-        PDBFile.writeFile(self.topology, self.positions, pdb_stream)
+        PDBFile.writeFile(modeller.topology, modeller.positions, pdb_stream)
         pdb_stream.seek(0)
         return pdb_stream
 
@@ -710,7 +841,7 @@ class NonBondedForceModel:
         state and clean up the state."""
         if self.simulation is not None:
             try:
-                state = self.simulation.context.getState(getPositions=True)
+                state = self.simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
                 self.positions = state.getPositions()
                 try:
                     # Store the periodic box vectors from the state before deleting context
@@ -1002,7 +1133,11 @@ class NonBondedForceModel:
         self._create_new_simulation(
             add_calpha_restraint=True,
             add_barostat=True)
-        
+
+        # Initialize velocities — without this OpenMM starts from zero,
+        # which causes an energy spike with stiff restraints under NPT
+        self.simulation.context.setVelocitiesToTemperature(self.temperature)
+
         # Add reporter for monitoring
         self.simulation.reporters.append(
             StateDataReporter(
@@ -1034,14 +1169,25 @@ class NonBondedForceModel:
         # Log initial energy (debug mode)
         if self.debug:
             self._log_energy('npt', 0.0, initial_energy)
-        
+
         # Run equilibration in chunks for monitoring
         steps_run = 0
         while steps_run < steps:
             chunk = min(check_interval, steps - steps_run)
             self.simulation.step(chunk)
             steps_run += chunk
-            
+
+            # Update CA restraint reference positions to track NPT barostat
+            # coordinate rescaling — prevents growing forces from position/box mismatch
+            if self._restraint_force is not None and self._ca_indices:
+                pos_state = self.simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
+                current_positions = pos_state.getPositions()
+                del pos_state
+                for i, atom_idx in enumerate(self._ca_indices):
+                    pos = list(current_positions[atom_idx].value_in_unit(nanometers))
+                    self._restraint_force.setParticleParameters(i, atom_idx, pos)
+                self._restraint_force.updateParametersInContext(self.simulation.context)
+
             # Get current energy
             state = self.simulation.context.getState(getEnergy=True)
             current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
@@ -1070,7 +1216,7 @@ class NonBondedForceModel:
             f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
         
         # Check for energy explosion (indicates coordinate corruption)
-        if final_energy / n_atoms > 100 or final_energy / n_atoms > 0:
+        if final_energy / n_atoms > 100:
             print(f"WARNING: NPT final energy is unreasonably high ({final_energy/n_atoms:.1f} kJ/mol/atom)")
             print("  This may indicate coordinate corruption in the system")
             # This will be detected and fixed at the start of NVT
@@ -1283,7 +1429,7 @@ class NonBondedForceModel:
         
         # Sanity check: if energy is ridiculously high, coordinates are corrupted
         # Typical folded protein energy is -10 to -30 kJ/mol/atom
-        if initial_energy / n_atoms > 100 or initial_energy / n_atoms > 0:
+        if initial_energy / n_atoms > 100:
             print(f"ERROR: Initial NVT energy is unreasonably high ({initial_energy/n_atoms:.1f} kJ/mol/atom)")
             print("  This indicates corrupted particle coordinates")
             if hasattr(self, '_pre_npt_positions') and self._pre_npt_positions is not None:
@@ -1299,7 +1445,7 @@ class NonBondedForceModel:
                 initial_energy = initial_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
                 del initial_state
                 print(f"  Retrying with pre-NPT positions: {initial_energy:.1f} kJ/mol ({initial_energy/n_atoms:.2f} kJ/mol/atom)")
-                if initial_energy / n_atoms > 100 or initial_energy / n_atoms > 0:
+                if initial_energy / n_atoms > 100:
                     raise RuntimeError(f"Even pre-NPT positions are corrupted (energy: {initial_energy/n_atoms:.1f} kJ/mol/atom)")
             else:
                 raise RuntimeError(f"Initial NVT energy is corrupted ({initial_energy/n_atoms:.1f} kJ/mol/atom) and no backup positions available")
@@ -1813,9 +1959,6 @@ class NonBondedForceModel:
                 mem_before_solvent = process.memory_info().rss / 1024 / 1024
             (vdw_solv, es_solv, 
             vdw_force_solv, es_force_solv) = self._calculate_residue_solvent_energies(positions)
-            if self.debug:
-                mem_after_solvent = process.memory_info().rss / 1024 / 1024
-                print(f"Solvent energy computation: {mem_before_solvent:.1f} -> {mem_after_solvent:.1f} MB (delta: {mem_after_solvent - mem_before_solvent:.1f} MB)")
         
         # Energy matrices
         vdw_energy_attractive = np.zeros((n_residues, n_residues))
@@ -1957,9 +2100,6 @@ class NonBondedForceModel:
                         # Subtract from attractive terms (solvent interaction is typically stabilizing)
                         vdw_energy_attractive[i, j] -= avg_vdw_solv
                         es_energy_attractive[i, j] -= avg_es_solv
-                if self.debug:
-                    mem_after_standard = process.memory_info().rss / 1024 / 1024
-                    print(f"Standard solvent subtraction: {mem_before_standard:.1f} -> {mem_after_standard:.1f} MB (delta: {mem_after_standard - mem_before_standard:.1f} MB)")
         
         return (vdw_energy_attractive, vdw_energy_repulsive, es_energy_attractive, es_energy_repulsive)
     

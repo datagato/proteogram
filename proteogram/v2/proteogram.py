@@ -10,7 +10,7 @@ import gc
 from Bio.PDB.PDBParser import PDBParser, PDBConstructionWarning
 from Bio.PDB.Polypeptide import PPBuilder
 
-from ..common.constants import HYDROPHOBICITY_LIST, RESIDUE_LIST
+from ..common.constants import HYDROPHOBICITY_LIST, RESIDUE_LIST, MODIFIED_RESIDUES_TO_STANDARD
 from .nonbonded_forces import NonBondedForceModel
 
 
@@ -65,12 +65,24 @@ class ProteogramV2:
         self.structure = parser.get_structure("protein_id", self.pdb_path)
         self.model = self.structure[0]
         try:
-            self.chain = self.model[chain_id]
-        except KeyError:
-            raise KeyError(f"Chain ID {chain_id} not found in PDB file.")
+            # Get the first chain from PDB file from the PDBParser structure model
+            self.chain = self.model.get_chains().__next__()
+        except StopIteration as e:
+            raise StopIteration(f"No chains found in PDB file {pdb_path}") from e
         self.allowed_amino_acids = {b: a for a, b in RESIDUE_LIST}
+        # Extend with modified residues. MODIFIED_RESIDUES_TO_STANDARD maps
+        # 3-letter modified codes → 3-letter standard codes ('M3L' → 'LYS').
+        # allowed_amino_acids needs 3-letter → 1-letter ('M3L' → 'K'), so we
+        # compose through the already-built dict to get the right value.
+        self.allowed_amino_acids.update({
+            mod: self.allowed_amino_acids[std]
+            for mod, std in MODIFIED_RESIDUES_TO_STANDARD.items()
+            if std in self.allowed_amino_acids
+        })
         self.sequence = ''.join(
-            [self.allowed_amino_acids[res.resname] for res in self.chain])
+            [self.allowed_amino_acids[res.resname]
+             for res in self.chain
+             if res.resname in self.allowed_amino_acids])
         self.calpha_atom_distance_cutoff = calpha_atom_distance_cutoff
         self.sequence_len_lower_cutoff = sequence_len_lower_cutoff
         self.sequence_len_upper_cutoff = sequence_len_upper_cutoff

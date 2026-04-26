@@ -21,6 +21,46 @@ RESIDUE_LIST = [
     ("V", "VAL"),
 ]
 
+MODIFIED_RESIDUES_TO_STANDARD = {
+            # Methionine variants
+            'MSE': 'MET',  # Selenomethionine
+            'FME': 'MET',  # N-formylmethionine
+            'CXM': 'MET',  # N-carboxymethionine
+            # Lysine variants
+            'M3L': 'LYS',  # N6,N6,N6-trimethyllysine
+            'MLY': 'LYS',  # N6-methyllysine
+            'MLZ': 'LYS',  # N6-methyllysine (alt code)
+            'KCX': 'LYS',  # Lysine NZ-carboxylic acid
+            'ALY': 'LYS',  # N6-acetyllysine
+            'LLP': 'LYS',  # Lysine-pyridoxal-5-phosphate
+            # Cysteine variants
+            'CSO': 'CYS',  # S-hydroxycysteine
+            'CME': 'CYS',  # S,S-(2-hydroxyethyl)thiocysteine
+            'OCS': 'CYS',  # Cysteinesulfonic acid
+            'SEC': 'CYS',  # Selenocysteine
+            'SMC': 'CYS',  # S-methylcysteine
+            'CSD': 'CYS',  # 3-sulfoalanine (treated as Cys)
+            # Serine/Threonine variants
+            'SEP': 'SER',  # Phosphoserine
+            'TPO': 'THR',  # Phosphothreonine
+            # Tyrosine variants
+            'PTR': 'TYR',  # Phosphotyrosine
+            'TYS': 'TYR',  # Sulfotyrosine
+            # Proline variants
+            'HYP': 'PRO',  # 4-hydroxyproline
+            # Aspartate variants
+            'BHD': 'ASP',  # (3S)-3-hydroxy-L-aspartic acid (beta-hydroxyaspartic acid)
+            # Glutamate/Glutamine variants
+            'CGU': 'GLU',  # Gamma-carboxyglutamate
+            'PCA': 'GLN',  # Pyroglutamate (from Gln)
+            # Histidine variants
+            'NEP': 'HIS',  # N1-phosphohistidine
+            'HIC': 'HIS',  # 4-methyl-histidine
+        }
+
+# Solvent residue names to exclude when parsing PDB files. This is not an exhaustive list, but covers common cases.
+SOLVENT_RESIDUES = {'HOH', 'WAT', 'TIP3', 'SOL', 'NA', 'CL', 'K', 'MG', 'ZN'}
+
 UNKNOWN_RESIDUE = ("X", "UNK")
 
 BACKBONE_ATOMS = ["N", "CA", "C"]
