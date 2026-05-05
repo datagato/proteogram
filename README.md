@@ -131,32 +131,211 @@ uv add --dev <packagename>
 
 ### Set up configuration
 
-1. Copy the example configuration file:
-   ```bash
-   cp scripts/v2/config.example.yml scripts/v2/config.yml
-   ```
-
-2. Edit `scripts/v2/config.yml` to configure:
-   - `scope_structures_dir`: Path to your input PDB structure files (here we used SCOPe 2.08 structures)
-   - `all_proteograms_dir`: Path where generated proteograms will be saved
-   - `limit_file`: (Optional) Path to a file listing specific structures to process (one per line)
-
-### Creating Proteograms
-
-To create Proteograms for your protein structure(s), run the following from the `scripts/v2` folder:
+Copy the example configuration file and edit it before running any pipeline step:
 ```bash
-cd scripts/v2
-uv run python create_v2_proteograms.py
+cp scripts/v2/config.example.yml scripts/v2/config.yml
 ```
 
-Optional arguments/flags:
-- `--overwrite`: Recreate Proteograms even if they already exist
+All scripts read from `scripts/v2/config.yml`. The keys used at each pipeline step are listed below alongside the relevant step. A full reference is in `scripts/v2/config.example.yml`.
+
+### v2 Pipeline
+
+All commands below are run from the `scripts/v2/` directory:
+```bash
+cd scripts/v2
+```
+
+---
+
+#### Step 1 — Create Proteograms
+
+Set in `config.yml`:
+```yaml
+scope_structures_dir: /path/to/pdb/structures   # input .ent/.pdb files
+all_proteograms_dir:  /path/to/output/proteograms
+limit_file: /path/to/limit.lst                  # optional: one PDB ID per line
+```
+
+Run:
+```bash
+python create_v2_proteograms.py
+```
+
+Key optional flags:
+- `--overwrite`: Recreate proteograms even if they already exist
 - `--verbose`: Enable verbose output and logging
 - `--save_simulated_pdb`: Save the final MD simulation structure as a PDB file to a subfolder
+- `--memory-efficient`: Lower peak RAM at the cost of speed (for proteins > ~150 residues on constrained hardware)
 
-### Measure similarity of a single domain against a database of Proteograms
+> Proteogram creation runs the full MD simulation pipeline (energy minimization + equilibration + 1 ns production). Expect ~5 min per protein for small domains (~50 residues) and ~1 hour for larger ones (~200 residues) on a GPU. Run multiple instances in parallel with `--limit_file` splits to speed this up.
 
-> Coming soon
+---
+
+#### Step 2 — Train the image embedding model
+
+Separate your proteograms into `train/` and `eval/` subdirectories first (see `create_balanced_scope_train_eval_lists.py` in the scripts reference below). Set in `config.yml`:
+```yaml
+training_data_dir: /path/to/proteograms        # must contain train/ and eval/ subdirs
+num_epochs: 100
+learning_rate: 0.001
+batch_size: 8
+model_file_prefix: cnn_proteogram_model
+```
+
+Run (pretrained ResNet18, recommended):
+```bash
+python train_multiple_models.py \
+  --model resnet18 \
+  --epochs 100 \
+  --batch_size 8 \
+  --lr 0.001 \
+  --patience 10 \
+  --val_size 0.2 \
+  --tsv_file ../data/ProteogramData_SCOP_RCSB_PDBe_AnnotationsLookup_AllSCOPe208.tsv
+```
+
+Key optional flags:
+- `--model cnn`: Train a from-scratch 4-block ConvNet instead of ResNet18
+- `--level class|fold|superfamily|family`: SCOPe hierarchy level to classify at (default: `class`)
+- `--exclude_classes h,i,j,k,l`: Comma-separated classes to exclude (useful for very small classes)
+- `--overwrite`: Overwrite an existing saved model file
+
+The trained model `.pt` file is saved to `training_data_dir` with hyperparameters in the filename (e.g. `cnn_proteogram_model_resnet18_lr0.001_bs8_e29.pt`).
+
+---
+
+#### Step 3 — Create corpus embeddings
+
+Embed all proteograms (train + eval combined) into a single portable corpus. Set in `config.yml`:
+```yaml
+model_file: /path/to/cnn_proteogram_model_resnet18_lr0.001_bs8_e29.pt
+embed_file: /path/to/corpus_embeddings.pkl
+```
+
+Run using the utility script (searches subdirectories recursively):
+```bash
+python ../tmp/create_corpus_embeddings.py \
+  --model_file /path/to/model.pt \
+  --embed_file /path/to/corpus_embeddings.pkl \
+  --dirs /path/to/proteograms/train /path/to/proteograms/eval
+```
+
+The resulting pickle contains `{filename: embedding_tensor}` with filename-only keys (portable across machines).
+
+---
+
+#### Step 4 — Measure proteogram similarity
+
+Set in `config.yml`:
+```yaml
+proteograms_for_sim_dir: /path/to/proteograms/eval   # proteograms to search across
+proteogram_sim_results:  /path/to/proteogram_similarity_results.tsv
+search_images_dir:       /path/to/search_images
+top_k: 5
+```
+
+Run (using pre-computed embeddings from Step 3):
+```bash
+python measure_similarity_v2.py --no-embed
+```
+
+Or recompute embeddings for the eval set only:
+```bash
+python measure_similarity_v2.py
+```
+
+Key optional flags:
+- `--no-embed`: Skip embedding and load from `embed_file` (faster if embeddings already exist)
+- `--exclude_classes h,i,j,k,l`: Exclude classes from the search corpus
+
+---
+
+#### Step 5 — Run GTalign and USalign (for comparison)
+
+First copy the eval set structures to a flat directory:
+```bash
+python ../utilities/copy_structures_by_prefix.py \
+  --prefix_file /path/to/eval.lst \
+  --src_dir /path/to/pdb/structures \
+  --dst_dir eval_structures
+```
+
+**GTalign:**
+```bash
+gtalign --qrs=eval_structures --rfs=eval_structures -s 0.0 -o gtalign_out
+```
+
+**US-align:**
+```bash
+ls -1 eval_structures > eval_structures_names.lst
+~/Documents/bin/USalign/USalign \
+  -mol prot -outfmt 2 \
+  -dir eval_structures eval_structures_names.lst \
+  > usalign_out.tsv
+```
+
+---
+
+#### Step 6 — Evaluate all methods
+
+Set in `config.yml`:
+```yaml
+scope_eval_set:       /path/to/eval.lst
+gtalign_results_dir:  /path/to/gtalign_out
+usalign_results:      /path/to/usalign_out.tsv
+scope_cla_file:       /path/to/dir.cla.scope.2.08-stable.txt
+scope_des_file:       /path/to/dir.des.scope.2.08-stable.txt
+scope_hie_file:       /path/to/dir.hie.scope.2.08-stable.txt
+save_bad_searches_dir:  /path/to/bad_searches
+save_good_searches_dir: /path/to/good_searches
+```
+
+Run:
+```bash
+python evaluate_methods_v2.py
+```
+
+Key optional flags:
+- `--exclude_classes h,i,j,k,l`: Match the classes excluded during training and similarity search
+
+Outputs Precision@K, MAP@K, and Recall@K for each method (Proteogram, GTalign, USalign) at the class, fold, superfamily, and family levels.
+
+### Find similar proteins to a single domain
+
+`query_similar_proteins.py` takes a single PDB file, builds its v2 proteogram (running the full MD simulation pipeline), embeds it with the trained model, and returns the top-K most similar proteins from a pre-computed corpus using cosine similarity.
+
+**Prerequisites:**
+
+1. A trained model (`.pt` file) — produced by `train_multiple_models.py` and set as `model_file` in `config.yml`.
+2. A pre-computed corpus embedding pickle — produced by running `measure_similarity_v2.py` at least once, set as `embed_file` in `config.yml`.
+
+**Add the following to `scripts/v2/config.yml`** if not already present:
+```yaml
+model_file: /path/to/cnn_proteogram_model_resnet18_lr0.001_bs8_e29.pt
+embed_file: /path/to/proteogram_embeddings.pkl
+top_k: 5
+```
+
+**Run from the `scripts/v2/` folder:**
+```bash
+cd scripts/v2
+python query_similar_proteins.py \
+  --pdb_file /path/to/myprotein.pdb \
+  --chain_id A \
+  --output_dir /path/to/results \
+  --top_k 5
+```
+
+Arguments:
+- `--pdb_file / -p`: Path to the query PDB file (required)
+- `--chain_id / -c`: Chain ID to extract, e.g. `A` (required)
+- `--output_dir / -o`: Directory to save the query proteogram JPG and result images (default: current directory)
+- `--top_k / -k`: Number of top results to return (default: `top_k` from `config.yml`)
+
+**Output:**
+- The query proteogram saved as `<pdb_basename>.jpg` in `--output_dir`
+- A ranked list of top-K similar proteins with cosine similarity scores printed to the console
+- A side-by-side result image saved to `<output_dir>/search_results/`
 
 ### Running an MD simulation (without creating a Proteogram)
 
@@ -210,6 +389,7 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 | Script | Purpose | Config Variables (`config.yml`) | Command-Line Arguments |
 |--------|---------|--------------------------------|------------------------|
 | `v2/create_v2_proteograms.py` | Create proteograms using MD-based nonbonded energy calculations, distances, and hydrophobicity deltas | `limit_file`, `scope_structures_dir`, `all_proteograms_dir` | `--max_workers/-w`, `--overwrite`, `--verbose`, `--debug`, `--memory-efficient`, `--save_simulated_pdb` |
+| `v2/query_similar_proteins.py` | Create a proteogram for a single query PDB and find the top-K most similar proteins from a pre-computed corpus | `top_k`, `model_file`, `embed_file` | `--pdb_file/-p`, `--chain_id/-c`, `--output_dir/-o`, `--top_k/-k` |
 | `v2/measure_similarity_v2.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | `--exclude_classes/-x`, `--overwrite`, `--embed/--no-embed` |
 | `v2/train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping and per-class evaluation | `training_data_dir`, `num_epochs`, `learning_rate`, `batch_size`, `scope_level`, `model_file_prefix` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
 | `v2/evaluate_methods_v2.py` | Evaluate proteogram approach vs GTalign and USalign | `top_k`, `scope_eval_set`, `proteogram_sim_results`, `gtalign_results_dir`, `usalign_results`, `search_images_dir`, `save_bad_searches_dir`, `save_good_searches_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | `--overwrite`, `--exclude_classes/-x` |
@@ -237,20 +417,6 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 | `utilities/get_structures_scope20840_list.py` | Download and parse PDB structures by chain from SCOPe 2.08 | None (hardcoded paths in script) | None |
 
 > **Note:** Scripts with "None (hardcoded paths in script)" require editing the script directly to set file paths. See `config.example.yml` in the relevant subfolder for descriptions of all configuration variables.
-
-## Workflow for paper where the Proteogram approach was compared to popular methods for structure alignment and search
-
-### Overview of v1 approach
-
-![](assets/Workflow-Structure-Compression.png)
-
-#### Proteogram v1 generation
-
-![](assets/proteogram_generation.png)
-
-Example of resulting top 5 most similar Proteograms using the v1 approach:
-
-![](assets/AF-A0A3M6TU40-F1-model_v4_A_top_sims.jpg)
 
 ## References
 

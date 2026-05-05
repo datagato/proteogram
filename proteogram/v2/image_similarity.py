@@ -326,13 +326,13 @@ class Img2Vec:
             with Pool(1) as pool:
                 results = pool.map(self.embed_image_for_mp, self.files)
             for img, embedding in results:
-                self.dataset[str(img)] = embedding.clone()#.detach().item()
+                self.dataset[os.path.basename(str(img))] = embedding.clone()#.detach().item()
 
     def embed_dataset(self):
         # convert source to appropriate format
         with torch.no_grad():
             for img in tqdm(self.files):
-                self.dataset[str(img)] = self.embed_image(img)
+                self.dataset[os.path.basename(str(img))] = self.embed_image(img)
 
     def sim_calc(self, image_path1, image_path2):
         embedding1 = self.dataset[image_path1]
@@ -481,17 +481,26 @@ class Img2Vec:
 
         return sim_calc_time
 
-    def save_images(self, query_file, save_dir, scores_n_arr=None, pad_fn=None):
-        """Save similar images from similarity search"""
-        images_files = [query_file]
+    def save_images(self, query_file, save_dir, scores_n_arr=None, pad_fn=None, corpus_dir=None):
+        """Save similar images from similarity search.
+
+        corpus_dir: directory where corpus proteogram images live. Required when
+        embeddings were saved with filename-only keys (portable mode) so that
+        result image paths can be reconstructed for display.
+        """
         if not scores_n_arr:
-            images_files.extend([target for target, _ in self.sim_dict[query_file]])
+            result_keys = [target for target, _ in self.sim_dict[query_file]]
             scores = ['']
             scores.extend([f'{score:.2f}' for _, score in self.sim_dict[query_file]])
         else:
-            images_files.extend([file for file, _ in scores_n_arr])
+            result_keys = [file for file, _ in scores_n_arr]
             scores = ['']
             scores.extend([f'{score:.2f}' for _, score in scores_n_arr])
+        if corpus_dir:
+            result_paths = [os.path.join(corpus_dir, os.path.basename(k)) for k in result_keys]
+        else:
+            result_paths = result_keys
+        images_files = [query_file] + result_paths
         images = [pad_fn(Image.open(t)) if pad_fn else Image.open(t) for t in images_files]
 
         max_height = 1000

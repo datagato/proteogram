@@ -151,7 +151,9 @@ if __name__ == '__main__':
         full_sim_dict = {k: list(v) for k, v in img_sim.sim_dict.items()}
         for image_path in img_sim.sim_dict:
             img_sim.sim_dict[image_path] = full_sim_dict[image_path][:top_k]
-            img_sim.save_images(image_path, save_images_dir, pad_fn=pad_to_size)
+            img_sim.save_images(os.path.join(dataset_dir, image_path), save_images_dir,
+                                scores_n_arr=img_sim.sim_dict[image_path],
+                                pad_fn=pad_to_size, corpus_dir=dataset_dir)
         img_sim.sim_dict = full_sim_dict  # restore all results for CSV
 
         print(f'Took {sim_time} seconds to calculate similarities / perform search.')

@@ -168,7 +168,7 @@ if __name__ == '__main__':
                                       chain_id=chain_id,
                                       calpha_atom_distance_cutoff=10,
                                       sequence_len_lower_cutoff=20,
-                                      sequence_len_upper_cutoff=1000,
+                                      sequence_len_upper_cutoff=200,
                                       use_gpu=use_gpu)
             
             # Skip chains that don't meet the sequence length cutoffs

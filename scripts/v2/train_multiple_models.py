@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import argparse
 
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, roc_auc_score
 
 import torch
 from torch.utils.data import random_split, Dataset, DataLoader
@@ -354,20 +354,23 @@ def split_train_test(full_dataset, generator):
     return train_dataset, test_dataset
 
 def get_accuracies(model, test_loader, class_names, labels_to_names, device=torch.device('cpu')):
-    """Accuracies per class"""
+    """Accuracies per class, classification report, and AUC-ROC."""
     correct_pred = {classname: 0 for classname in class_names}
     total_pred = {classname: 0 for classname in class_names}
     total_correct = 0
     len_data = len(test_loader)
     y_pred = []
     y_test = []
+    y_scores = []
     model.eval()
     model.to(device)
     with torch.no_grad():
         for (data, targets) in test_loader:
             data, targets = data.to(device), targets.to(device)
             outputs = model(data)
+            probs = torch.softmax(outputs, dim=1)
             _, predictions = torch.max(outputs, 1)
+            y_scores.append(probs.cpu().numpy())
             # collect the correct predictions for each class
             for label, prediction in zip(targets, predictions):
                 if label == prediction:
@@ -388,6 +391,14 @@ def get_accuracies(model, test_loader, class_names, labels_to_names, device=torc
 
     print('\nAdditional Classification Report:')
     print(classification_report(y_test, y_pred))
+
+    name_to_int = {v: k for k, v in labels_to_names.items()}
+    y_test_int = [name_to_int[n] for n in y_test]
+    y_scores_arr = np.vstack(y_scores)
+    auc_macro    = roc_auc_score(y_test_int, y_scores_arr, multi_class='ovr', average='macro')
+    auc_weighted = roc_auc_score(y_test_int, y_scores_arr, multi_class='ovr', average='weighted')
+    print(f'\nAUC-ROC (macro):    {auc_macro:.4f}')
+    print(f'AUC-ROC (weighted): {auc_weighted:.4f}')
 
 
 def view_pred_set(model, test_loader, num_preds, labels_to_names, fig_path):
