@@ -117,7 +117,7 @@ if __name__ == '__main__':
     img_sim = Img2Vec(model_file, dataset_dir=prot_files, weights='DEFAULT', device=device)
     # Override transform to match training: pad to 200x200 with gray rather than resize
     img_sim.transform = transforms.Compose([
-        transforms.Lambda(pad_to_size(target=200)),
+        transforms.Lambda(lambda img: pad_to_size(img, target=200)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -165,7 +165,7 @@ if __name__ == '__main__':
         df_res['query_image'] = prot_files
         for i, image_path in enumerate(prot_files):
             try:
-                scores = img_sim.sim_dict[image_path]
+                scores = img_sim.sim_dict[os.path.basename(image_path)]
                 df_res.iloc[i, :n_results] = [f'{a},{b}' for (a, b) in scores]
             except KeyError as e:
                 print(f'Key error for {e}')

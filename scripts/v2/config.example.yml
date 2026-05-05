@@ -42,5 +42,6 @@ proteogram_sim_results: './<path>/proteogram_similarity_results.tsv' # similarit
 # for evaluate_methods.py
 gtalign_results_dir: '<path>/gtalign_out' # dir name for gtalign output
 usalign_results: './<path>/usalign_out.tsv' # tab-delimited ouptut from USalign
+foldseek_results: './<path>/foldseek_out.tsv' # optional; 3-col TSV from foldseek easy-search --format-output "query,target,qtmscore"; omit key to skip Foldseek in evaluation
 save_bad_searches_dir: './<path>/bad_proteogram_searches' # dir for poor search result images
 save_good_searches_dir: './<path>/good_proteogram_searches' # dir for very good search result images

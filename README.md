@@ -250,7 +250,7 @@ Key optional flags:
 
 ---
 
-#### Step 5 — Run GTalign and USalign (for comparison)
+#### Step 5 — Run GTalign, USalign, and Foldseek (for comparison)
 
 First copy the eval set structures to a flat directory:
 ```bash
@@ -261,18 +261,62 @@ python ../utilities/copy_structures_by_prefix.py \
 ```
 
 **GTalign:**
+
+Download a precompiled binary from the [GTalign releases page](https://github.com/minmarg/gtalign_alpha/releases) and add it to your PATH:
+```bash
+wget https://github.com/minmarg/gtalign_alpha/releases/latest/download/gtalign_Linux_x86_64.tar.gz
+tar -xzf gtalign_Linux_x86_64.tar.gz
+export PATH="$PATH:$(pwd)/bin"   # or move the binary to /usr/local/bin
+```
+
+Run all-vs-all structural search on the eval set:
 ```bash
 gtalign --qrs=eval_structures --rfs=eval_structures -s 0.0 -o gtalign_out
 ```
 
 **US-align:**
+
+Clone and compile from source (requires a C++ compiler):
+```bash
+git clone https://github.com/pylelab/USalign.git
+cd USalign && make
+export PATH="$PATH:$(pwd)"   # or move the binary to /usr/local/bin
+```
+
+Run all-vs-all structural search on the eval set:
 ```bash
 ls -1 eval_structures > eval_structures_names.lst
-~/Documents/bin/USalign/USalign \
+USalign \
   -mol prot -outfmt 2 \
   -dir eval_structures eval_structures_names.lst \
   > usalign_out.tsv
 ```
+
+**Foldseek:**
+
+Install Foldseek via conda or download a static binary from the [Foldseek releases page](https://github.com/steineggerlab/foldseek/releases):
+```bash
+conda install -c bioconda foldseek
+```
+
+Run all-vs-all structural search on the eval set:
+```bash
+foldseek easy-search eval_structures/ eval_structures/ foldseek_out.tsv tmp_foldseek/ \
+  --format-output "query,target,qtmscore" \
+  --alignment-type 1 \
+  --exhaustive-search 1 \
+  -e inf \
+  --max-seqs 10000
+```
+
+Key flags:
+- `--format-output "query,target,qtmscore"`: outputs query ID, target ID, and TM-score normalized by query length (the correct analog to USalign's TM1 score for ranking)
+- `--alignment-type 1`: forces TM-align-based structural alignment (default 3Di mode can produce near-zero scores for distant pairs when prefiltering is disabled)
+- `--exhaustive-search 1`: disables the k-mer prefilter to ensure true all-vs-all comparison
+- `-e inf`: removes the e-value cutoff
+- `--max-seqs 10000`: sets the maximum results per query above the eval set size
+
+> **Important:** Run Foldseek against the same `eval_structures/` directory used for GTalign and USalign. Including train-set structures will cause most targets to be absent from the evaluation label set, giving artificially low scores.
 
 ---
 
@@ -283,6 +327,7 @@ Set in `config.yml`:
 scope_eval_set:       /path/to/eval.lst
 gtalign_results_dir:  /path/to/gtalign_out
 usalign_results:      /path/to/usalign_out.tsv
+foldseek_results:     /path/to/foldseek_out.tsv   # optional
 scope_cla_file:       /path/to/dir.cla.scope.2.08-stable.txt
 scope_des_file:       /path/to/dir.des.scope.2.08-stable.txt
 scope_hie_file:       /path/to/dir.hie.scope.2.08-stable.txt
@@ -392,7 +437,7 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 | `v2/query_similar_proteins.py` | Create a proteogram for a single query PDB and find the top-K most similar proteins from a pre-computed corpus | `top_k`, `model_file`, `embed_file` | `--pdb_file/-p`, `--chain_id/-c`, `--output_dir/-o`, `--top_k/-k` |
 | `v2/measure_similarity_v2.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | `--exclude_classes/-x`, `--overwrite`, `--embed/--no-embed` |
 | `v2/train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping and per-class evaluation | `training_data_dir`, `num_epochs`, `learning_rate`, `batch_size`, `scope_level`, `model_file_prefix` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
-| `v2/evaluate_methods_v2.py` | Evaluate proteogram approach vs GTalign and USalign | `top_k`, `scope_eval_set`, `proteogram_sim_results`, `gtalign_results_dir`, `usalign_results`, `search_images_dir`, `save_bad_searches_dir`, `save_good_searches_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | `--overwrite`, `--exclude_classes/-x` |
+| `v2/evaluate_methods_v2.py` | Evaluate proteogram approach vs GTalign, USalign, and Foldseek | `top_k`, `scope_eval_set`, `proteogram_sim_results`, `gtalign_results_dir`, `usalign_results`, `foldseek_results` (optional), `search_images_dir`, `save_bad_searches_dir`, `save_good_searches_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | `--overwrite`, `--exclude_classes/-x` |
 | `v2/create_annotation_file.py` | Generate annotation lookup file from SCOPe/RCSB/PDBe | `limit_file`, `scope_structures_dir`, `annot_file`, `fasta_style_file`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | None |
 | `v2/create_balanced_scope_train_eval_lists.py` | Create balanced train/eval splits from CD-HIT clustered results | None | `--lst-file/-l`, `--lookup-tsv/-t`, `--class-column/-c`, `--n-per-class/-n`, `--eval-fraction/-e`, `--train-output`, `--eval-output`, `--split-train`, `--seed` |
 
@@ -430,7 +475,9 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 
 5. **AMBER ff19SB** - Tian, C., Kasavajhala, K., Belfon, K.A.A., Raguette, L., Huang, H., Migues, A.N., Bickel, J., Wang, Y., Pincay, J., Wu, Q., & Simmerling, C. (2020). ff19SB: Amino-Acid-Specific Protein Backbone Parameters Trained against Quantum Mechanics Energy Surfaces in Solution. *Journal of Chemical Theory and Computation*, 16(1), 528-552. https://doi.org/10.1021/acs.jctc.9b00591
 
-6. **ResNet** - He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep Residual Learning for Image Recognition. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 770-778. https://doi.org/10.1109/CVPR.2016.90
+6. **Foldseek** - van Kempen, M., Kim, S.S., Tumescheit, C., Mirdita, M., Lee, J., Gilchrist, C.L.M., Söding, J., & Steinegger, M. (2024). Fast and accurate protein structure search with Foldseek. *Nature Biotechnology*, 42, 243–246. https://doi.org/10.1038/s41587-023-01773-0
+
+7. **ResNet** - He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep Residual Learning for Image Recognition. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 770-778. https://doi.org/10.1109/CVPR.2016.90
 
 
 # Docker Guide (uv based)

@@ -150,6 +150,47 @@ def read_gtalign_results(gtalign_results_dir):
 
     return pd.DataFrame(results)
 
+def _foldseek_id(raw):
+    """Extract a 7-char SCOPe SID from a raw Foldseek query/target field.
+
+    Foldseek may output any of:
+      - 'd1a3wa3.ent'   (filename with extension)
+      - 'd1a3wa3'       (stem only)
+      - 'd1a3wa3A'      (stem + chain letter appended by createdb)
+    SCOPe SIDs are always exactly 7 characters (e.g. 'd1a3wa3').
+    """
+    stem = os.path.splitext(os.path.basename(raw))[0]
+    return stem[:7]
+
+
+def read_foldseek_results(foldseek_results):
+    """Read Foldseek easy-search results into a pandas DataFrame.
+
+    Expects output produced with:
+        --format-output "query,target,alntmscore"
+    which yields a headerless three-column TSV.  Self-hits are present in
+    Foldseek output and are skipped here (query == target after stem extraction).
+    """
+    fs_df = pd.read_csv(foldseek_results, sep='\t', header=None,
+                        names=['query', 'target', 'score'])
+    data = {}
+    for _, row in fs_df.iterrows():
+        q = _foldseek_id(row['query'])
+        t = _foldseek_id(row['target'])
+        score = float(row['score'])
+        if q not in data:
+            data[q] = OrderedDict()
+        if t not in data[q] or score > data[q][t]:
+            data[q][t] = score
+
+    ordered_data = []
+    for query_id, targets in data.items():
+        sorted_targets = sorted(targets.items(), key=lambda x: x[1], reverse=True)
+        filtered = [t for t, _ in sorted_targets if t != query_id]
+        ordered_data.append([query_id] + filtered[:top_k])
+    return pd.DataFrame(ordered_data)
+
+
 def read_usalign_results(usalign_results):
     """
     Read USalign results into a pandas dataframe.
@@ -214,6 +255,7 @@ if __name__ == '__main__':
     proteogram_sim_results = config['proteogram_sim_results']
     gtalign_results_dir = config['gtalign_results_dir']
     usalign_results = config['usalign_results']
+    foldseek_results = config.get('foldseek_results')
     search_images_dir = config['search_images_dir']
     save_bad_searches_dir = config['save_bad_searches_dir']
     save_good_searches_dir = config['save_good_searches_dir']
@@ -429,10 +471,34 @@ if __name__ == '__main__':
     usalign_metrics = calc_patk_mapk(usalign_res_df, label_df, top_k,
                                      limit_to_ids=proteogram_evaluated_ids)
 
+    if foldseek_results:
+        fs_raw = pd.read_csv(foldseek_results, sep='\t', header=None,
+                             names=['query', 'target', 'score'])
+        scores = pd.to_numeric(fs_raw['score'], errors='coerce').dropna()
+        print(f'Foldseek score column — n: {len(scores)}, '
+              f'min: {scores.min():.4f}, max: {scores.max():.4f}, '
+              f'mean: {scores.mean():.4f}, '
+              f'n_zero: {(scores == 0).sum()}')
+        print(f'Foldseek file columns: {fs_raw.shape[1]}  '
+              f'sample row: {list(fs_raw.iloc[0])}')
+        foldseek_res_df = read_foldseek_results(foldseek_results)
+        label_ids = set(label_df['pdb_id_chain'])
+        fs_targets = [t for t in pd.unique(foldseek_res_df.iloc[:, 1:].values.ravel())
+                      if isinstance(t, str)]
+        n_matched = sum(1 for t in fs_targets if t in label_ids)
+        print(f'Foldseek unique targets: {len(fs_targets)}, '
+              f'found in label_df: {n_matched} ({100*n_matched/max(len(fs_targets),1):.1f}%)')
+        foldseek_metrics = calc_patk_mapk(foldseek_res_df, label_df, top_k,
+                                          limit_to_ids=proteogram_evaluated_ids)
+    else:
+        foldseek_metrics = None
+
     gt = gtalign_metrics
     us = usalign_metrics
+    fs = foldseek_metrics
     proteogram_n = len(precision_at_ks_fams)
-    print(f'Proteins compared — Proteogram: {proteogram_n} | GTalign: {gt["n_queries"]} | USalign: {us["n_queries"]}')
+    fs_n = fs['n_queries'] if fs else 'N/A'
+    print(f'Proteins compared — Proteogram: {proteogram_n} | GTalign: {gt["n_queries"]} | USalign: {us["n_queries"]} | Foldseek: {fs_n}')
 
     hdr  = f'{"Method":<15} | {"Class":>8} | {"Fold":>8} | {"Superfamily":>11} | {"Family":>8}'
     sep  = '-' * len(hdr)
@@ -442,6 +508,8 @@ if __name__ == '__main__':
     print(sep)
     print(f'{"GTalign":<15} | {gt["patk_class"]:>8.4f} | {gt["patk_fold"]:>8.4f} | {gt["patk_superfamily"]:>11.4f} | {gt["patk_family"]:>8.4f}')
     print(f'{"USalign":<15} | {us["patk_class"]:>8.4f} | {us["patk_fold"]:>8.4f} | {us["patk_superfamily"]:>11.4f} | {us["patk_family"]:>8.4f}')
+    if fs:
+        print(f'{"Foldseek":<15} | {fs["patk_class"]:>8.4f} | {fs["patk_fold"]:>8.4f} | {fs["patk_superfamily"]:>11.4f} | {fs["patk_family"]:>8.4f}')
     print(f'{"Proteogram":<15} | {proteogram_patk_class:>8.4f} | {proteogram_patk_fold:>8.4f} | {proteogram_patk_sfam:>11.4f} | {proteogram_patk_fam:>8.4f}')
 
     print(f'\nMAP@K (K={top_k})')
@@ -449,6 +517,8 @@ if __name__ == '__main__':
     print(sep)
     print(f'{"GTalign":<15} | {gt["map_class"]:>8.4f} | {gt["map_fold"]:>8.4f} | {gt["map_superfamily"]:>11.4f} | {gt["map_family"]:>8.4f}')
     print(f'{"USalign":<15} | {us["map_class"]:>8.4f} | {us["map_fold"]:>8.4f} | {us["map_superfamily"]:>11.4f} | {us["map_family"]:>8.4f}')
+    if fs:
+        print(f'{"Foldseek":<15} | {fs["map_class"]:>8.4f} | {fs["map_fold"]:>8.4f} | {fs["map_superfamily"]:>11.4f} | {fs["map_family"]:>8.4f}')
     print(f'{"Proteogram":<15} | {proteogram_map_class:>8.4f} | {proteogram_map_fold:>8.4f} | {proteogram_map_sfam:>11.4f} | {proteogram_map_fam:>8.4f}')
 
     print(f'\nRecall@K (K={top_k})')
@@ -456,4 +526,6 @@ if __name__ == '__main__':
     print(sep)
     print(f'{"GTalign":<15} | {gt["ratk_class"]:>8.4f} | {gt["ratk_fold"]:>8.4f} | {gt["ratk_superfamily"]:>11.4f} | {gt["ratk_family"]:>8.4f}')
     print(f'{"USalign":<15} | {us["ratk_class"]:>8.4f} | {us["ratk_fold"]:>8.4f} | {us["ratk_superfamily"]:>11.4f} | {us["ratk_family"]:>8.4f}')
+    if fs:
+        print(f'{"Foldseek":<15} | {fs["ratk_class"]:>8.4f} | {fs["ratk_fold"]:>8.4f} | {fs["ratk_superfamily"]:>11.4f} | {fs["ratk_family"]:>8.4f}')
     print(f'{"Proteogram":<15} | {proteogram_ratk_class:>8.4f} | {proteogram_ratk_fold:>8.4f} | {proteogram_ratk_sfam:>11.4f} | {proteogram_ratk_fam:>8.4f}')
