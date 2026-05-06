@@ -3,7 +3,7 @@
 test.*
 poetry.lock
 *.pdf
-data/
+scripts/data/
 pdb_*
 msa/
 *.pth
