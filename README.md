@@ -343,7 +343,7 @@ python evaluate_methods_v2.py
 Key optional flags:
 - `--exclude_classes h,i,j,k,l`: Match the classes excluded during training and similarity search
 
-Outputs Precision@K, MAP@K, and Recall@K for each method (Proteogram, GTalign, USalign) at the class, fold, superfamily, and family levels.
+Outputs Precision@K, MAP@K, and Recall@K for each method (Proteogram, GTalign, USalign and optionally Foldseek) at the structure class and fold levels.
 
 ### Find similar proteins to a single domain
 
@@ -351,17 +351,17 @@ Outputs Precision@K, MAP@K, and Recall@K for each method (Proteogram, GTalign, U
 
 **Prerequisites:**
 
-1. A trained model (`.pt` file) — produced by `train_multiple_models.py` and set as `model_file` in `config.yml`.
-2. A pre-computed corpus embedding pickle — produced by running `measure_similarity_v2.py` at least once, set as `embed_file` in `config.yml`.
+1. A trained PyTorch CNN (`.pt` file) — produced by `train_multiple_models.py` and set as `model_file` in `config.yml`. For the benchmarking model, go to the Releases in this repository and download from the latest release.
+2. A pre-computed corpus embedding pickle — produced by running `measure_similarity_v2.py` at least once, set as `embed_file` in `config.yml`. For the benchmarking embeddings, go to the Releases in this repository and download from the latest release.
 
 **Add the following to `scripts/v2/config.yml`** if not already present:
 ```yaml
-model_file: /path/to/cnn_proteogram_model_resnet18_lr0.001_bs8_e29.pt
-embed_file: /path/to/proteogram_embeddings.pkl
+model_file: /path/to/proteogram_resnet18_finetuned_lr0.001_bs8_e29_85.5acc.pt
+embed_file: /path/to/proteogram_embeddings_scope2.08-nr60_20-200.pkl
 top_k: 5
 ```
 
-**Run from the `scripts/v2/` folder:**
+**Run from the `scripts/v2/` folder (Note, this may take a very long time depending upon the size of the protein which will, if large, make the MD simulation very compute intensive):**
 ```bash
 cd scripts/v2
 python query_similar_proteins.py \
