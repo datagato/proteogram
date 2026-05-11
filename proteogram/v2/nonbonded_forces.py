@@ -506,17 +506,19 @@ class NonBondedForceModel:
         )
         
         platform = self._get_platform()
-        
+        platform_properties = {'CudaPrecision': 'double'} if platform.getName() == 'CUDA' else {}
+
         # Clean up old simulation to free memory (especially CUDA)
         self.cleanup_all_resources(final_run=False)
-        
+
         # Don't store system here - Simulation manages its own system lifetime
         # Create fresh system for this simulation
         self.simulation = Simulation(
             self.topology,
             system,
             integrator,
-            platform
+            platform,
+            platform_properties
         )
         
         # Restore periodic box vectors from previous Context if available

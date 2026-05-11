@@ -16,7 +16,7 @@ This representation captures both spatial similarity through distograms and phys
 
 Example proteogram v1 (symmetric):
 
-![](assets/3KFD_A.jpg)
+![](assets/figures/3KFD_A.jpg)
 
 ### Proteogram v2: Incorporating MD Simulations
 
@@ -51,7 +51,7 @@ All six maps are normalized to [0–255] before combining into the final RGB ima
 
 Example Proteogram v2 (asymmetric):
 
-![](assets/d3kfda_.jpg)
+![](assets/figures/d3kfda_.jpg)
 
 ## Getting started with Proteogram v2
 
@@ -138,7 +138,49 @@ cp scripts/v2/config.example.yml scripts/v2/config.yml
 
 All scripts read from `scripts/v2/config.yml`. The keys used at each pipeline step are listed below alongside the relevant step. A full reference is in `scripts/v2/config.example.yml`.
 
-### v2 Pipeline
+### Single protein inference
+
+`query_similar_proteins.py` takes a single PDB file, builds its v2 proteogram (running the full MD simulation pipeline), embeds it with the trained model, and returns the top-K most similar proteins from a pre-computed corpus using cosine similarity.
+
+**Prerequisites:**
+
+1. A trained PyTorch CNN (`.pt` file) — produced by `train_multiple_models.py` and set as `model_file` in `config.yml`. For the benchmarking model, go to the Releases in this repository and download from the latest release.
+2. A pre-computed corpus embedding pickle — produced by running `measure_similarity_v2.py` at least once, set as `embed_file` in `config.yml`. For the benchmarking embeddings, go to the Releases in this repository and download from the latest release.
+
+**Add the following to `scripts/v2/config.yml`** if not already present:
+```yaml
+model_file: /path/to/proteogram_resnet18_finetuned_lr0.001_bs8_e29_85.5acc.pt
+embed_file: /path/to/proteogram_embeddings_scope2.08-nr60_20-200.pkl
+top_k: 5
+proteograms_for_sim_dir: /path/to/corpus/proteogram/images  # optional: parent or root dir containing corpus .jpg files (searched recursively)
+```
+
+> **Note:** `proteograms_for_sim_dir` is optional (allows the retrieval of the actual images themselves to built a composite image with query and targets). Set it to any directory that contains (or recursively contains) the corpus proteogram `.jpg` files. Without it, the side-by-side result image will show only the query proteogram, since the matching corpus images cannot be located on disk.
+
+
+**Run from the `scripts/v2/` folder (Note, this may take a very long time depending upon the size of the protein which will, if large, make the MD simulation very compute intensive):**
+```bash
+cd scripts/v2
+python query_similar_proteins.py \
+  --pdb_file /path/to/myprotein.pdb \
+  --chain_id A \
+  --output_dir /path/to/results \
+  --top_k 5
+```
+
+Arguments:
+- `--pdb_file / -p`: Path to the query PDB file (required)
+- `--chain_id / -c`: Chain ID to extract, e.g. `A` (required)
+- `--output_dir / -o`: Directory to save the query proteogram JPG and result images (default: current directory)
+- `--top_k / -k`: Number of top results to return (default: `top_k` from `config.yml`)
+
+**Output:**
+- The query proteogram saved as `<pdb_basename>.jpg` in `--output_dir`
+- A ranked list of top-K similar proteins with cosine similarity scores printed to the console
+- A side-by-side result image saved to `<output_dir>/search_results/`
+
+
+### v2 End-to-End Pipeline
 
 All commands below are run from the `scripts/v2/` directory:
 ```bash
@@ -345,43 +387,6 @@ Key optional flags:
 
 Outputs Precision@K, MAP@K, and Recall@K for each method (Proteogram, GTalign, USalign and optionally Foldseek) at the structure class and fold levels.
 
-### Find similar proteins to a single domain
-
-`query_similar_proteins.py` takes a single PDB file, builds its v2 proteogram (running the full MD simulation pipeline), embeds it with the trained model, and returns the top-K most similar proteins from a pre-computed corpus using cosine similarity.
-
-**Prerequisites:**
-
-1. A trained PyTorch CNN (`.pt` file) — produced by `train_multiple_models.py` and set as `model_file` in `config.yml`. For the benchmarking model, go to the Releases in this repository and download from the latest release.
-2. A pre-computed corpus embedding pickle — produced by running `measure_similarity_v2.py` at least once, set as `embed_file` in `config.yml`. For the benchmarking embeddings, go to the Releases in this repository and download from the latest release.
-
-**Add the following to `scripts/v2/config.yml`** if not already present:
-```yaml
-model_file: /path/to/proteogram_resnet18_finetuned_lr0.001_bs8_e29_85.5acc.pt
-embed_file: /path/to/proteogram_embeddings_scope2.08-nr60_20-200.pkl
-top_k: 5
-```
-
-**Run from the `scripts/v2/` folder (Note, this may take a very long time depending upon the size of the protein which will, if large, make the MD simulation very compute intensive):**
-```bash
-cd scripts/v2
-python query_similar_proteins.py \
-  --pdb_file /path/to/myprotein.pdb \
-  --chain_id A \
-  --output_dir /path/to/results \
-  --top_k 5
-```
-
-Arguments:
-- `--pdb_file / -p`: Path to the query PDB file (required)
-- `--chain_id / -c`: Chain ID to extract, e.g. `A` (required)
-- `--output_dir / -o`: Directory to save the query proteogram JPG and result images (default: current directory)
-- `--top_k / -k`: Number of top results to return (default: `top_k` from `config.yml`)
-
-**Output:**
-- The query proteogram saved as `<pdb_basename>.jpg` in `--output_dir`
-- A ranked list of top-K similar proteins with cosine similarity scores printed to the console
-- A side-by-side result image saved to `<output_dir>/search_results/`
-
 ### Running an MD simulation (without creating a Proteogram)
 
 The `NonBondedForceModel` module provides a complete pipeline for running molecular dynamics simulations by themselves and calculating residue-residue interaction energies (Van der Waals and electrostatics). Here's an example:
@@ -434,7 +439,7 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 | Script | Purpose | Config Variables (`config.yml`) | Command-Line Arguments |
 |--------|---------|--------------------------------|------------------------|
 | `v2/create_v2_proteograms.py` | Create proteograms using MD-based nonbonded energy calculations, distances, and hydrophobicity deltas | `limit_file`, `scope_structures_dir`, `all_proteograms_dir` | `--max_workers/-w`, `--overwrite`, `--verbose`, `--debug`, `--memory-efficient`, `--save_simulated_pdb` |
-| `v2/query_similar_proteins.py` | Create a proteogram for a single query PDB and find the top-K most similar proteins from a pre-computed corpus | `top_k`, `model_file`, `embed_file` | `--pdb_file/-p`, `--chain_id/-c`, `--output_dir/-o`, `--top_k/-k` |
+| `v2/query_similar_proteins.py` | Create a proteogram for a single query PDB and find the top-K most similar proteins from a pre-computed corpus | `top_k`, `model_file`, `embed_file`, `proteograms_for_sim_dir` (optional — parent or root directory containing corpus `.jpg` files, searched recursively, needed for result image) | `--pdb_file/-p`, `--chain_id/-c`, `--output_dir/-o`, `--top_k/-k` |
 | `v2/measure_similarity_v2.py` | Batch similarity search across all proteograms | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | `--exclude_classes/-x`, `--overwrite`, `--embed/--no-embed` |
 | `v2/train_multiple_models.py` | Train a from-scratch ConvNet or fine-tune ResNet18 for proteogram classification, with early stopping and per-class evaluation | `training_data_dir`, `num_epochs`, `learning_rate`, `batch_size`, `scope_level`, `model_file_prefix` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
 | `v2/evaluate_methods_v2.py` | Evaluate proteogram approach vs GTalign, USalign, and Foldseek | `top_k`, `scope_eval_set`, `proteogram_sim_results`, `gtalign_results_dir`, `usalign_results`, `foldseek_results` (optional), `search_images_dir`, `save_bad_searches_dir`, `save_good_searches_dir`, `scope_cla_file`, `scope_des_file`, `scope_hie_file` | `--overwrite`, `--exclude_classes/-x` |

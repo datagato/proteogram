@@ -10,6 +10,11 @@ Prerequisites:
 
 Usage example:
     python query_similar_proteins.py --pdb_file /path/to/protein.pdb --chain_id A
+
+Note:
+  - May need to choose a different version of PyTorch with the proper CUDA support if you encounter CUDA errors.
+    - Try: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+  - The output image will show the query proteogram and the top-K similar proteograms side by side, with cosine similarity scores annotated.
 """
 import argparse
 import gc
@@ -21,6 +26,7 @@ import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import torch
+torch.backends.cudnn.enabled = False
 import torch.nn as nn
 import torchvision.transforms as transforms
 from Bio.PDB.PDBParser import PDBConstructionWarning
@@ -69,14 +75,22 @@ if __name__ == '__main__':
 
     config = read_yaml('config.yml')
     top_k      = args.top_k or config['top_k']
-    model_file = config['model_file']
-    embed_file = config['embed_file']
+    model_file = os.path.expanduser(config['model_file'])
+    embed_file = os.path.expanduser(config['embed_file'])
     corpus_dir = config.get('proteograms_for_sim_dir')
+    if corpus_dir:
+        corpus_dir = os.path.expanduser(corpus_dir)
 
+    args.output_dir = os.path.expanduser(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
     # --- Step 1: Create the proteogram from the query PDB ---
-    use_gpu = torch.cuda.is_available()
+    try:
+        from openmm import Platform
+        _openmm_platforms = [Platform.getPlatform(i).getName() for i in range(Platform.getNumPlatforms())]
+        use_gpu = 'CUDA' in _openmm_platforms
+    except Exception:
+        use_gpu = False
     print(f'Creating proteogram for {args.pdb_file} (chain {args.chain_id})...')
 
     proteogram = ProteogramV2(
@@ -107,6 +121,8 @@ if __name__ == '__main__':
     plt.close('all')
     del proteogram, final_data
     gc.collect()
+    if not os.path.isfile(query_jpg):
+        raise RuntimeError(f'Failed to save query proteogram — file not found after imsave: {query_jpg}')
     print(f'Saved query proteogram to {query_jpg}')
 
     # --- Step 2: Load corpus embeddings and embed the query image ---
@@ -134,11 +150,21 @@ if __name__ == '__main__':
     scores = []
     with torch.no_grad():
         for path, emb in corpus.items():
-            sim = cosine(query_vec, emb)[0].item()
+            sim = cosine(query_vec, emb.to(query_vec.device))[0].item()
             scores.append((path, sim))
 
     scores.sort(key=lambda x: x[1], reverse=True)
-    top_results = scores[:top_k]
+
+    # Exclude the query protein itself if it appears in the corpus.
+    query_basename = os.path.basename(query_jpg)
+    scores_filtered = [(p, s) for p, s in scores
+                       if os.path.basename(p) != query_basename]
+    top_results = scores_filtered[:top_k]
+
+    if corpus_dir is None:
+        print('Warning: proteograms_for_sim_dir not set in config.yml — '
+              'result images will not be shown. Set it to the directory '
+              'containing the corpus proteogram JPG files.')
 
     # --- Step 4: Print results and save result image ---
     print(f'\nTop {top_k} similar proteins:')
@@ -147,5 +173,6 @@ if __name__ == '__main__':
 
     result_img_dir = os.path.join(args.output_dir, 'search_results')
     os.makedirs(result_img_dir, exist_ok=True)
-    img_sim.save_images(query_jpg, result_img_dir, scores_n_arr=top_results, corpus_dir=corpus_dir)
+    img_sim.save_images(query_jpg, result_img_dir, scores_n_arr=top_results, corpus_dir=corpus_dir,
+                        pad_fn=pad_to_size)
     print(f'\nResult image saved to {result_img_dir}/')
