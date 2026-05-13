@@ -49,6 +49,25 @@ if __name__ == '__main__':
     parser.add_argument('--embed', action=argparse.BooleanOptionalAction, default=True,
                         help='Recompute and save embeddings (default: True). '
                              'Use --no-embed to load from embed_file instead.')
+    # ── FAISS options ────────────────────────────────────────────────────────
+    parser.add_argument('--faiss', action='store_true',
+                        help=(
+                            'Use FAISS ANN index for similarity search instead of '
+                            'brute-force cosine similarity.  Much faster for large '
+                            'corpora (> 10 K proteins).  Requires faiss-cpu or '
+                            'faiss-gpu to be installed.'
+                        ))
+    parser.add_argument('--faiss_pq', action='store_true',
+                        help=(
+                            'Use IVF-PQ compressed FAISS index (recommended for '
+                            '> 100 K proteins).  Slightly lower recall but 4-32x '
+                            'lower memory than IVFFlat.'
+                        ))
+    parser.add_argument('--faiss_index_file', type=str, default=None,
+                        help=(
+                            'Path to save / load the FAISS index.  Defaults to '
+                            'embed_file with a .faiss extension.'
+                        ))
     args = parser.parse_args()
 
     # Run embedding vs loading saved embeddings
@@ -143,9 +162,28 @@ if __name__ == '__main__':
         # Image saving is done separately at top_k to avoid PIL's 65500px dimension limit.
         start = time()
         n_results = len(prot_files)  # all including self-hit
-        sim_time = img_sim.similarities(n=n_results,
-                                        save_result_images_dir=None,
-                                        pad_fn=pad_to_size)
+
+        if args.faiss:
+            # ── FAISS ANN search ─────────────────────────────────────────────
+            faiss_index_file = (
+                args.faiss_index_file
+                or embed_file.replace('.pkl', '.faiss')
+            )
+            if os.path.exists(faiss_index_file) and not args.overwrite:
+                print(f'Loading existing FAISS index from {faiss_index_file}')
+                img_sim.load_faiss_index(faiss_index_file)
+            else:
+                print(f'Building FAISS index (use_pq={args.faiss_pq}) ...')
+                img_sim.build_faiss_index(use_pq=args.faiss_pq)
+                img_sim.save_faiss_index(faiss_index_file)
+            sim_time = img_sim.similarities_faiss(n=n_results,
+                                                   save_result_images_dir=None,
+                                                   pad_fn=pad_to_size)
+        else:
+            # ── Brute-force cosine search (original) ─────────────────────────
+            sim_time = img_sim.similarities(n=n_results,
+                                            save_result_images_dir=None,
+                                            pad_fn=pad_to_size)
 
         # Save top-k result images with padding
         full_sim_dict = {k: list(v) for k, v in img_sim.sim_dict.items()}

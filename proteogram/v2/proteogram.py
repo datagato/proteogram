@@ -12,6 +12,7 @@ from Bio.PDB.Polypeptide import PPBuilder
 
 from ..common.constants import HYDROPHOBICITY_LIST, RESIDUE_LIST, MODIFIED_RESIDUES_TO_STANDARD
 from .nonbonded_forces import NonBondedForceModel
+from .normalisation import normalise_channel
 
 
 # Ignore PDB construction warnings
@@ -102,7 +103,8 @@ class ProteogramV2:
                              return_simulated_pdb: bool = False,
                              debug: bool = False,
                              subtract_solvent_energies: bool = True,
-                             memory_efficient: bool = False):
+                             memory_efficient: bool = False,
+                             norm_stats: dict = None):
         """Calculate the proteogram maps.
 
         Computes distance, hydrophobicity, Van der Waals, and electrostatic maps
@@ -114,9 +116,15 @@ class ProteogramV2:
                 Defaults to False.
             debug (bool): If True, print debug information during calculations.
                 Defaults to False.
-            subtract_solvent_energies (bool): If True, subtract solvent-only 
-                energies from the protein+solvent energies to isolate the protein 
+            subtract_solvent_energies (bool): If True, subtract solvent-only
+                energies from the protein+solvent energies to isolate the protein
                 contributions. Defaults to False.
+            norm_stats (dict | None): Optional dict loaded from ``norm_stats.json``
+                (via :func:`~proteogram.v2.normalisation.load_norm_stats`).
+                When supplied, corpus-level percentile bounds are used to
+                normalise every channel so that inter-protein energy scale is
+                preserved in pixel values.  When ``None`` (default), the
+                original per-protein min-max normalisation is applied.
 
         Returns:
             tuple: A tuple containing:
@@ -167,14 +175,17 @@ class ProteogramV2:
 
         # Hydrophobicity map depends on the MD-derived distance matrix
         hydro_map = self.calc_hydrophobicity_map(self.sequence, disto_map)
-        
-        # Normalize all maps to [0-255]
-        norm_disto_map, disto_err = self.normalize_map(disto_map)
-        norm_hydro_map, hydro_err = self.normalize_map(hydro_map)
-        norm_vdw_att_map, vdw_att_err = self.normalize_map(vdw_e_att)
-        norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep)
-        norm_es_att_map, es_att_err = self.normalize_map(es_e_att)
-        norm_es_rep_map, es_rep_err = self.normalize_map(es_e_rep)
+
+        # Normalise all maps to [0-255].
+        # When norm_stats is provided, corpus-level percentile bounds are used
+        # (preserving inter-protein energy scale).  Otherwise the original
+        # per-protein min-max is applied via normalise_channel's fallback.
+        norm_disto_map,   disto_err   = normalise_channel(disto_map,  'distance',      norm_stats)
+        norm_hydro_map,   hydro_err   = normalise_channel(hydro_map,  'hydrophobicity', norm_stats)
+        norm_vdw_att_map, vdw_att_err = normalise_channel(vdw_e_att, 'vdw_attractive', norm_stats)
+        norm_vdw_rep_map, vdw_rep_err = normalise_channel(vdw_e_rep, 'vdw_repulsive',  norm_stats)
+        norm_es_att_map,  es_att_err  = normalise_channel(es_e_att,  'es_attractive',  norm_stats)
+        norm_es_rep_map,  es_rep_err  = normalise_channel(es_e_rep,  'es_repulsive',   norm_stats)
         
         # Clear the original energy maps to save memory
         del disto_map, hydro_map, vdw_e_att, vdw_e_rep, es_e_att, es_e_rep

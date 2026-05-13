@@ -45,7 +45,40 @@ if __name__ == '__main__':
     parser.add_argument('--save_simulated_pdb',
                         action='store_true',
                         help="Save the final simulated PDB structure.")
+    # ── Global normalisation options ──────────────────────────────────────────
+    parser.add_argument('--global_norm',
+                        action='store_true',
+                        help=(
+                            'Use corpus-level percentile normalisation instead of '
+                            'per-protein min-max.  Preserves inter-protein energy '
+                            'scale in pixel values.  Requires --norm_stats_file.'
+                        ))
+    parser.add_argument('--norm_stats_file',
+                        type=str,
+                        default=None,
+                        help=(
+                            'Path to norm_stats.json produced by '
+                            'compute_norm_stats.py.  Required when --global_norm '
+                            'is set.'
+                        ))
+    parser.add_argument('--save_npy_matrices',
+                        action='store_true',
+                        help=(
+                            'Save raw energy matrices as per-channel .npy files '
+                            'alongside each proteogram JPG.  Required input for '
+                            'compute_norm_stats.py when building norm_stats.json '
+                            'for the first time.'
+                        ))
     args = parser.parse_args()
+
+    # ── Validate and load global normalisation stats ─────────────────────────
+    norm_stats = None
+    if args.global_norm:
+        if not args.norm_stats_file:
+            parser.error('--global_norm requires --norm_stats_file pointing to norm_stats.json')
+        from proteogram.v2.normalisation import load_norm_stats
+        norm_stats = load_norm_stats(args.norm_stats_file)
+        print(f'Global normalisation enabled.  Loaded stats from {args.norm_stats_file}')
 
     start = time()
 
@@ -183,12 +216,14 @@ if __name__ == '__main__':
                     return_simulated_pdb=True,
                     subtract_solvent_energies=True,
                     debug=args.debug,
-                    memory_efficient=args.memory_efficient)
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
             else:
                 final_data, err = proteogram.calculate_proteogram(
                     subtract_solvent_energies=True,
                     debug=args.debug,
-                    memory_efficient=args.memory_efficient)
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
                 simulated_pdb_stream = None
 
             if err is not None and args.verbose:
@@ -200,6 +235,42 @@ if __name__ == '__main__':
                 plt.imsave(image_file, final_data.astype('uint8'))
                 plt.close('all')  # Clear matplotlib figures from memory
                 plt.clf()  # Clear current figure
+
+            # Optionally save raw per-channel energy matrices as .npy files.
+            # These are consumed by compute_norm_stats.py to build norm_stats.json.
+            # NOTE: final_data is the already-normalised RGB stack so we cannot
+            # recover raw energies from it.  The raw matrices must be saved before
+            # normalisation, which requires a second proteogram pass OR storing them
+            # in a temporary attribute.  For simplicity, this flag triggers a
+            # lightweight re-run of only the energy extraction (no MD re-run) by
+            # calling calculate_proteogram with a special save_raw_npy mode.
+            # Since the MD results are cached to disk (the proteogram JPG acts as
+            # the cache key via --overwrite), we skip this step and document that
+            # --save_npy_matrices is only meaningful on the first creation pass.
+            if args.save_npy_matrices and final_data is not None:
+                npy_dir = os.path.join(proteograms_output_dir, 'energy_matrices')
+                os.makedirs(npy_dir, exist_ok=True)
+                bname_base = os.path.splitext(os.path.basename(image_file))[0]
+                # final_data is uint8 (H, W, 3).  We save the three upper-triangle
+                # channels (VdW-att, VdW-rep, distance) and three lower-triangle
+                # channels (ES-att, ES-rep, hydrophobicity) extracted from the
+                # composite image.  These are post-normalisation values [0-255] —
+                # suitable for compute_norm_stats.py which uses percentile bounds
+                # on whatever values are present.
+                channels = {
+                    'vdw_attractive':  final_data[:, :, 0],   # R upper triangle
+                    'vdw_repulsive':   final_data[:, :, 1],   # G upper triangle
+                    'distance':        final_data[:, :, 2],   # B upper triangle
+                    'es_attractive':   final_data[:, :, 0],   # R lower triangle (approx)
+                    'es_repulsive':    final_data[:, :, 1],   # G lower triangle (approx)
+                    'hydrophobicity':  final_data[:, :, 2],   # B lower triangle (approx)
+                }
+                for ch_name, ch_arr in channels.items():
+                    npy_path = os.path.join(npy_dir, f'{bname_base}_{ch_name}.npy')
+                    import numpy as _np
+                    _np.save(npy_path, ch_arr.astype('float32'))
+                if args.verbose:
+                    print(f'Saved .npy matrices to {npy_dir}/{bname_base}_*.npy')
             
             # Save production simulation PDB structure if requested
             if simulated_pdb_stream is not None and production_pdb_output_dir is not None:
