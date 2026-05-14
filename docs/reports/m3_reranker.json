@@ -1,0 +1,50 @@
+{
+  "milestone": "M3",
+  "config": {
+    "synthetic": true,
+    "data_npz": null,
+    "pair_tsv": null,
+    "epochs": 4,
+    "batch": 16,
+    "lr": 0.001,
+    "n_pairs": 1500,
+    "report": "docs/reports/m3_reranker.json",
+    "checkpoint": "docs/reports/m3_reranker.pt",
+    "seed": 0
+  },
+  "history": {
+    "epoch": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "train_mse": [
+      0.056314819370922836,
+      0.02863676150805974,
+      0.0190231531428603,
+      0.013279032236257923
+    ],
+    "val_mse": [
+      0.03486641338188513,
+      0.04511944904773929,
+      0.02210545323066488,
+      0.036177755149710535
+    ],
+    "val_pair_auc": [
+      0.9874957177115451,
+      0.9948612538540595,
+      1.0,
+      1.0
+    ]
+  },
+  "final": {
+    "train_mse": 0.013279032236257923,
+    "val_mse": 0.036177755149710535,
+    "val_pair_auc": 1.0
+  },
+  "n_train_pairs": 1196,
+  "n_val_pairs": 299,
+  "elapsed_sec": 2.5021917819976807,
+  "device": "cpu"
+}
