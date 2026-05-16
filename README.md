@@ -138,9 +138,12 @@ cp scripts/v2/config.example.yml scripts/v2/config.yml
 
 All scripts read from `scripts/v2/config.yml`. The keys used at each pipeline step are listed below alongside the relevant step. A full reference is in `scripts/v2/config.example.yml`.
 
-### Single protein inference
+### Single protein inference demo
 
-`query_similar_proteins.py` takes a single PDB file, builds its v2 proteogram (running the full MD simulation pipeline), embeds it with the trained model, and returns the top-K most similar proteins from a pre-computed corpus using cosine similarity.
+`query_similar_proteins.py`, a demo of the project inference workflow, takes a single PDB file, builds its v2 proteogram (running the full MD simulation pipeline and saving refined structure), embeds it with the trained model, and returns the top-K most similar proteins from a pre-computed corpus using cosine similarity. 
+
+> [!NOTE]
+> The provided embeddings are a small demo corpus, not a comprehensive PDB dataset. This script demonstrates the retrieval workflow only — results will not reflect full PDB coverage.
 
 **Prerequisites:**
 
@@ -149,8 +152,8 @@ All scripts read from `scripts/v2/config.yml`. The keys used at each pipeline st
 
 **Add the following to `scripts/v2/config.yml`** if not already present:
 ```yaml
-model_file: /path/to/proteogram_resnet18_finetuned_lr0.001_bs8_e29_85.5acc.pt
-embed_file: /path/to/proteogram_embeddings_scope2.08-nr60_20-200.pkl
+model_file: /path/to/proteogram_demo_resnet18_finetuned_lr0.001_bs8_e29_85.5acc.pt
+embed_file: /path/to/proteogram_demo_embeddings_scope2.08-nr60_20-200.pkl
 top_k: 5
 proteograms_for_sim_dir: /path/to/corpus/proteogram/images  # optional: parent or root dir containing corpus .jpg files (searched recursively)
 ```
@@ -180,7 +183,9 @@ Arguments:
 - A side-by-side result image saved to `<output_dir>/search_results/`
 
 
-### v2 End-to-End Pipeline
+### v2 End-to-End Train and Eval Pipeline
+
+This workflow is meant to provide instruction on creating a database of Proteograms, training an Img2Vec model, create a corpus of Proteogram embeddings, and evaluating the Proteogram approach against other popular structure search tools.
 
 All commands below are run from the `scripts/v2/` directory:
 ```bash
@@ -210,6 +215,8 @@ Key optional flags:
 - `--memory-efficient`: Lower peak RAM at the cost of speed (for proteins > ~150 residues on constrained hardware)
 
 > Proteogram creation runs the full MD simulation pipeline (energy minimization + equilibration + 1 ns production). Expect ~5 min per protein for small domains (~50 residues) and ~1 hour for larger ones (~200 residues) on a GPU. Run multiple instances in parallel with `--limit_file` splits to speed this up.
+
+This step may be used to create a single Proteogram as well for inference (including an option to save the refined structure file from the MD simulation).
 
 ---
 
