@@ -467,7 +467,7 @@ class NonBondedForceModel:
         )
         
         if add_barostat:
-            barostat = MonteCarloBarostat(self.pressure, self.temperature)
+            barostat = MonteCarloBarostat(self.pressure, self.temperature, 100)
             system.addForce(barostat)  # FIX: Use new 'system' not 'self.system'
 
         if add_calpha_restraint:
@@ -506,17 +506,19 @@ class NonBondedForceModel:
         )
         
         platform = self._get_platform()
-        
+        platform_properties = {'CudaPrecision': 'mixed'} if platform.getName() == 'CUDA' else {}
+
         # Clean up old simulation to free memory (especially CUDA)
         self.cleanup_all_resources(final_run=False)
-        
+
         # Don't store system here - Simulation manages its own system lifetime
         # Create fresh system for this simulation
         self.simulation = Simulation(
             self.topology,
             system,
             integrator,
-            platform
+            platform,
+            platform_properties
         )
         
         # Restore periodic box vectors from previous Context if available
@@ -1125,10 +1127,10 @@ class NonBondedForceModel:
             report_interval (int): Interval for reporting state data.
         """
         print(f"Running NPT equilibration for {steps} steps...")
-        
+
         # Store positions before NPT as backup
         self._pre_npt_positions = self.positions
-        
+
         # Create simulation with barostat
         self._create_new_simulation(
             add_calpha_restraint=True,
@@ -1150,7 +1152,7 @@ class NonBondedForceModel:
                 separator='\t'
             )
         )
-        
+
         # Get initial energy for monitoring
         n_atoms = self._get_n_atoms()
         initial_state = self.simulation.context.getState(getEnergy=True)
@@ -1158,8 +1160,8 @@ class NonBondedForceModel:
         del initial_state  # CRITICAL: Delete state to avoid holding Context reference
         print(f"  Initial potential energy: {initial_energy:.1f} kJ/mol "
             f"({initial_energy/n_atoms:.2f} kJ/mol/atom)")
-        
-        # Track energies for validation
+
+        # Track energies for validation — seed with None so the first chunk is not
         energy_history = [initial_energy]
         check_interval = max(steps // 5, report_interval)  # Check 5 times during equilibration
         
@@ -1198,10 +1200,11 @@ class NonBondedForceModel:
                 time_ps = steps_run * timestep_ps
                 self._log_energy('npt', time_ps, current_energy)
             
-            # Validate energy
+            # Validate energy — skip comparing chunk 1 against pre-velocity initial
+            # energy since that jump is expected when velocities are assigned at 310K.
             warnings_list = self._validate_energy(
-                current_energy, 'NPT', 
-                prev_energy=energy_history[-2] if len(energy_history) > 1 else None,
+                current_energy, 'NPT',
+                prev_energy=energy_history[-2] if len(energy_history) > 2 else None,
                 n_atoms=n_atoms
             )
             for w in warnings_list:
@@ -1243,7 +1246,6 @@ class NonBondedForceModel:
                 raise RuntimeError("NPT equilibration corrupted positions and no backup available")
             
         self.cleanup_all_resources(final_run=False)
-
         print("NPT equilibration complete.")
 
     def equilibrate_nvt(

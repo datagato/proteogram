@@ -497,9 +497,36 @@ class Img2Vec:
             scores = ['']
             scores.extend([f'{score:.2f}' for _, score in scores_n_arr])
         if corpus_dir:
-            result_paths = [os.path.join(corpus_dir, os.path.basename(k)) for k in result_keys]
+            # Build a recursive filename→path index so subdirectory layouts are found.
+            corpus_index = {
+                os.path.basename(p): p
+                for p in glob.glob(os.path.join(corpus_dir, '**', '*.jpg'), recursive=True)
+            }
+            corpus_index.update({
+                os.path.basename(p): p
+                for p in glob.glob(os.path.join(corpus_dir, '**', '*.png'), recursive=True)
+            })
+            result_paths = [
+                corpus_index.get(os.path.basename(k), os.path.join(corpus_dir, os.path.basename(k)))
+                for k in result_keys
+            ]
         else:
             result_paths = result_keys
+
+        # Filter to files that actually exist; warn about missing ones
+        available = [(p, s) for p, s in zip(result_paths, scores[1:]) if os.path.isfile(p)]
+        missing = [p for p in result_paths if not os.path.isfile(p)]
+        if missing:
+            print(f'Warning: {len(missing)} result image(s) not found on disk and will be skipped.')
+            print(f'  Set proteograms_for_sim_dir in config.yml to the local corpus image directory.')
+        result_paths = [p for p, _ in available]
+        scores = [''] + [s for _, s in available]
+
+        if not os.path.isfile(query_file):
+            raise FileNotFoundError(
+                f'Query proteogram image not found: {query_file}\n'
+                f'Ensure the proteogram was saved successfully before calling save_images.')
+
         images_files = [query_file] + result_paths
         images = [pad_fn(Image.open(t)) if pad_fn else Image.open(t) for t in images_files]
 
