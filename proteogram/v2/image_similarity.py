@@ -798,3 +798,78 @@ class Img2Vec:
             f"  (cos_sim={cos_sim:.4f})"
         )
         return heatmap
+
+    def gradcam_decomposed_similarity(
+        self,
+        query_image_path: str,
+        target_image_path: str,
+        output_dir: str,
+        query_sequence: str = None,
+        save_npy: bool = True,
+    ) -> np.ndarray:
+        """Compute and save an energy-decomposed Grad-CAM attribution map.
+
+        Runs both the standard Grad-CAM (spatial importance) and the
+        per-channel Gradient × Input attribution (which physical force drives
+        similarity) and saves a combined 5-panel figure.
+
+        Channel semantics for proteogram v2:
+            Channel 0 (R): VdW attractive / electrostatic attractive
+            Channel 1 (G): VdW repulsive  / electrostatic repulsive
+            Channel 2 (B): Cα distance    / hydrophobicity Δ
+
+        Args:
+            query_image_path:  Path to the query proteogram JPG.
+            target_image_path: Path to the target proteogram JPG.
+            output_dir:        Directory to save the PNG figure and optional
+                               ``.npy`` arrays.
+            query_sequence:    Optional 1-letter amino acid sequence of the
+                               query protein.  Adds residue tick labels.
+            save_npy:          Also save raw arrays as ``.npy`` files.
+
+        Returns:
+            Float32 numpy array of shape ``(3, H, W)``, per-channel attributions
+            in ``[0, 1]``.
+        """
+        from .gradcam import GradCAM, _preprocess_image
+        from PIL import Image as _Image
+
+        gcam = GradCAM(embed_net=self.embed, device=str(self.device))
+
+        q_tensor = _preprocess_image(query_image_path)
+        t_tensor = _preprocess_image(target_image_path)
+
+        # Combined Grad-CAM heatmap
+        combined, cos_sim = gcam.compute_from_paths(
+            query_image_path, target_image_path
+        )
+
+        # Per-channel energy decomposition
+        attributions, _ = gcam.compute_decomposed(q_tensor, t_tensor)
+
+        query_name  = os.path.splitext(os.path.basename(query_image_path))[0]
+        target_name = os.path.splitext(os.path.basename(target_image_path))[0]
+        query_img   = np.array(_Image.open(query_image_path).convert("RGB"))
+
+        gcam.save_decomposed_figure(
+            attributions=attributions,
+            combined_heatmap=combined,
+            query_img=query_img,
+            cos_sim=cos_sim,
+            query_name=query_name,
+            target_name=target_name,
+            output_dir=output_dir,
+            query_sequence=query_sequence,
+        )
+
+        if save_npy:
+            gcam.save_decomposed_npy(attributions, query_name, target_name,
+                                     output_dir)
+            gcam.save_npy(combined, query_name, target_name, output_dir)
+
+        print(
+            f"Decomposed Grad-CAM saved → "
+            f"{output_dir}/{query_name}_vs_{target_name}_gradcam_decomposed.png"
+            f"  (cos_sim={cos_sim:.4f})"
+        )
+        return attributions

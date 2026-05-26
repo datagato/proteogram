@@ -291,8 +291,13 @@ if __name__ == '__main__':
         for line in fin:
             try:
                 spl_line = line.split()
+                if not spl_line:
+                    continue
                 # Get a specific domain by its SCOP identifier (sid) found in scope_label_file
                 scop_entry = scop.getDomainBySid(spl_line[0].replace('.ent',''))
+                if scop_entry is None:
+                    # ID not present in SCOP tables loaded for this run
+                    continue
                 # Parse out info for our dataframe
                 sccs = scop_entry.sccs
                 sccs_spl = sccs.split('.')
@@ -375,7 +380,16 @@ if __name__ == '__main__':
         # fold and class SCOPe levels
         k = 0
         for target in proteogram_res_df.iloc[i,1:]:
-            target_file  = os.path.basename(target.split(',')[0])
+            # Skip NaN / empty cells (pandas may parse missing hits as float NaN)
+            if pd.isna(target):
+                continue
+            target_str = str(target).strip()
+            if not target_str:
+                continue
+
+            target_file  = os.path.basename(target_str.split(',')[0])
+            if not target_file:
+                continue
             if target_file == prot_file:  # skip self-hit
                 continue
             target_fam   = lookup(label_df, 'proteogram_file', target_file, 'family')

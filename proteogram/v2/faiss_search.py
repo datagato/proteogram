@@ -216,7 +216,7 @@ class FaissIndex:
                 if j < 0:               # FAISS pads with -1 when fewer results exist
                     continue
                 hits.append((self.keys[j], float(scores_mat[i, rank])))
-                if len(hits) > top_k:
+                if len(hits) >= top_k:
                     break
             sim_dict[key] = hits
         return sim_dict

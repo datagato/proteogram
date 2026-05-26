@@ -127,6 +127,14 @@ if __name__ == '__main__':
                       if os.path.splitext(os.path.basename(f))[0] not in excluded_sids]
         print(f'Excluded {before - len(prot_files)} proteograms from class(es): '
               + ', '.join(sorted(excluded)))
+
+    if not prot_files:
+        raise ValueError(
+            'No proteogram .jpg files found for similarity search. '\
+            f'Checked dataset_dir={dataset_dir!r}. '\
+            'If you are running from scripts/v2/, ensure config paths are correct '\
+            'relative to that working directory.'
+        )
         
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
@@ -147,6 +155,11 @@ if __name__ == '__main__':
     with torch.no_grad():
         if embed:
            img_sim.embed_dataset()
+           if not img_sim.dataset:
+               raise ValueError(
+                   'Embedding dataset is empty after embed_dataset(). '\
+                   'Verify input proteogram files are readable and preprocessing succeeded.'
+               )
            # Save embeddings
            with open(embed_file, 'wb') as pklout:
                pickle.dump(img_sim.dataset, pklout)
@@ -155,6 +168,11 @@ if __name__ == '__main__':
             if embed_file:
                 with open(embed_file, 'rb') as pklin:
                     img_sim.dataset = pickle.load(pklin)
+            if not img_sim.dataset:
+                raise ValueError(
+                    'Loaded embedding dataset is empty. '\
+                    f'Check embed_file={embed_file!r} or rerun with --embed.'
+                )
             
         # Search to find similar images using cosine-similarity amongst embeddings.
         # Save all corpus results (including self-hit) so Recall@K can be computed at
@@ -165,10 +183,11 @@ if __name__ == '__main__':
 
         if args.faiss:
             # ── FAISS ANN search ─────────────────────────────────────────────
-            faiss_index_file = (
-                args.faiss_index_file
-                or embed_file.replace('.pkl', '.faiss')
-            )
+            if args.faiss_index_file:
+                faiss_index_file = args.faiss_index_file
+            else:
+                base, _ = os.path.splitext(embed_file)
+                faiss_index_file = base + '.faiss'
             if os.path.exists(faiss_index_file) and not args.overwrite:
                 print(f'Loading existing FAISS index from {faiss_index_file}')
                 img_sim.load_faiss_index(faiss_index_file)
@@ -204,7 +223,8 @@ if __name__ == '__main__':
         for i, image_path in enumerate(prot_files):
             try:
                 scores = img_sim.sim_dict[os.path.basename(image_path)]
-                df_res.iloc[i, :n_results] = [f'{a},{b}' for (a, b) in scores]
+                row_vals = [f'{a},{b}' for (a, b) in scores[:n_results]]
+                df_res.iloc[i, :len(row_vals)] = row_vals
             except KeyError as e:
                 print(f'Key error for {e}')
         # Reorder cols

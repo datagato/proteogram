@@ -12,8 +12,8 @@ dependencies = [
   "pandas>=3.0",
   "pdbfixer @ git+https://github.com/openmm/pdbfixer@94cfa4c",
   "pillow>=12.1",
-  "torch>=2.2",
-  "torchvision>=0.17",
+  "torch==2.4.1",
+  "torchvision==0.19.1",
   "torchsummary>=1.5",
   "kmeans-pytorch>=0.3",
   "tqdm>=4.67",
@@ -21,6 +21,7 @@ dependencies = [
   "objgraph>=3.6.2",
   "PyYAML>=6.0",
   "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main",
+  "faiss-cpu>=1.13.2",
 ]
 
 [project.optional-dependencies]

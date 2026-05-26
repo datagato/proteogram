@@ -265,6 +265,108 @@ def build_resnet18(num_classes, freeze_layers=('layer1',)):
     return model
 
 
+def scop_triplet_loss(embeddings, fold_labels, class_labels, margin=0.3):
+    """Cosine-space triplet loss with SCOP-hierarchy pair selection.
+
+    Positive: hardest same-fold protein (lowest cosine sim to anchor).
+    Negative: hardest same-class, different-fold protein (highest cosine sim).
+    Restricting negatives to the same class forces fold separation rather than
+    just broad class separation.
+    """
+    emb = F.normalize(embeddings, dim=1)
+    sim = emb @ emb.T
+    B = emb.size(0)
+    idx = torch.arange(B, device=emb.device)
+
+    triplet_losses = []
+    for i in range(B):
+        same_fold = (fold_labels == fold_labels[i]) & (idx != i)
+        hard_neg_mask = (class_labels == class_labels[i]) & (fold_labels != fold_labels[i])
+        if same_fold.sum() == 0 or hard_neg_mask.sum() == 0:
+            continue
+        pos_sim = sim[i, same_fold].min()
+        neg_sim = sim[i, hard_neg_mask].max()
+        triplet_losses.append(F.relu(neg_sim - pos_sim + margin))
+
+    if not triplet_losses:
+        return torch.tensor(0.0, device=emb.device)
+    return torch.stack(triplet_losses).mean()
+
+
+class SCOPFoldSampler(torch.utils.data.Sampler):
+    """Guarantee at least 2 proteins from the same fold in every batch.
+
+    Without this, random batching on ~544 proteins / 241 folds produces many
+    batches with no positive pairs, making triplet loss useless.
+    Expects a random_split Subset whose underlying dataset has a `label_names`
+    attribute (standard on ProteogramDataset).
+    """
+    def __init__(self, subset, batch_size):
+        self.batch_size = batch_size
+        dataset = subset.dataset
+        local_fold_names = [dataset.label_names[i] for i in subset.indices]
+        self.fold_to_local = {}
+        for local_i, fname in enumerate(local_fold_names):
+            self.fold_to_local.setdefault(fname, []).append(local_i)
+        self.eligible_folds = [f for f, ids in self.fold_to_local.items() if len(ids) >= 2]
+
+    def __len__(self):
+        return sum(len(v) for v in self.fold_to_local.values() if len(v) >= 2)
+
+    def __iter__(self):
+        folds = self.eligible_folds.copy()
+        random.shuffle(folds)
+        batch = []
+        for fold in folds:
+            pair = random.sample(self.fold_to_local[fold], 2)
+            batch.extend(pair)
+            if len(batch) >= self.batch_size:
+                yield batch[:self.batch_size]
+                batch = []
+        if len(batch) >= 2:
+            yield batch
+
+
+class WithClassLabel(Dataset):
+    """Wraps a random_split Subset to return (image, fold_label, class_label).
+
+    Used for triplet training: the DataLoader yields class labels alongside
+    fold labels so scop_triplet_loss can select within-class negatives.
+    """
+    def __init__(self, subset, class_labels_by_orig_idx):
+        self.subset = subset
+        self.class_labels = class_labels_by_orig_idx
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        orig_idx = self.subset.indices[idx]
+        image, fold_label = self.subset[idx]
+        return image, fold_label, torch.tensor(self.class_labels[orig_idx])
+
+
+class WithProteinId(Dataset):
+    """Wraps a random_split Subset to return (image, label, protein_id).
+
+    Used for ranking-loss training: the DataLoader yields the SCOPe domain ID
+    (filename stem) alongside the image and label so that TM-score ground truth
+    can be looked up per batch.
+    """
+    def __init__(self, subset):
+        self.subset = subset
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        orig_idx = self.subset.indices[idx]
+        image, label = self.subset[idx]
+        filepath = self.subset.dataset.files[orig_idx]
+        protein_id = os.path.splitext(os.path.basename(filepath))[0]
+        return image, label, protein_id
+
+
 def train_model(model, train_loader, val_loader, optimizer, epochs,
                 patience=None, device=torch.device('cpu')):
     """Train the ConvNet, tracking train and val loss each epoch.
@@ -295,11 +397,18 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
             running_loss = 0.0
             n_batches = 0
             with torch.set_grad_enabled(phase == 'train'):
-                for data, target in loaders[phase]:
-                    data, target = data.to(device), target.to(device)
+                for batch in loaders[phase]:
+                    data, target = batch[0].to(device), batch[1].to(device)
+                    # batch[2] may be a tensor (class labels / triplet) or a
+                    # tuple of strings (protein IDs for ranking loss)
+                    if len(batch) == 3:
+                        aux = batch[2]
+                        class_target = aux.to(device) if isinstance(aux, torch.Tensor) else aux
+                    else:
+                        class_target = None
                     optimizer.zero_grad()
                     output = model(data)
-                    loss = loss_criteria(output, target)
+                    loss = loss_criteria(output, target, class_target)
                     if phase == 'train':
                         loss.backward()
                         optimizer.step()
@@ -339,7 +448,11 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
     if patience is not None and best_weights is not None:
         print(f'Restoring best weights (val loss: {best_val_loss:.6f})')
         model.load_state_dict(best_weights)
-    return model, training_loss, val_loss_history, best_epoch + 1
+    # When patience is None, best_epoch is never updated (-1); use actual
+    # epoch count instead so the saved filename reflects real training length.
+    actual_epochs = best_epoch + 1 if (patience is not None and best_epoch >= 0) \
+        else len(training_loss)
+    return model, training_loss, val_loss_history, actual_epochs
 
 def split_train_test(full_dataset, generator):
     """Split a PyTorch Dataset object into train and test sets"""
@@ -424,8 +537,11 @@ def view_pred_set(model, test_loader, num_preds, labels_to_names, fig_path):
         plt.subplot(2, plot_row, i + 1)
         img = images[i]
         npimg = img.numpy()
-        npimg = np.squeeze(npimg, axis=0)
-        npimg = npimg / 2 + 0.5
+        npimg = np.squeeze(npimg, axis=0)          # (3, H, W)
+        # Reverse ImageNet normalisation so pixel values land in [0, 1]
+        _mean = np.array([0.485, 0.456, 0.406])[:, None, None]
+        _std  = np.array([0.229, 0.224, 0.225])[:, None, None]
+        npimg = np.clip(npimg * _std + _mean, 0.0, 1.0)
         plt.imshow(np.transpose(npimg, (1, 2, 0)))
         plt.axis('off')
         
@@ -491,7 +607,14 @@ if __name__ == '__main__':
                              "or 'resnet18' (pretrained ResNet18 fine-tuning). Default: cnn.")
     parser.add_argument('--overwrite', '-o',
                         action='store_true',
-                        help="Recreate / overwrite model")    
+                        help="Recreate / overwrite model")
+    parser.add_argument('--min_class_size',
+                        type=int,
+                        default=20,
+                        help="Minimum number of training samples a class must have to be "
+                             "included. Classes below this threshold are excluded. "
+                             "Default: 20. For fold-level or --hierarchical runs use 2 "
+                             "since most folds have only 2-3 members.")    
     parser.add_argument('--resize',
                         action='store_true',
                         help="Resize images to new_size instead of padding. "
@@ -528,6 +651,36 @@ if __name__ == '__main__':
                         help="SCOPe hierarchy level to use as the classification target. "
                              "'class' is the highest (broadest) level; 'family' is the lowest "
                              "(finest). Default: class.")
+    parser.add_argument('--triplet',
+                        action='store_true',
+                        help="Add cosine-space triplet loss (SCOP hierarchy aware) on top of "
+                             "CrossEntropyLoss. Requires --model resnet18. Uses SCOPFoldSampler "
+                             "to guarantee positive pairs per batch and loads class labels as "
+                             "negative-mining anchors. Typical use: --level fold --triplet.")
+    parser.add_argument('--ranking_loss',
+                        action='store_true',
+                        help="Add a physics-informed ListNet ranking loss on top of "
+                             "CrossEntropyLoss. The ranking loss directly optimises cosine "
+                             "similarities to match USalign TM-score order, bypassing the "
+                             "classification objective. Requires --tm_score_file and "
+                             "--model resnet18. Typical use: --level fold --ranking_loss "
+                             "--tm_score_file /path/to/usalign_out.tsv")
+    parser.add_argument('--tm_score_file',
+                        type=str,
+                        default=None,
+                        help="Path to USalign all-vs-all TSV (columns: #PDBchain1, PDBchain2, "
+                             "TM1, TM2). Required when --ranking_loss is set.")
+    parser.add_argument('--ranking_weight',
+                        type=float,
+                        default=0.5,
+                        help="Weight β for the ranking loss in: total = CE + β × ranking. "
+                             "Default: 0.5. Higher values shift the model towards TM-score "
+                             "alignment; lower values preserve classification accuracy.")
+    parser.add_argument('--ranking_temperature',
+                        type=float,
+                        default=0.1,
+                        help="Softmax temperature for TM-score GT distribution in ListNet "
+                             "loss. Lower = sharper targets (default: 0.1).")
     args = parser.parse_args()
 
     config = read_yaml('config.yml')
@@ -535,19 +688,19 @@ if __name__ == '__main__':
     # Get level from command line or config, with command line taking precedence. Default to 'class' if neither is provided.
     level = args.level or config.get('scope_level', 'class')
 
-    if args.epochs:
+    if args.epochs is not None:
         epochs = args.epochs
     elif 'num_epochs' in config:
         epochs = config['num_epochs']
     else:
         raise ValueError("Number of epochs must be specified via command line or config.yml")
-    if args.lr:
+    if args.lr is not None:
         lr = args.lr
     elif 'learning_rate' in config:
         lr = config['learning_rate']
     else:
         raise ValueError("Learning rate must be specified via command line or config.yml")
-    if args.batch_size:
+    if args.batch_size is not None:
         batch_size = args.batch_size
     elif 'batch_size' in config:
         batch_size = config['batch_size']
@@ -588,7 +741,7 @@ if __name__ == '__main__':
         pad=not args.resize,
         transform=transform_train,
         # exclude classes with certain number of samples to avoid extreme class imbalance and unreliable eval metrics; ignored if names_to_labels is supplied
-        min_class_size=20,  
+        min_class_size=args.min_class_size,
         min_image_size=20,
         exclude_classes=exclude_classes)
 
@@ -610,6 +763,7 @@ if __name__ == '__main__':
     n_total = len(train_dataset)
     n_val = max(1, int(n_total * args.val_size))
     n_train = n_total - n_val
+
     train_split, val_split = random_split(train_dataset, [n_train, n_val], generator=g)
     print(f'Split: {n_train} train / {n_val} val / {len(eval_dataset)} test (held-out)')
 
@@ -625,17 +779,56 @@ if __name__ == '__main__':
 
     class_names = train_dataset.label_names_unique
 
-    train_loader = DataLoader(train_split,
-                              batch_size=args.batch_size,
-                              # Note, shuffle is mutually exclusive with sampler
-                              shuffle=True,
-                            #   sampler=sampler,
-                              worker_init_fn=seed_worker)
-    val_loader = DataLoader(val_split,
-                            batch_size=args.batch_size,
-                            shuffle=False,
-                            worker_init_fn=seed_worker,
-                            generator=g)
+    if args.triplet and args.model == 'resnet18':
+        # Build SCOPe class label list (parallel to train_dataset.files) for triplet negative mining
+        _annot_df = pd.read_csv(tsv_file, sep='\t')
+        _cls_sorted = sorted(_annot_df['SCOPeClass'].dropna().unique())
+        _cls_to_int = {n: i for i, n in enumerate(_cls_sorted)}
+        _cls_lookup = dict(zip(_annot_df['SCOPeID'], _annot_df['SCOPeClass']))
+        class_labels_full = []
+        for f in train_dataset.files:
+            bname = os.path.basename(f).replace('.jpg', '')
+            cls = _cls_lookup.get(bname, _cls_sorted[0])
+            class_labels_full.append(_cls_to_int.get(cls, 0))
+        print(f'Triplet mode: {len(_cls_sorted)} SCOPe classes for negative mining.')
+
+        train_loader = DataLoader(
+            WithClassLabel(train_split, class_labels_full),
+            batch_sampler=SCOPFoldSampler(train_split, batch_size),
+            worker_init_fn=seed_worker)
+        val_loader = DataLoader(
+            WithClassLabel(val_split, class_labels_full),
+            batch_size=batch_size,
+            shuffle=False,
+            worker_init_fn=seed_worker,
+            generator=g)
+    elif args.ranking_loss and args.model == 'resnet18':
+        if not args.tm_score_file:
+            raise ValueError("--tm_score_file is required when --ranking_loss is set.")
+        train_loader = DataLoader(
+            WithProteinId(train_split),
+            batch_size=batch_size,
+            sampler=torch.utils.data.WeightedRandomSampler(
+                weights=sample_weights, num_samples=len(sample_weights), replacement=True),
+            worker_init_fn=seed_worker)
+        val_loader = DataLoader(
+            WithProteinId(val_split),
+            batch_size=batch_size,
+            shuffle=False,
+            worker_init_fn=seed_worker,
+            generator=g)
+        print(f'Ranking-loss mode: loading TM-scores from {args.tm_score_file}')
+    else:
+        train_loader = DataLoader(train_split,
+                                  batch_size=batch_size,
+                                  shuffle=True,
+                                  worker_init_fn=seed_worker)
+        val_loader = DataLoader(val_split,
+                                batch_size=batch_size,
+                                shuffle=False,
+                                worker_init_fn=seed_worker,
+                                generator=g)
+
     test_loader = DataLoader(eval_dataset,
                              batch_size=1,
                              shuffle=False,
@@ -650,21 +843,56 @@ if __name__ == '__main__':
         backbone_params = [p for n, p in model.named_parameters() if 'fc' not in n and p.requires_grad]
         head_params = list(model.fc.parameters())
         optimizer = optim.AdamW([
-            {'params': backbone_params, 'lr': args.lr * 0.1},
-            {'params': head_params,     'lr': args.lr},
+            {'params': backbone_params, 'lr': lr * 0.1},
+            {'params': head_params,     'lr': lr},
         ], weight_decay=1e-3)
-        print(f'ResNet18: backbone LR={args.lr * 0.1:.2e}, head LR={args.lr:.2e}')
+        print(f'ResNet18: backbone LR={lr * 0.1:.2e}, head LR={lr:.2e}')
     else:
         model = ConvNet(num_classes)
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        print(f'ConvNet (from scratch): LR={args.lr:.2e}')
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        print(f'ConvNet (from scratch): LR={lr:.2e}')
 
-    loss_criteria = nn.CrossEntropyLoss(label_smoothing=0.1)
+    _ce = nn.CrossEntropyLoss(label_smoothing=0.1)
+    _TRIPLET_W = 0.5
+    _emb_store = {}
+    if args.triplet and args.model == 'resnet18':
+        model.avgpool.register_forward_hook(
+            lambda m, i, o: _emb_store.update({'emb': torch.flatten(o, 1)}))
+        def loss_criteria(logits, targets, class_labels=None):
+            ce = _ce(logits, targets)
+            if class_labels is not None and 'emb' in _emb_store:
+                return ce + _TRIPLET_W * scop_triplet_loss(
+                    _emb_store['emb'], targets, class_labels)
+            return ce
+        print(f'Triplet loss enabled: CE + {_TRIPLET_W} × triplet (margin=0.3)')
+    elif args.ranking_loss and args.model == 'resnet18':
+        from proteogram.v2.ranking_loss import TmScoreRankingLoss
+        _ranking = TmScoreRankingLoss(
+            args.tm_score_file,
+            temperature=args.ranking_temperature,
+        )
+        _RANKING_W = args.ranking_weight
+        model.avgpool.register_forward_hook(
+            lambda m, i, o: _emb_store.update({'emb': torch.flatten(o, 1)}))
+        def loss_criteria(logits, targets, protein_ids=None):
+            ce = _ce(logits, targets)
+            if protein_ids is not None and 'emb' in _emb_store:
+                ids = list(protein_ids)
+                cov = _ranking.batch_coverage(ids)
+                if cov > 0.0:
+                    r_loss = _ranking.listnet_loss(_emb_store['emb'], ids)
+                    return ce + _RANKING_W * r_loss
+            return ce
+        print(f'Ranking loss enabled: CE + {_RANKING_W} × ListNet  '
+              f'(temperature={args.ranking_temperature})')
+    else:
+        def loss_criteria(logits, targets, class_labels=None):
+            return _ce(logits, targets)
     model, training_loss, val_loss, epochs_trained = train_model(model,
                         train_loader=train_loader,
                         val_loader=val_loader,
                         optimizer=optimizer,
-                        epochs=args.epochs,
+                        epochs=epochs,
                         patience=args.patience,
                         device=device)
 
@@ -687,7 +915,7 @@ if __name__ == '__main__':
                    test_loader,
                    class_names,
                    train_dataset.labels_to_names)
-    
+
     view_pred_set(model,
                   test_loader,
                   num_preds=10,
