@@ -1,0 +1,46 @@
+# for create_proteograms.py and create_v2_proteograms.py
+limit_file: './../data/queries-scope20840_files.txt' # optional, limit to these structures, .ent file base name one per line
+scope_structures_dir: './../data/pdbstyle-2.08' # input structures, .ent/.pdb file format
+eval_proteograms_dir: './../data/scope2.08_eval_queries-scope20840_proteograms' # input proteogram dir for eval set
+all_proteograms_dir: './../data/scope2.08_all_proteograms_v2' # output proteogram dir for all structures
+eval_structures_dir: './../data/scope2.08_eval_queries-scope20840_structures' # input structures for eval set, .ent/.pdb file format
+
+# for measure_similarity_single_domain.py
+proteograms_dir_single_search: '' # dir of proteograms to search against
+
+# for create_annotation_file.py
+annot_file: './<path>/ProteogramData_SCOP_RCSB_PDBe_AnnotationsLookup.tsv'
+fasta_style_file: './<path>/structure_based_seqs.fa'
+  
+# for make_training_data.py
+scope_level: 'superfamily' # family, superfamily, fold or class
+scope_eval_set: './../data/queries-scope20840_files.txt' # file to indicate proteins to be excluded, .ent file base name one per line
+scope_cla_file: './../data/dir.cla.scope.2.08-stable.txt'
+scope_des_file: './../data/dir.des.scope.2.08-stable.txt'
+scope_hie_file: './../data/dir.hie.scope.2.08-stable.txt'
+training_structures_dir: './../data/scope20840_experiment_sfam_scratch_2/scope_training_structures' # copy structures used for proteograms for gtalign runs (for eval)
+training_proteograms_dir: './../data/scope20840_experiment_sfam_scratch_2/scope_training_proteograms' # output dir
+label_df_out: './../data/scope20840_experiment_sfam_scratch_2/scope2.08_annotations_for_pdb.tsv' # annotations output file
+
+# for train_multiple_models.py - ResNet18 or CNN training
+training_data_dir: './../data/scope20840_experiment_sfam_scratch_2/scope_training_proteograms' # input proteogram dir
+num_epochs: 25 # can be overridden by command line argument
+learning_rate: 0.001 # can be overridden by command line argument
+batch_size: 8 # can be overridden by command line argument
+pretrained: True # True or False
+model_file_prefix: 'scope_cnn_model' # parameters will be appended to this prefix
+ 
+# for measure_similarity.py
+proteograms_for_sim_dir: './../data/proteograms_v2_april2026/eval' # input proteogram dir for similarity search
+model_file: './../data/proteograms_v2_april2026/scope_cnn_model_cnn_lr0.001_bs8_e0.pt' # model file for embedding proteograms for similarity search
+top_k: 10
+embed_file_exists: 'False' # either "True" or "False" if you have "embeddings.pt"
+embed_file: './../data/proteograms_v2_april2026/embeddings.pt' # name of pytorch tensors file representing embeddings of proteograms
+search_images_dir: './../data/scope20840_experiment_sfam_scratch_2/search_images_dir' # search results (top k protegram hits per query)
+proteogram_sim_results: './../data/scope20840_experiment_sfam_scratch_2/proteogram_similarity_results.tsv' # similarity results (top k) as table
+
+# for evaluate_methods.py
+gtalign_results_dir: './../data/gtalign_out' # dir name for gtalign output
+usalign_results: './../data/usalign_out.tsv' # tab-delimited ouptut from USalign
+save_bad_searches_dir: './../data/bad_proteogram_searches' # dir for poor search result images
+save_good_searches_dir: './../data/good_proteogram_searches' # dir for very good search result images

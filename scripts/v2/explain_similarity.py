@@ -68,8 +68,16 @@ def _load_img2vec(config: dict, device: str) -> Img2Vec:
     img_sim = Img2Vec(model_file, dataset_dir=[], device=device)
 
     if embed_file and os.path.exists(embed_file):
-        with open(embed_file, 'rb') as fh:
-            img_sim.dataset = pickle.load(fh)
+        try:
+            with open(embed_file, 'rb') as fh:
+                img_sim.dataset = pickle.load(fh)
+        except Exception as exc:
+            raise RuntimeError(
+                f'Failed to load embeddings from {embed_file}. '\
+                'This file may not be a pickle embedding dataset (e.g., overwritten by a FAISS index). '\
+                'Rerun measure_similarity_v2.py with --embed to recreate embeddings, '\
+                'and ensure FAISS index uses a separate .faiss path.'
+            ) from exc
         print(f'Loaded {len(img_sim.dataset):,} embeddings from {embed_file}')
     else:
         print(

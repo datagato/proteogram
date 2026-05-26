@@ -360,3 +360,215 @@ class GradCAM:
         out_path = os.path.join(output_dir, f"{stem}_gradcam.npy")
         np.save(out_path, heatmap)
         return out_path
+
+    # ------------------------------------------------------------------
+    # Energy decomposition
+    # ------------------------------------------------------------------
+
+    # Channel semantics for proteogram v2 images (upper/lower triangle):
+    #   Ch 0 (R): VdW attractive  / electrostatic attractive
+    #   Ch 1 (G): VdW repulsive   / electrostatic repulsive
+    #   Ch 2 (B): Cα distance     / hydrophobicity Δ
+    CHANNEL_LABELS = [
+        "VdW (R channel)",
+        "Electrostatic (G channel)",
+        "Distance/Hydrophobicity (B channel)",
+    ]
+    CHANNEL_CMAPS = ["Reds", "Greens", "Blues"]
+
+    def compute_decomposed(
+        self,
+        query_tensor: torch.Tensor,
+        target_tensor: torch.Tensor,
+    ) -> tuple:
+        """Compute per-channel (energy-decomposed) attribution maps.
+
+        Uses Gradient × Input saliency on the raw input channels rather than
+        the convolutional feature maps.  This produces three spatially aligned
+        heatmaps — one per proteogram channel — that directly answer: "at each
+        residue pair (i, j), how much does the VdW / electrostatic / distance
+        channel contribute to the cosine similarity?"
+
+        This is complementary to ``compute()``:
+        - ``compute()``           → WHERE similarity comes from (spatial)
+        - ``compute_decomposed()`` → WHICH FORCE drives similarity (per channel)
+
+        Args:
+            query_tensor:  Preprocessed query image, shape ``(1, 3, H, W)``.
+            target_tensor: Preprocessed target image, shape ``(1, 3, H, W)``.
+
+        Returns:
+            Tuple of:
+            - attributions: Float32 numpy array of shape ``(3, H, W)``, values
+              in ``[0, 1]``.  ``attributions[k]`` is the attribution for
+              channel k.
+            - cos_sim: Scalar cosine similarity (float).
+        """
+        query  = query_tensor.to(self.device).float().requires_grad_(True)
+        target = target_tensor.to(self.device).float()
+
+        self.embed_net.eval()
+        self.embed_net.zero_grad()
+
+        q_feat = self.embed_net(query)
+        with torch.no_grad():
+            t_feat = self.embed_net(target)
+
+        q_norm = F.normalize(q_feat, dim=1)
+        t_norm = F.normalize(t_feat.detach(), dim=1)
+        cos_sim_val = float((q_norm * t_norm).sum().item())
+
+        # Backward from cosine similarity to input
+        cos_sim_scalar = (q_norm * t_norm).sum()
+        self.embed_net.zero_grad()
+        cos_sim_scalar.backward()
+
+        # Gradient w.r.t. input: (1, 3, H, W)
+        grad = query.grad.detach()                       # (1, 3, H, W)
+        inp  = query_tensor.to(self.device).float()      # (1, 3, H, W)
+
+        # Gradient × Input attribution per channel
+        # abs() keeps both excitatory and inhibitory contributions
+        attr = (grad * inp).abs()                        # (1, 3, H, W)
+        attr = attr.squeeze(0).cpu().numpy()             # (3, H, W)
+
+        # Normalise each channel independently to [0, 1]
+        out = np.zeros_like(attr, dtype=np.float32)
+        for k in range(3):
+            ch = attr[k]
+            mn, mx = ch.min(), ch.max()
+            if mx > mn:
+                out[k] = (ch - mn) / (mx - mn)
+            else:
+                out[k] = ch
+
+        return out, cos_sim_val
+
+    def compute_decomposed_from_paths(
+        self,
+        query_path: str,
+        target_path: str,
+    ) -> tuple:
+        """Convenience wrapper: load from disk, compute decomposed attributions.
+
+        Args:
+            query_path:  Path to query proteogram JPG.
+            target_path: Path to target proteogram JPG.
+
+        Returns:
+            Tuple of:
+            - attributions: Float32 numpy array of shape ``(3, H, W)``.
+            - cos_sim: Cosine similarity (float).
+        """
+        q_tensor = _preprocess_image(query_path)
+        t_tensor = _preprocess_image(target_path)
+        return self.compute_decomposed(q_tensor, t_tensor)
+
+    def save_decomposed_figure(
+        self,
+        attributions: np.ndarray,
+        combined_heatmap: np.ndarray,
+        query_img: np.ndarray,
+        cos_sim: float,
+        query_name: str,
+        target_name: str,
+        output_dir: str,
+        query_sequence: Optional[str] = None,
+    ) -> str:
+        """Save a 5-panel energy-decomposed Grad-CAM figure.
+
+        Panels: original proteogram | combined Grad-CAM | VdW attribution |
+                electrostatic attribution | distance/hydrophobicity attribution.
+
+        Args:
+            attributions:    Float32 array ``(3, H, W)`` from ``compute_decomposed()``.
+            combined_heatmap: Float32 array ``(H, W)`` from ``compute()``.
+            query_img:       ``uint8`` RGB array of the query proteogram.
+            cos_sim:         Cosine similarity score.
+            query_name:      SCOPe ID of the query.
+            target_name:     SCOPe ID of the target.
+            output_dir:      Directory where the PNG is written.
+            query_sequence:  Optional 1-letter amino acid sequence for tick labels.
+
+        Returns:
+            Absolute path of the saved PNG.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        fig = plt.figure(figsize=(25, 6), layout="constrained")
+        gs  = gridspec.GridSpec(1, 5, figure=fig, wspace=0.35)
+
+        fig.suptitle(
+            f"Energy-decomposed Grad-CAM:  {query_name}  →  {target_name}"
+            f"   (cosine similarity = {cos_sim:.4f})",
+            fontsize=13, y=1.02,
+        )
+
+        axes = [fig.add_subplot(gs[0, k]) for k in range(5)]
+
+        # Panel 0 — original proteogram
+        axes[0].imshow(query_img)
+        axes[0].set_title("Query proteogram", fontsize=10)
+        axes[0].axis("off")
+
+        # Panel 1 — combined Grad-CAM
+        im0 = axes[1].imshow(combined_heatmap, cmap="hot", vmin=0, vmax=1)
+        axes[1].set_title("Combined Grad-CAM\n(spatial importance)", fontsize=10)
+        axes[1].axis("off")
+        plt.colorbar(im0, ax=axes[1], fraction=0.046, pad=0.04)
+
+        # Panels 2–4 — per-channel attributions
+        for k in range(3):
+            ax = axes[k + 2]
+            im = ax.imshow(attributions[k], cmap=self.CHANNEL_CMAPS[k],
+                           vmin=0, vmax=1)
+            ax.set_title(
+                f"Attribution: {self.CHANNEL_LABELS[k]}", fontsize=10
+            )
+            ax.axis("off")
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        # Optional residue-index tick labels
+        if query_sequence and 0 < len(query_sequence) <= 200:
+            step = max(1, len(query_sequence) // 20)
+            ticks = list(range(0, len(query_sequence), step))
+            labels = [f"{i}\n{query_sequence[i]}" for i in ticks]
+            for ax in axes:
+                ax.set_xticks(ticks)
+                ax.set_xticklabels(labels, fontsize=6)
+                ax.set_yticks(ticks)
+                ax.set_yticklabels(labels, fontsize=6)
+                ax.tick_params(axis="both", length=2)
+
+        stem = f"{query_name}_vs_{target_name}"
+        out_path = os.path.join(output_dir, f"{stem}_gradcam_decomposed.png")
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+
+    def save_decomposed_npy(
+        self,
+        attributions: np.ndarray,
+        query_name: str,
+        target_name: str,
+        output_dir: str,
+    ) -> str:
+        """Save raw per-channel attributions as a ``.npy`` file.
+
+        Args:
+            attributions: Float32 array ``(3, H, W)``.
+            query_name:   SCOPe ID of query.
+            target_name:  SCOPe ID of target.
+            output_dir:   Destination directory.
+
+        Returns:
+            Absolute path of the saved ``.npy`` file.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        stem = f"{query_name}_vs_{target_name}"
+        out_path = os.path.join(output_dir, f"{stem}_gradcam_decomposed.npy")
+        np.save(out_path, attributions)
+        return out_path

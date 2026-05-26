@@ -14,6 +14,94 @@ Each section follows the same structure: motivation → design decisions → ful
 
 ---
 
+## Operational Notes (May 2026): Environment Setup + Long v2 Runs
+
+This section documents practical lessons from running the current v2 pipeline on Linux with mixed toolchains (`uv`, local Conda bootstrap, OpenMM).
+
+### A. Why `create_v2_proteograms.py` may be slow
+
+`scripts/v2/create_v2_proteograms.py` runs a full MD pipeline per protein (minimization + NPT + NVT + production) before image export. If OpenMM CUDA is unavailable, this falls back to CPU and runtime increases significantly.
+
+At default MD lengths, CPU runtime can be many minutes per protein; with 2,008 proteins this can become multi-day if not accelerated.
+
+### B. Distinguish PyTorch CUDA vs OpenMM CUDA
+
+It is common to have:
+
+- `torch.cuda.is_available() == True`
+- OpenMM platforms = `['Reference', 'CPU', 'OpenCL']`
+
+In this case, similarity scripts can use GPU (PyTorch), but MD in v2 proteogram generation still runs without CUDA.
+
+Check OpenMM platforms directly:
+
+```bash
+python - <<'PY'
+from openmm import Platform
+names = [Platform.getPlatform(i).getName() for i in range(Platform.getNumPlatforms())]
+print('OpenMM platforms:', names)
+print('CUDA available:', 'CUDA' in names)
+PY
+```
+
+### C. Conda bootstrap pitfall encountered
+
+In this run, `conda` was pointing to a local bootstrap install under:
+
+`scripts/v2/exit/bin/conda`
+
+This caused solver and lock issues (e.g., sqlite lock, libmamba plugin mismatch), and prevented reliable environment creation.
+
+Recommended safeguards:
+
+1. Confirm which conda is active (`which conda`, `conda info --base`).
+2. Prefer a stable system conda/mamba/micromamba install for OpenMM-CUDA env creation.
+3. If needed, force classic solver when libmamba plugin is unavailable.
+
+### D. Minimal reliable runbook (CUDA-capable OpenMM env)
+
+```bash
+# 1) create env with python 3.11 (recommended for this project stack)
+conda create -n proteogram-openmm-cuda -c conda-forge python=3.11 openmm pdbfixer -y
+
+# 2) activate env
+conda activate proteogram-openmm-cuda
+
+# 3) verify OpenMM CUDA platform visibility
+python - <<'PY'
+from openmm import Platform
+print([Platform.getPlatform(i).getName() for i in range(Platform.getNumPlatforms())])
+PY
+
+# 4) install project in editable mode
+cd /path/to/proteogram
+pip install -e .
+
+# 5) run v2 proteogram creation
+cd scripts/v2
+python create_v2_proteograms.py --overwrite
+```
+
+### E. Monitoring a long run
+
+During `create_v2_proteograms.py`, JPG outputs are written incrementally (not only at end). To watch output growth:
+
+```bash
+# from repo root
+watch -n 5 'find data/scope2.08_all_proteograms_v2 -maxdepth 1 -name "*.jpg" | wc -l'
+
+# or from scripts/v2
+watch -n 5 'find ../data/scope2.08_all_proteograms_v2 -maxdepth 1 -name "*.jpg" | wc -l'
+```
+
+### F. Current observed status
+
+- Run is progressing through structures and skipping out-of-range chains (`sequence length outside [20, 200]`) as designed.
+- Output directory image count should rise continuously as proteins complete.
+- If OpenMM CUDA remains unavailable, OpenCL/CPU execution is expected and slower than CUDA.
+
+---
+
 ## 1. FAISS Approximate Nearest Neighbour Search
 
 ### 1.1 Motivation
