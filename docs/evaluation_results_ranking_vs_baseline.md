@@ -60,6 +60,50 @@ All methods — GTalign, USalign, and both Proteogram models — are evaluated o
 
 ---
 
+## How the Key Numbers Are Calculated
+
+### MAP@K improvement (+46% at fold level)
+
+1. Both models embed all 544 eval proteins into embedding vectors (`measure_similarity_v2.py`).
+2. For each query, the top-10 most similar proteins are retrieved by cosine similarity.
+3. `evaluate_methods_v2.py` looks up each retrieved protein's SCOP fold and computes **Average Precision** for that query — this rewards fold-correct proteins appearing earlier in the ranked list, not just anywhere in the top 10.
+4. MAP@K is the mean of per-query Average Precision scores across all 544 queries.
+5. The **+45.8% relative improvement** at fold level is: `(0.1133 − 0.0777) / 0.0777`.
+
+### Energy/Distance (E/D) ratio (+21% for same-fold/high-TM pairs)
+
+The E/D ratio comes from `explain_energy_channels.py` and measures which physical force channels the model attends to most.
+
+**Step 1 — Pair categorisation** (`auto_select_pairs()`): USalign TM-scores are used to bin protein pairs into three categories:
+
+| Category | Fold relationship | TM-score threshold |
+|---|---|---|
+| `diff_fold_low_sim` | Different fold | ≤ 0.3 |
+| `same_fold_low_sim` | Same fold | ≤ 0.4 (hard negatives) |
+| `same_fold_high_sim` | Same fold | ≥ 0.7 (confident true positives) |
+
+**Step 2 — Per-channel Grad-CAM** (`gradcam_decomposed_similarity()`): For each pair, Grad-CAM is run separately on each RGB channel of the proteogram. The output is a `(3, H, W)` attribution array, where each channel corresponds to a different physical force:
+
+| Channel | Colour | Physical meaning |
+|---|---|---|
+| Channel 0 | R | VdW energy (short-range stickiness, governs hydrophobic core packing) |
+| Channel 1 | G | Electrostatic energy (charged residue interactions) |
+| Channel 2 | B | Cα geometric distance / hydrophobicity |
+
+**Step 3 — E/D ratio** (`channel_dominance_stats()`): For each pair, the ratio is computed as:
+
+```
+E/D ratio = (mean_attribution_ch0 + mean_attribution_ch1) / (mean_attribution_ch2 + ε)
+```
+
+Mean attributions are spatial averages over all residue-pair pixels (i, j) in the heatmap. A higher ratio means the model is using energy channels (physics) more than raw geometric distance to judge similarity.
+
+**Step 4 — Aggregation**: The E/D ratio is averaged across all pairs within each category. The **+21.4%** figure is the change in this average for `same_fold_high_sim` pairs between the baseline and ranking models.
+
+The Grad-CAM attribution here is directly biologically interpretable: because each proteogram pixel at (row i, col j) encodes the physical interaction between residue i and residue j, high attribution at (i, j) in channel 0 means VdW interactions between those two specific residues drove the similarity prediction.
+
+---
+
 ## Results
 
 ### Precision@K (K=10)
