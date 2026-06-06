@@ -34,7 +34,7 @@ import psutil
 from ..common.constants import MODIFIED_RESIDUES_TO_STANDARD, SOLVENT_RESIDUES
 
 
-class NonBondedForceModel:
+class AtomisticNonBondedForceModel:
     """Model for computing non-bonded forces between residues using MD simulation.
 
     This class provides a complete pipeline for:
@@ -175,18 +175,10 @@ class NonBondedForceModel:
         # removeHeterogens. Modified residues are stored as HETATM records in PDB
         # files, so removeHeterogens would silently delete them if they haven't
         # already been converted to a standard residue name.
-        _MODIFIED_TO_STANDARD = {
-            'MSE': 'MET', 'FME': 'MET', 'CXM': 'MET',
-            'M3L': 'LYS', 'MLY': 'LYS', 'MLZ': 'LYS', 'KCX': 'LYS', 'ALY': 'LYS', 'LLP': 'LYS',
-            'CSO': 'CYS', 'CME': 'CYS', 'OCS': 'CYS', 'SEC': 'CYS', 'SMC': 'CYS', 'CSD': 'CYS',
-            'SEP': 'SER', 'TPO': 'THR', 'PTR': 'TYR', 'TYS': 'TYR',
-            'HYP': 'PRO', 'CGU': 'GLU', 'PCA': 'GLN', 'NEP': 'HIS', 'HIC': 'HIS',
-            'BHD': 'ASP',
-        }
         for res in fixer.topology.residues():
-            if res.name in _MODIFIED_TO_STANDARD:
-                print(f"  INFO: Pre-renaming {res.name} → {_MODIFIED_TO_STANDARD[res.name]} before hetatm removal")
-                res.name = _MODIFIED_TO_STANDARD[res.name]
+            if res.name in MODIFIED_RESIDUES_TO_STANDARD:
+                print(f"  INFO: Pre-renaming {res.name} → {MODIFIED_RESIDUES_TO_STANDARD[res.name]} before hetatm removal")
+                res.name = MODIFIED_RESIDUES_TO_STANDARD[res.name]
 
         fixer.removeHeterogens(keepWater=False)
         fixer.findMissingAtoms()
@@ -1342,10 +1334,11 @@ class NonBondedForceModel:
                 time_ps = steps_run * timestep_ps
                 self._log_energy('nvt', time_ps, current_energy)
             
-            # Validate energy
+            # Validate energy — skip first-chunk comparison: the jump from a
+            # zero-temperature minimized state to 310 K is expected and large.
             warnings_list = self._validate_energy(
-                current_energy, 'NVT', 
-                prev_energy=energy_history[-2] if len(energy_history) > 1 else None,
+                current_energy, 'NVT',
+                prev_energy=energy_history[-2] if len(energy_history) > 2 else None,
                 n_atoms=n_atoms
             )
             for w in warnings_list:
@@ -1358,14 +1351,13 @@ class NonBondedForceModel:
         print(f"  Final potential energy: {final_energy:.1f} kJ/mol "
             f"({final_energy/n_atoms:.2f} kJ/mol/atom)")
         
-        # Check overall trend
-        if final_energy > initial_energy:
-            warnings.warn(
-                f"NVT equilibration: Energy increased from {initial_energy:.1f} to {final_energy:.1f} kJ/mol"
-            )
-            print(f"  WARNING: Energy increased during NVT equilibration")
+        # Energy increase from minimization → NVT is expected (system thermalizes
+        # from 0 K to 310 K), so only report the trend without raising a warning.
+        delta_nvt = final_energy - initial_energy
+        if delta_nvt > 0:
+            print(f"  Energy increased by {delta_nvt:.1f} kJ/mol (normal thermalization)")
         else:
-            print(f"  Energy decreased by {initial_energy - final_energy:.1f} kJ/mol (good)")
+            print(f"  Energy decreased by {-delta_nvt:.1f} kJ/mol (good)")
         
         self._get_positions_and_cleanup()
 
@@ -2335,13 +2327,21 @@ class NonBondedForceModel:
             add_barostat=False, add_calpha_restraint=True)
         self.minimize_energy()
         
-        # Step 3: NPT equilibration with new system including barostat force
-        print("\n[Step 3/5] NPT equilibration...")
-        self.equilibrate_npt(steps=npt_steps)
-        
-        # Step 4: NVT equilibration using same system without barostat force
-        print("\n[Step 4/5] NVT equilibration...")
-        self.equilibrate_nvt_with_warming(steps=nvt_steps)
+        # Step 3: NVT equilibration using same system without barostat force
+        print("\n[Step 3/5] NVT equilibration...")
+        self.equilibrate_nvt(steps=nvt_steps)
+
+        # Step 4: NPT equilibration with new system including barostat force.
+        # Skipped for small proteins (< 50 residues): tiny simulation boxes
+        # produce pressure fluctuations large enough to cause NaN coordinates,
+        # and box-volume equilibration adds no value at that scale.
+        print("\n[Step 4/5] NPT equilibration...")
+        n_protein_residues = len(self.protein_residue_indices)
+        if n_protein_residues < 50:
+            print(f"  Skipping NPT for small protein ({n_protein_residues} residues < 50): "
+                  "pressure coupling is unstable at this scale.")
+        else:
+            self.equilibrate_npt(steps=npt_steps)
         
         # Step 5: Production MD using new system and simulation with energy calculations
         print("\n[Step 5/5] Production MD...")
