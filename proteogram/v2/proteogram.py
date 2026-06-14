@@ -93,7 +93,7 @@ class ProteogramV2:
         self.sequence = ''.join(
             [self.allowed_amino_acids[res.resname]
              for res in self.chain
-             if res.resname in self.allowed_amino_acids])
+             if res.resname in self.allowed_amino_acids and "CA" in res])
         self.calpha_atom_distance_cutoff = calpha_atom_distance_cutoff
         self.sequence_len_lower_cutoff = sequence_len_lower_cutoff
         self.sequence_len_upper_cutoff = sequence_len_upper_cutoff
@@ -323,16 +323,10 @@ class ProteogramV2:
         """
         ca_atoms = [res["CA"] for res in self.chain if "CA" in res]
         n_residues = len(ca_atoms)
-        # Initialize a results matrix with zeros
         distogram = np.zeros((n_residues, n_residues), dtype=np.float64)
-        
-        # Assign upper triangle the c-alpha distances (lower triangle remains all 0)
         for i in range(n_residues):
-            for j in range(i + 1, n_residues): # Only iterate over unique pairs (upper triangle)
-                # Use the distance operator overload for Atom objects
-                distance = ca_atoms[i] - ca_atoms[j]
-                distogram[i, j] = distance
-                
+            for j in range(i + 1, n_residues):
+                distogram[i, j] = ca_atoms[i] - ca_atoms[j]
         return distogram
 
     def calc_hydrophobicity_map(self, sequence, disto_map):

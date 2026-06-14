@@ -320,6 +320,8 @@ class MartiniNonBondedForceModel:
                 bead_defs = _RESIDUE_BEADS.get(resname)
                 if bead_defs is None:
                     continue  # HETATM, solvent, unknown residue — skip
+                if 'CA' not in res:
+                    continue  # no alpha carbon — BB bead position unreliable, skip
 
                 ri = len(residue_names)
                 residue_names.append(resname)

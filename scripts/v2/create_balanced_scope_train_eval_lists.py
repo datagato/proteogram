@@ -19,6 +19,13 @@ Usage:
         [--seed 42] \
         [--exclude-classes e,f,g]
 
+    Or without an eval split:
+    python create_balanced_scope_eval_list.py \
+        --lst-file path/to/cdhits_result.lst \
+        --lookup-tsv path/to/annotations.tsv \
+        --train-output train_set.txt \
+        --no-eval
+
 Class column options:
     - SCOPeClass: Major structural class (e.g., a, b, c, d)
     - SCOPeFold: Fold level classification
@@ -269,19 +276,26 @@ def main():
         '--eval-fraction', '-e',
         type=float,
         default=0.2,
-        help='Fraction of data to use for evaluation (default: 0.2)'
+        help='Fraction of data to use for evaluation (default: 0.2); ignored with --no-eval'
     )
-    
+
+    parser.add_argument(
+        '--no-eval',
+        action='store_true',
+        help='Skip eval split; all sampled proteins go to the training set'
+    )
+
     parser.add_argument(
         '--train-output',
         required=True,
         help='Path to output file for training set (one identifier per line)'
     )
-    
+
     parser.add_argument(
         '--eval-output',
-        required=True,
-        help='Path to output file for evaluation set (one identifier per line)'
+        default=None,
+        help='Path to output file for evaluation set (one identifier per line); '
+             'required unless --no-eval is set'
     )
     
     parser.add_argument(
@@ -321,6 +335,9 @@ def main():
 
     args = parser.parse_args()
 
+    if not args.no_eval and args.eval_output is None:
+        parser.error('--eval-output is required unless --no-eval is set')
+
     exclude_classes = set()
     if args.exclude_classes:
         exclude_classes = {c.strip() for c in args.exclude_classes.split(',')}
@@ -351,56 +368,65 @@ def main():
         seed=args.seed
     )
     
-    # Split into train and eval sets
-    print(f"\nSplitting into train ({1-args.eval_fraction:.0%}) and eval ({args.eval_fraction:.0%}) sets...")
-    train_ids, eval_ids, split_counts = split_train_eval(
-        sampled_by_class=sampled_by_class,
-        eval_fraction=args.eval_fraction,
-        seed=args.seed
-    )
-    
-    # Print summary
-    print(f"\nClass distribution (total / train / eval):")
-    for scope_class in sorted(class_counts.keys()):
-        total = class_counts[scope_class]
-        train_n, eval_n = split_counts[scope_class]
-        print(f"  {scope_class}: {total} / {train_n} / {eval_n}")
-    
-    print(f"\nTotal selected: {sum(class_counts.values())}")
-    print(f"  Training set: {len(train_ids)}")
-    print(f"  Evaluation set: {len(eval_ids)}")
-    
+    if args.no_eval:
+        # All sampled proteins go to training
+        train_ids = [sid for ids in sampled_by_class.values() for sid in ids]
+
+        print(f"\nClass distribution (total / train):")
+        for scope_class in sorted(class_counts.keys()):
+            print(f"  {scope_class}: {class_counts[scope_class]} / {class_counts[scope_class]}")
+
+        print(f"\nTotal selected: {sum(class_counts.values())}")
+        print(f"  Training set: {len(train_ids)} (no eval split)")
+    else:
+        # Split into train and eval sets
+        print(f"\nSplitting into train ({1-args.eval_fraction:.0%}) and eval ({args.eval_fraction:.0%}) sets...")
+        train_ids, eval_ids, split_counts = split_train_eval(
+            sampled_by_class=sampled_by_class,
+            eval_fraction=args.eval_fraction,
+            seed=args.seed
+        )
+
+        print(f"\nClass distribution (total / train / eval):")
+        for scope_class in sorted(class_counts.keys()):
+            total = class_counts[scope_class]
+            train_n, eval_n = split_counts[scope_class]
+            print(f"  {scope_class}: {total} / {train_n} / {eval_n}")
+
+        print(f"\nTotal selected: {sum(class_counts.values())}")
+        print(f"  Training set: {len(train_ids)}")
+        print(f"  Evaluation set: {len(eval_ids)}")
+
     # Save training set
     train_path = Path(args.train_output)
     train_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     if args.split_train and args.split_train > 1:
-        # Split training set into multiple files
         created_files = split_into_files(train_ids, train_path, args.split_train)
         print(f"\nSplit training set into {len(created_files)} files:")
         for f in created_files:
             print(f"  {f}")
     else:
-        # Save as single file
         with open(train_path, 'w') as f:
             for identifier in train_ids:
                 f.write(f"{identifier}\n")
         print(f"\nSaved training set to: {args.train_output}")
-    
-    # Save evaluation set
-    eval_path = Path(args.eval_output)
-    eval_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.split_eval and args.split_eval > 1:
-        created_files = split_into_files(eval_ids, eval_path, args.split_eval)
-        print(f"\nSplit evaluation set into {len(created_files)} files:")
-        for f in created_files:
-            print(f"  {f}")
-    else:
-        with open(eval_path, 'w') as f:
-            for identifier in eval_ids:
-                f.write(f"{identifier}\n")
-        print(f"Saved evaluation set to: {args.eval_output}")
+    if not args.no_eval:
+        # Save evaluation set
+        eval_path = Path(args.eval_output)
+        eval_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if args.split_eval and args.split_eval > 1:
+            created_files = split_into_files(eval_ids, eval_path, args.split_eval)
+            print(f"\nSplit evaluation set into {len(created_files)} files:")
+            for f in created_files:
+                print(f"  {f}")
+        else:
+            with open(eval_path, 'w') as f:
+                for identifier in eval_ids:
+                    f.write(f"{identifier}\n")
+            print(f"Saved evaluation set to: {args.eval_output}")
 
 
 if __name__ == '__main__':

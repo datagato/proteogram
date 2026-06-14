@@ -7,9 +7,17 @@ cg_method: 'martini' # coarse-grained (CG) method: 'martini' or null for full at
 # for measure_similarity_single_domain.py
 proteograms_dir_single_search: '' # dir of proteograms to search against
 
-# for create_annotation_file.py
-annot_file: './<path>/ProteogramData_SCOP_RCSB_PDBe_AnnotationsLookup.tsv'
+# for split_pdb_into_chains.py
+pdb_download_dir: '../data/pdb_download'   # downloaded full PDB files
+pdb_monomers_dir: '../data/pdb_monomers'   # output: {PDBID}_{CHAIN}.pdb per chain
+
+# for create_pdb_annotation_file.py (PDB-based pipeline, no SCOPe required)
+# for create_scope_annotation_file.py / create_annotation_file.py (SCOPe pipeline)
+annot_file: './<path>/ProteogramData_RCSB_PDBe_AnnotationsLookup.tsv'
 fasta_style_file: './<path>/structure_based_seqs.fa'
+# GO OBO files — downloaded automatically from geneontology.org if absent
+go_obo_file: '../data/go/go-basic.obo'
+goslim_obo_file: '../data/go/goslim_generic.obo'
   
 # for make_training_data.py
 scope_level: '' # family, superfamily, fold or class
