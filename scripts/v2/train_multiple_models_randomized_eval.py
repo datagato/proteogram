@@ -562,10 +562,8 @@ if __name__ == '__main__':
                         default=0.15,
                         help="Fraction of images to hold out as the final held-out test set (default: 0.15).")
     parser.add_argument('--save_test_list',
-                        type=str,
-                        default=None,
-                        help="If set, write the file prefix of each test set image (one per line) "
-                             "to this path.")
+                        action='store_true',
+                        help="Flag to save the list of test set image filenames to a text file for later " "reference.")
     parser.add_argument('--max_image_size',
                         type=int,
                         default=200,
@@ -584,6 +582,11 @@ if __name__ == '__main__':
                         help="SCOPe hierarchy level to use as the classification target. "
                              "'class' is the highest (broadest) level; 'family' is the lowest "
                              "(finest). Default: class.")
+    parser.add_argument('--min_class_size',
+                        type=int,
+                        default=20,
+                        help="Exclude classes with fewer than this many samples to avoid extreme "
+                             "class imbalance. Default: 20.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -653,7 +656,7 @@ if __name__ == '__main__':
         pad=not args.resize,
         transform=None,
         # exclude classes with fewer than this many samples to avoid extreme class imbalance
-        min_class_size=20,
+        min_class_size=args.min_class_size,
         min_image_size=20,
         max_image_size=args.max_image_size,
         exclude_classes=exclude_classes)
@@ -680,13 +683,6 @@ if __name__ == '__main__':
     test_split  = TransformedSubset(Subset(full_dataset, test_indices),  transform_eval)
     print(f'Stratified split (seed={args.seed}): '
           f'{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test (held-out)')
-
-    if args.save_test_list:
-        os.makedirs(os.path.dirname(os.path.abspath(args.save_test_list)), exist_ok=True)
-        with open(args.save_test_list, 'w') as f:
-            for i in test_indices:
-                f.write(os.path.splitext(os.path.basename(full_dataset.files[i]))[0] + '\n')
-        print(f'Test set file prefixes written to {args.save_test_list}')
 
     # WeightedRandomSampler: oversample minority classes so each epoch sees
     # a balanced class distribution regardless of raw class frequencies.
@@ -746,16 +742,17 @@ if __name__ == '__main__':
 
     output_dir = os.path.dirname(os.path.abspath(root_dir))
 
-    plot_losses(training_loss, val_loss,
-                fig_path=os.path.join(output_dir, 'loss_curves.png'))
-
     overall_accuracy = get_accuracies(model,
                    test_loader,
                    class_names,
                    full_dataset.labels_to_names)
 
-    model_file = config.get('model_file_prefix', 'scope_proteogram_model') \
-        + f'_{args.model}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_acc{overall_accuracy}.pt'
+    suffix = f'_{args.model}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_min_class_size{args.min_class_size}_level-{level}_acc{overall_accuracy}'
+
+    plot_losses(training_loss, val_loss,
+                fig_path=os.path.join(output_dir, f'loss_curves{suffix}.png'))
+
+    model_file = config.get('model_file_prefix', 'scope_proteogram_model') + suffix + '.pt'
     model_path = os.path.join(output_dir, model_file)
 
     # Save model
@@ -766,9 +763,18 @@ if __name__ == '__main__':
         torch.save(model.state_dict(), model_path)
         print(f'Saved model to {model_path}')
 
+    if args.save_test_list:
+        save_list_name = f"test_list_for_model_{suffix}.lst"
+        save_list_path = os.path.join(output_dir, save_list_name)
+        os.makedirs(os.path.dirname(os.path.abspath(save_list_path)), exist_ok=True)
+        with open(save_list_path, 'w') as f:
+            for i in test_indices:
+                f.write(os.path.splitext(os.path.basename(full_dataset.files[i]))[0] + '\n')
+        print(f'Test set file prefixes written to {save_list_path}')
+
     view_pred_set(model,
                   test_loader,
                   num_preds=10,
                   labels_to_names=full_dataset.labels_to_names,
-                  fig_path=os.path.join(output_dir, 'sample_preds.png'))
+                  fig_path=os.path.join(output_dir, f'sample_preds{suffix}.png'))
 
