@@ -486,6 +486,24 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
+class FocalLoss(nn.Module):
+    """Multi-class focal loss: FL = -(1 - p_t)^gamma * log(p_t).
+
+    gamma=0 reduces to standard cross-entropy. gamma=2 is the value used in
+    the original RetinaNet paper and is a reasonable starting point.
+    label_smoothing is applied to the underlying cross-entropy term.
+    """
+    def __init__(self, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        ce = F.cross_entropy(inputs, targets, label_smoothing=self.label_smoothing, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+
+
 class TransformedSubset(Dataset):
     """Wraps a Subset and applies a transform, allowing train/eval subsets to use different augmentations."""
     def __init__(self, subset, transform):
@@ -587,6 +605,17 @@ if __name__ == '__main__':
                         default=20,
                         help="Exclude classes with fewer than this many samples to avoid extreme "
                              "class imbalance. Default: 20.")
+    parser.add_argument('--loss',
+                        choices=['ce', 'focal'],
+                        default='ce',
+                        help="Loss function: 'ce' (cross-entropy with label smoothing) or "
+                             "'focal' (focal loss, good for hard/imbalanced examples). Default: ce.")
+    parser.add_argument('--focal_gamma',
+                        type=float,
+                        default=2.0,
+                        help="Focusing parameter gamma for focal loss (ignored when --loss=ce). "
+                             "gamma=0 reduces to cross-entropy; gamma=2 is the RetinaNet default. "
+                             "Default: 2.0.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -731,7 +760,12 @@ if __name__ == '__main__':
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
         print(f'ConvNet (from scratch): LR={args.lr:.2e}')
 
-    loss_criteria = nn.CrossEntropyLoss(label_smoothing=0.1)
+    if args.loss == 'focal':
+        loss_criteria = FocalLoss(gamma=args.focal_gamma, label_smoothing=0.1)
+        print(f'Loss: FocalLoss(gamma={args.focal_gamma}, label_smoothing=0.1)')
+    else:
+        loss_criteria = nn.CrossEntropyLoss(label_smoothing=0.1)
+        print('Loss: CrossEntropyLoss(label_smoothing=0.1)')
     model, training_loss, val_loss, epochs_trained = train_model(model,
                         train_loader=train_loader,
                         val_loader=val_loader,
@@ -747,7 +781,8 @@ if __name__ == '__main__':
                    class_names,
                    full_dataset.labels_to_names)
 
-    suffix = f'_{args.model}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_min_class_size{args.min_class_size}_level-{level}_acc{overall_accuracy}'
+    loss_tag = f'focal_g{args.focal_gamma}' if args.loss == 'focal' else 'ce'
+    suffix = f'_{args.model}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_min_class_size{args.min_class_size}_level-{level}_loss{loss_tag}_acc{overall_accuracy}'
 
     plot_losses(training_loss, val_loss,
                 fig_path=os.path.join(output_dir, f'loss_curves{suffix}.png'))
