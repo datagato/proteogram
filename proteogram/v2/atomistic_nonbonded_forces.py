@@ -31,7 +31,15 @@ from typing import Optional
 from pathlib import Path
 import psutil
 
-from ..common.constants import MODIFIED_RESIDUES_TO_STANDARD, SOLVENT_RESIDUES
+from ..common.constants import MODIFIED_RESIDUES_TO_STANDARD, RESIDUE_LIST, SOLVENT_RESIDUES
+
+# Residue 3-letter codes ProteogramV2.self.sequence will actually count (see
+# ProteogramV2.__init__'s allowed_amino_acids). PDBFixer recognizes a broader
+# set of modified/nonstandard residues than this project's own
+# MODIFIED_RESIDUES_TO_STANDARD table (e.g. 'CAS') and will silently convert
+# and keep them, which would otherwise let such residues leak into the MD
+# output maps without a matching entry in self.sequence.
+_PROTEOGRAM_ALLOWED_RESNAMES = {name for _, name in RESIDUE_LIST} | set(MODIFIED_RESIDUES_TO_STANDARD)
 
 
 class AtomisticNonBondedForceModel:
@@ -115,6 +123,13 @@ class AtomisticNonBondedForceModel:
         self.simulation = None
         self.residue_atom_indices = {}
         self.protein_residue_indices = []
+        # (chain_id, residue_id) keys present in the raw PDB, captured before
+        # PDBFixer's findMissingResidues()/addMissingAtoms() can graft in
+        # SEQRES-only residues to bridge structural gaps. Used to tag which
+        # final protein residues are gap-filled vs experimentally resolved —
+        # see _identify_protein_residues() and run_production().
+        self._original_residue_keys = None
+        self._dummy_residue_mask = None
         self.debug = False
         
         # Store periodic box vectors for proper Context transitions
@@ -149,15 +164,21 @@ class AtomisticNonBondedForceModel:
         self.cleanup_all_resources()
         return False
 
-    @staticmethod
-    def fix_pdb_file(pdb_path: str) -> io.StringIO:
+    def fix_pdb_file(self, pdb_path: str) -> io.StringIO:
         """Fix a PDB structure for input to MD simulation.
 
         Performs the following fixes:
             - Replace non-standard residues with standard equivalents
             - Remove heterogens including crystal waters
-            - Add missing atoms
+            - Add missing atoms (including whole residues to bridge gaps,
+              e.g. disordered loops absent from the crystal structure)
             - Add hydrogens (at pH 7.0)
+
+        Gap-filled residues are needed to keep the simulated chain physically
+        connected, but they have modeled (not experimentally determined)
+        coordinates, so they are excluded from the final energy/distance maps
+        — see _identify_protein_residues() and run_production(). This mirrors
+        MartiniNonBondedForceModel's dummy-bead bridging.
 
         Args:
             pdb_path (str): Path to the input PDB file.
@@ -166,6 +187,27 @@ class AtomisticNonBondedForceModel:
             io.StringIO: A PDB file in memory after fixing.
         """
         fixer = PDBFixer(pdb_path)
+
+        # Snapshot residue identities present in the raw file before any
+        # gap-filling/atom-filling can occur, so gap-filled and CA-less
+        # residues can be identified (and excluded from the output maps)
+        # later. Requiring a CA atom mirrors ProteogramV2.self.sequence's own
+        # "CA" in res filter: a residue with only a stray backbone atom (e.g.
+        # just N, with the rest of the residue unresolved/disordered in the
+        # crystal structure) isn't a SEQRES-style missing residue — PDBFixer
+        # treats it as present and fills in the rest via addMissingAtoms() —
+        # but ProteogramV2 doesn't count it as resolved, so it must be
+        # excluded here too or the residue counts diverge by one. Also
+        # require the (pre-conversion) resname to be one ProteogramV2 itself
+        # recognizes — PDBFixer's own findNonstandardResidues() knows about
+        # far more modified residues than our MODIFIED_RESIDUES_TO_STANDARD
+        # table and will convert+keep them (e.g. 'CAS'), which self.sequence
+        # would still skip.
+        self._original_residue_keys = {
+            (res.chain.id, res.id) for res in fixer.topology.residues()
+            if res.name in _PROTEOGRAM_ALLOWED_RESNAMES
+            and any(atom.name == 'CA' for atom in res.atoms())
+        }
 
         fixer.findMissingResidues()
         fixer.findNonstandardResidues()
@@ -185,9 +227,13 @@ class AtomisticNonBondedForceModel:
         fixer.addMissingAtoms()
         fixer.addMissingHydrogens(pH=7.0)
 
-        # Write PDB file info to an IO stream
+        # Write PDB file info to an IO stream. keepIds=True is required so
+        # chain/residue IDs survive this write-then-reread round trip —
+        # otherwise PDBFile.writeFile() renumbers every residue sequentially
+        # by position (ignoring original numbering/gaps), which would make
+        # self._original_residue_keys (captured pre-write) match nothing.
         pdb_file_in_mem = io.StringIO()
-        PDBFile.writeFile(fixer.topology, fixer.positions, pdb_file_in_mem)
+        PDBFile.writeFile(fixer.topology, fixer.positions, pdb_file_in_mem, keepIds=True)
         pdb_file_in_mem.seek(0)
 
         return pdb_file_in_mem
@@ -242,6 +288,18 @@ class AtomisticNonBondedForceModel:
         ]
         if all_h:
             self.modeller.delete(all_h)
+
+        # Detect disulfide bonds (SG-SG distance-based) and add them to the
+        # topology BEFORE addHydrogens(). addHydrogens() only assigns the
+        # CYX (no thiol H) variant to a cysteine that already has an
+        # explicit bond to another residue's SG; without this, every
+        # cysteine gets a normal HG even when two SG atoms sit ~2 Å apart in
+        # the real structure, which detonates into a huge non-bonded clash
+        # (NaN coordinates) once dynamics starts. Must run after the H-strip
+        # above, since createDisulfideBonds() only considers a CYS a
+        # candidate if it currently has no HG atom.
+        self.modeller.topology.createDisulfideBonds(self.modeller.positions)
+
         self.modeller.addHydrogens(self.forcefield, pH=7.0)
 
         # Store protein residue indices before adding water
@@ -375,9 +433,17 @@ class AtomisticNonBondedForceModel:
             'BHD',
         }
         self.protein_residue_indices = []
+        dummy_mask = []
         for i, residue in enumerate(self.modeller.topology.residues()):
             if residue.name in protein_resnames:
                 self.protein_residue_indices.append(i)
+                key = (residue.chain.id, residue.id)
+                dummy_mask.append(key not in self._original_residue_keys)
+        self._dummy_residue_mask = np.array(dummy_mask, dtype=bool)
+        n_dummy = int(self._dummy_residue_mask.sum())
+        if n_dummy:
+            print(f"  INFO: {n_dummy} residue(s) gap-filled by PDBFixer will be "
+                  "excluded from the output maps (modeled, not experimentally resolved)")
 
     def _build_residue_atom_mapping(self) -> None:
         """Build a mapping from residue index to atom indices."""
@@ -1166,32 +1232,48 @@ class AtomisticNonBondedForceModel:
 
         # Run equilibration in chunks for monitoring
         steps_run = 0
+        npt_diverged = False
         while steps_run < steps:
             chunk = min(check_interval, steps - steps_run)
-            self.simulation.step(chunk)
-            steps_run += chunk
+            try:
+                self.simulation.step(chunk)
+                steps_run += chunk
 
-            # Update CA restraint reference positions to track NPT barostat
-            # coordinate rescaling — prevents growing forces from position/box mismatch
-            if self._restraint_force is not None and self._ca_indices:
-                pos_state = self.simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
-                current_positions = pos_state.getPositions()
-                del pos_state
-                for i, atom_idx in enumerate(self._ca_indices):
-                    pos = list(current_positions[atom_idx].value_in_unit(nanometers))
-                    self._restraint_force.setParticleParameters(i, atom_idx, pos)
-                self._restraint_force.updateParametersInContext(self.simulation.context)
+                # Update CA restraint reference positions to track NPT barostat
+                # coordinate rescaling — prevents growing forces from position/box mismatch
+                if self._restraint_force is not None and self._ca_indices:
+                    pos_state = self.simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
+                    current_positions = pos_state.getPositions()
+                    del pos_state
+                    for i, atom_idx in enumerate(self._ca_indices):
+                        pos = list(current_positions[atom_idx].value_in_unit(nanometers))
+                        self._restraint_force.setParticleParameters(i, atom_idx, pos)
+                    self._restraint_force.updateParametersInContext(self.simulation.context)
 
-            # Get current energy
-            state = self.simulation.context.getState(getEnergy=True)
-            current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
-            energy_history.append(current_energy)
-            
+                # Get current energy
+                state = self.simulation.context.getState(getEnergy=True)
+                current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+                energy_history.append(current_energy)
+            except Exception as e:
+                # The barostat can occasionally destabilize a system (e.g. a
+                # box-volume move that leaves two atoms too close together)
+                # badly enough that OpenMM raises mid-step, before any of the
+                # energy-based checks below get a chance to see it coming —
+                # most commonly surfacing as "Particle coordinate is NaN."
+                # Treat this the same as the post-loop invalid-positions case
+                # already handled below: revert to pre-NPT positions and move
+                # on rather than crashing the whole pipeline for this protein.
+                print(f"  WARNING: NPT equilibration diverged at step {steps_run}: {e}")
+                print("  Reverting to positions before NPT equilibration and skipping the rest of NPT")
+                self._clear_exception_traceback()
+                npt_diverged = True
+                break
+
             # Log energy (debug mode)
             if self.debug:
                 time_ps = steps_run * timestep_ps
                 self._log_energy('npt', time_ps, current_energy)
-            
+
             # Validate energy — skip comparing chunk 1 against pre-velocity initial
             # energy since that jump is expected when velocities are assigned at 310K.
             warnings_list = self._validate_energy(
@@ -1202,7 +1284,13 @@ class AtomisticNonBondedForceModel:
             for w in warnings_list:
                 warnings.warn(w)
                 print(f"  {w}")
-        
+
+        if npt_diverged:
+            self.positions = self._pre_npt_positions
+            self.cleanup_all_resources(final_run=False)
+            print("NPT equilibration complete (diverged; reverted to pre-NPT positions).")
+            return
+
         # Final energy check
         final_state = self.simulation.context.getState(getEnergy=True)
         final_energy = final_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
@@ -1317,23 +1405,42 @@ class AtomisticNonBondedForceModel:
         if self.debug:
             self._log_energy('nvt', 0.0, initial_energy)
         
+        # Snapshot positions before stepping so a mid-run divergence can be
+        # reverted rather than propagating a hard crash (mirrors
+        # equilibrate_npt's _pre_npt_positions handling).
+        self._pre_nvt_positions = self.positions
+
         # Run equilibration in chunks for monitoring
         steps_run = 0
+        nvt_diverged = False
         while steps_run < steps:
             chunk = min(check_interval, steps - steps_run)
-            self.simulation.step(chunk)
-            steps_run += chunk
-            
-            # Get current energy
-            state = self.simulation.context.getState(getEnergy=True)
-            current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
-            energy_history.append(current_energy)
-            
+            try:
+                self.simulation.step(chunk)
+                steps_run += chunk
+
+                # Get current energy
+                state = self.simulation.context.getState(getEnergy=True)
+                current_energy = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+                energy_history.append(current_energy)
+            except Exception as e:
+                # A bad clash or thermalization spike can occasionally blow up
+                # mid-step, before any of the energy-based checks below get a
+                # chance to see it coming — most commonly surfacing as
+                # "Particle coordinate is NaN." Revert to pre-NVT positions
+                # and move on rather than crashing the whole pipeline for
+                # this protein (mirrors equilibrate_npt's recovery).
+                print(f"  WARNING: NVT equilibration diverged at step {steps_run}: {e}")
+                print("  Reverting to positions before NVT equilibration and skipping the rest of NVT")
+                self._clear_exception_traceback()
+                nvt_diverged = True
+                break
+
             # Log energy (debug mode)
             if self.debug:
                 time_ps = steps_run * timestep_ps
                 self._log_energy('nvt', time_ps, current_energy)
-            
+
             # Validate energy — skip first-chunk comparison: the jump from a
             # zero-temperature minimized state to 310 K is expected and large.
             warnings_list = self._validate_energy(
@@ -1344,7 +1451,13 @@ class AtomisticNonBondedForceModel:
             for w in warnings_list:
                 warnings.warn(w)
                 print(f"  {w}")
-        
+
+        if nvt_diverged:
+            self.positions = self._pre_nvt_positions
+            self.cleanup_all_resources(final_run=False)
+            print("NVT equilibration complete (diverged; reverted to pre-NVT positions).")
+            return
+
         # Final energy check
         final_state = self.simulation.context.getState(getEnergy=True)
         final_energy = final_state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
@@ -1695,9 +1808,19 @@ class AtomisticNonBondedForceModel:
 
         print("Production MD complete.")
 
-        return [vdw_energy_attractive_avg, vdw_energy_repulsive_avg,
-                es_energy_attractive_avg, es_energy_repulsive_avg,
-                dist_avg]
+        results = [vdw_energy_attractive_avg, vdw_energy_repulsive_avg,
+                   es_energy_attractive_avg, es_energy_repulsive_avg,
+                   dist_avg]
+
+        # Strip gap-filled (modeled, not experimentally resolved) residue
+        # rows/columns so the returned N×N matrices match the real sequence
+        # length expected by ProteogramV2 — mirrors
+        # MartiniNonBondedForceModel.run_production()'s dummy-bead stripping.
+        if np.any(self._dummy_residue_mask):
+            real = ~self._dummy_residue_mask
+            results = [m[np.ix_(real, real)] for m in results]
+
+        return results
 
 
     def _get_context(self) -> Context:
