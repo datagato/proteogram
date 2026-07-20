@@ -164,6 +164,43 @@ class AtomisticNonBondedForceModel:
         self.cleanup_all_resources()
         return False
 
+    @staticmethod
+    def _bridge_unannotated_gaps(fixer: PDBFixer) -> None:
+        """Bridge chain-internal residue-numbering gaps that SEQRES didn't cover.
+
+        Some source PDB files (e.g. SCOP/ASTRAL pdbstyle domain excerpts,
+        which strip SEQRES) have a genuine break in resolved density — a
+        jump in residue numbering within one chain — that
+        fixer.findMissingResidues() can't see, since it only places gaps
+        against a known SEQRES sequence. Left unbridged, OpenMM's
+        PDB-bond-inference step still draws an ordinary peptide bond
+        between the two residues flanking the gap (ignoring the real-space
+        distance between them), which produces a residue that matches a
+        terminal template (e.g. CGLY, if the pre-gap residue carries an
+        OXT) but has one extra external bond the template disallows —
+        OpenMM's "No template found ... externally bonded atoms" error.
+
+        This fills such gaps with placeholder GLY residues using
+        PDBFixer's own missingResidues/addMissingAtoms machinery — the
+        same mechanism used for ordinary SEQRES-covered gaps — so the
+        chain stays a single, physically continuous chain (no TER/chain
+        split). Like other gap-filled residues, these get modeled (not
+        experimentally determined) coordinates and are excluded from the
+        final maps by _identify_protein_residues().
+        """
+        for chain in fixer.topology.chains():
+            residues = list(chain.residues())
+            for i in range(1, len(residues)):
+                try:
+                    prev_id = int(residues[i - 1].id)
+                    curr_id = int(residues[i].id)
+                except ValueError:
+                    continue  # non-numeric (e.g. insertion-coded) residue id
+                gap = curr_id - prev_id - 1
+                key = (chain.index, i)
+                if gap > 0 and key not in fixer.missingResidues:
+                    fixer.missingResidues[key] = ['GLY'] * gap
+
     def fix_pdb_file(self, pdb_path: str) -> io.StringIO:
         """Fix a PDB structure for input to MD simulation.
 
@@ -210,6 +247,7 @@ class AtomisticNonBondedForceModel:
         }
 
         fixer.findMissingResidues()
+        self._bridge_unannotated_gaps(fixer)
         fixer.findNonstandardResidues()
         fixer.replaceNonstandardResidues()
 
@@ -221,6 +259,16 @@ class AtomisticNonBondedForceModel:
             if res.name in MODIFIED_RESIDUES_TO_STANDARD:
                 print(f"  INFO: Pre-renaming {res.name} → {MODIFIED_RESIDUES_TO_STANDARD[res.name]} before hetatm removal")
                 res.name = MODIFIED_RESIDUES_TO_STANDARD[res.name]
+
+        # Rename UNK (unresolved side chain) residues too, and for the same
+        # reason: this must happen before findMissingAtoms()/addMissingAtoms()/
+        # addMissingHydrogens() below, since those look up each residue's
+        # template by name and have no entry for "UNK". Without this, a UNK
+        # residue that happens to be a genuine chain terminus never gets its
+        # OXT (findMissingAtoms can't tell a nameless template needs one),
+        # and later fails template matching as an ALA/GLY missing its
+        # external bond ("Is the chain missing a terminal capping group?").
+        self._replace_unknown_residues(fixer.topology)
 
         fixer.removeHeterogens(keepWater=False)
         fixer.findMissingAtoms()
@@ -359,6 +407,34 @@ class AtomisticNonBondedForceModel:
                     for atom in residue.atoms():
                         if atom.name in atom_name_fixes[original_name]:
                             atom.name = atom_name_fixes[original_name][atom.name]
+
+    @staticmethod
+    def _replace_unknown_residues(topology) -> None:
+        """Replace UNK (unresolved side chain) residues with a matching standard residue.
+
+        Low-resolution/cryo-EM structures commonly model a residue whose side
+        chain density couldn't be interpreted as "UNK" with only backbone
+        atoms (N, CA, C, O), optionally plus CB. No AMBER residue is named
+        "UNK", so PDBFixer/OpenMM can't look up its template, missing atoms,
+        or hydrogens for it.
+
+        Renamed to GLY (backbone only) or ALA (backbone + CB) to match
+        whichever heavy atoms are actually present; any atoms beyond that
+        (there shouldn't be any) are stripped afterwards by
+        _delete_extra_atoms_from_templates(). UNK residues are already
+        excluded from _original_residue_keys (captured before this runs),
+        matching ProteogramV2's own allowed_amino_acids, which doesn't
+        count UNK either — so they stay excluded from the output maps
+        after this rename, same as any other gap-filled residue.
+        """
+        for residue in topology.residues():
+            if residue.name != 'UNK':
+                continue
+            has_cb = any(atom.name == 'CB' for atom in residue.atoms())
+            standard_name = 'ALA' if has_cb else 'GLY'
+            print(f"  INFO: Converting UNK (residue {residue.index}) to {standard_name} "
+                  "(unresolved side chain, renamed to match its backbone atoms)")
+            residue.name = standard_name
 
     def _delete_extra_atoms_from_templates(self) -> None:
         """Delete non-standard heavy atoms left over from renamed modified residues.
@@ -501,13 +577,22 @@ class AtomisticNonBondedForceModel:
 
 
     def _create_new_simulation(self,
-                        hbonds_constraint: bool = False,
+                        hbonds_constraint: bool = True,
                         add_calpha_restraint: bool = False,
                         add_barostat: bool = False) -> None:
         """Create an OpenMM simulation object.
 
         Args:
             hbonds_constraint (bool): Whether to constrain hydrogen bonds.
+                Defaults to True — matches setup_system()'s self.system and
+                is required for stability at the class's 2 fs timestep.
+                Polar hydrogens (bonded to O/N) have zero AMBER LJ radius,
+                so without this, nothing stops an unconstrained O-H/N-H bond
+                from stretching under electrostatic attraction toward a
+                nearby opposite-charge atom (e.g. a real H-bond partner) —
+                minimization can get stuck with the two nearly coincident,
+                which then reliably blows up into "Particle coordinate is
+                NaN" once real dynamics starts.
             add_barostat (bool): Whether to add a barostat for NPT simulation.
             add_calpha_restraint (bool): Whether to add constraints to CA atoms.
         """
@@ -1651,7 +1736,6 @@ class AtomisticNonBondedForceModel:
         
         # Create fresh simulation for production
         self._create_new_simulation(
-            hbonds_constraint=False,
             add_calpha_restraint=False,
             add_barostat=False)
         
