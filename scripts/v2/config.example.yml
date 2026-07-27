@@ -41,6 +41,11 @@ model_file_prefix: 'scope_cnn_model' # parameters will be appended to this prefi
 proteograms_for_sim_dir: '' # input proteogram dir for similarity search
 model_file: './<path>/scope_cnn_model.pt' # model file for embedding proteograms for similarity search
 top_k: 5
+# Pad target for search images in measure_similarity_v2.py (CNN/ResNet18 only).
+# MUST match the --max_image_size the model was trained with, or larger proteins
+# get cropped and smaller ones reframed at the wrong scale at search time. Set to
+# 300 when evaluating checkpoints trained with --max_image_size 300 (the CG set).
+search_pad_size: 200
 embed_file_exists: 'False' # either "True" or "False" if you have "embeddings.pt"
 embed_file: './<path>/embeddings.pt' # name of pytorch tensors file representing embeddings of proteograms
 search_images_dir: './<path>/search_images_dir' # search results (top k protegram hits per query)

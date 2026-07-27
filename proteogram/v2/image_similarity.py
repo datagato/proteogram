@@ -15,7 +15,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn as nn
 import torchvision.models as models
-from torchvision.models.vision_transformer import vit_b_16
 import torchvision.transforms as transforms
 
 from kmeans_pytorch import kmeans
@@ -81,10 +80,24 @@ class Img2Vec:
         self.architecture = self.validate_model(model_name_or_path)
         if self.architecture == "resnet_ft":
             weights = model_name_or_path
-        self.vit_model = None
-        if self.architecture == "vit_b_16":
-            self.vit_model = vit_b_16()
-            self.vit_model = self.vit_model.to(self.device).eval()
+        # Set by _model_from_state_dict() when a fine-tuned checkpoint loaded
+        # via "resnet_ft" turns out to be a ViT-B/16 (see train_multiple_models_
+        # randomized_eval.py --model vit), so embed_image() can route it through
+        # the ViT-specific forward pass instead of a plain nn.Sequential call.
+        self._ft_is_vit = False
+        # Set by initiate_model() when a fine-tuned checkpoint carries the
+        # {'state_dict':..., 'meta':...} embedding format (see
+        # train_multiple_models_randomized_eval.py --loss triplet_hierarchy).
+        # Such checkpoints have no classification head to strip -- the fc
+        # projection *is* the trained embedding -- so obtain_children() must
+        # keep the whole model instead of stripping fc like the classifier case.
+        self._ft_is_embedding = False
+        # Populated by initiate_model() from a self-describing embedding
+        # checkpoint's 'meta' dict (kind/architecture/embed_dim/max_image_size).
+        # Empty for legacy bare-state_dict checkpoints. Lets callers (e.g.
+        # measure_similarity_v2.py) recover the training max_image_size so
+        # search-time padding matches automatically.
+        self.embedding_meta = {}
         self.weights = weights
         self.transform = self.assign_transform(weights)
         self.model = self.initiate_model()
@@ -148,6 +161,16 @@ class Img2Vec:
                                 map_location=self.device)
             if isinstance(loaded, nn.Module):
                 model = loaded
+            elif isinstance(loaded, dict) and 'state_dict' in loaded and 'meta' in loaded:
+                # Self-describing checkpoint: {'state_dict':..., 'meta':...}.
+                # Used for embedding models (--loss triplet_hierarchy) whose
+                # state-dict keys are otherwise indistinguishable from a
+                # classifier checkpoint (both are a bare fc.1.weight/fc.1.bias
+                # Sequential(Dropout, Linear) head -- only the *meaning* of the
+                # final Linear's output differs: class logits vs. an embedding).
+                self.embedding_meta = dict(loaded['meta'])
+                model = self._model_from_meta(loaded['meta'])
+                model.load_state_dict(loaded['state_dict'])
             else:
                 # State dict saved with torch.save(model.state_dict()).
                 # Auto-detect architecture from key signatures.
@@ -159,10 +182,30 @@ class Img2Vec:
         model.to(self.device)
         return model.eval()
 
+    def _model_from_meta(self, meta):
+        """Reconstruct a model from the self-describing {'state_dict', 'meta'}
+        checkpoint format (currently only embedding checkpoints use this --
+        see train_multiple_models_randomized_eval.py --loss triplet_hierarchy
+        and build_resnet18_embedding())."""
+        import torchvision.models as tv_models
+
+        if meta.get('kind') == 'embedding' and meta.get('architecture') == 'resnet18':
+            self._ft_is_embedding = True
+            model = tv_models.resnet18()
+            model.fc = nn.Sequential(
+                nn.Dropout(0.5),
+                nn.Linear(model.fc.in_features, meta['embed_dim']),
+            )
+            return model
+        raise ValueError(f"Unrecognized checkpoint meta: {meta}")
+
     def _model_from_state_dict(self, state_dict):
         """Reconstruct a model object from a bare state dict.
 
         Detects architecture by inspecting state dict keys:
+          - 'conv_proj.weight' -> ViT-B/16 with nn.Sequential(Dropout, Linear) head
+                              (saved by train_multiple_models_randomized_eval.py
+                              --model vit)
           - 'fc.1.weight'  -> ResNet18 with nn.Sequential(Dropout, Linear) head
                               (saved by train_multiple_models.py --model resnet18)
           - 'fc.weight'    -> ResNet18 with plain nn.Linear head (legacy format)
@@ -171,7 +214,12 @@ class Img2Vec:
         """
         import torchvision.models as tv_models
 
-        if 'fc.1.weight' in state_dict:
+        if 'conv_proj.weight' in state_dict:
+            # ViT-B/16 with nn.Sequential(Dropout(0.5), Linear) head
+            num_classes = state_dict['heads.1.weight'].shape[0]
+            model = self._build_vit(num_classes)
+            self._ft_is_vit = True
+        elif 'fc.1.weight' in state_dict:
             # ResNet18 with nn.Sequential(Dropout(0.5), Linear) head
             num_classes = state_dict['fc.1.weight'].shape[0]
             model = tv_models.resnet18()
@@ -193,6 +241,20 @@ class Img2Vec:
                 f"Cannot infer model architecture from state dict keys. "
                 f"First 10 keys: {list(state_dict.keys())[:10]}"
             )
+        return model
+
+    @staticmethod
+    def _build_vit(num_classes):
+        """Reconstruct the fine-tuned ViT-B/16 used in
+        train_multiple_models_randomized_eval.py (--model vit)."""
+        import torchvision.models as tv_models
+
+        model = tv_models.vit_b_16(weights=None)
+        in_features = model.heads.head.in_features
+        model.heads = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(in_features, num_classes),
+        )
         return model
 
     @staticmethod
@@ -234,6 +296,21 @@ class Img2Vec:
         return model_embed
 
     def obtain_children(self):
+        if self._ft_is_vit:
+            # ViT-B/16: can't strip the head with a plain nn.Sequential slice like
+            # the CNN/ResNet18 cases below — the encoder expects a CLS token
+            # prepended to the patch embeddings, which embed_image() handles via
+            # self.model._process_input()/class_token before calling self.embed().
+            # So self.embed is just the pretrained/fine-tuned encoder itself.
+            return self.model.encoder
+
+        if self._ft_is_embedding:
+            # Trained end-to-end for retrieval (HierarchicalTripletLoss): fc is
+            # the trained embedding projection, not a classification head to
+            # strip. self.model's own forward already does avgpool -> flatten
+            # -> fc, giving a (batch, embed_dim) output directly.
+            return self.model
+
         children = list(self.model.children())
         # ConvNet: children[-1]=fc2, children[-2]=fc1 — strip both and add Flatten
         # so the GAP output (batch, 256, 1, 1) is correctly flattened to (batch, 256).
@@ -303,12 +380,17 @@ class Img2Vec:
         # load and preprocess image
         img = Image.open(img_file)
         with torch.no_grad():
-            if self.architecture == "vit_b_16":
+            if self.architecture == "vit_b_16" or self._ft_is_vit:
+                # self.model holds the actually-loaded weights in both cases:
+                # pretrained ImageNet weights for "vit_b_16", or the fine-tuned
+                # checkpoint for "resnet_ft". _process_input()/class_token must
+                # come from the same model instance as self.embed (its encoder),
+                # otherwise patch embeddings and the encoder use mismatched weights.
                 img_trans = self.transform(img)
                 img_trans = img_trans.unsqueeze(0).to(self.device)
-                img_trans = self.vit_model._process_input(img_trans)
+                img_trans = self.model._process_input(img_trans)
                 n = img_trans.shape[0]
-                batch_class_token = self.vit_model.class_token.expand(n, -1, -1)
+                batch_class_token = self.model.class_token.expand(n, -1, -1)
                 img_trans = torch.cat([batch_class_token, img_trans], dim=1)
                 embedded_img = self.embed(img_trans)[:, 0]
             else:

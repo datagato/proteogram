@@ -2,6 +2,7 @@
 Proteogram (image) search
 """
 import argparse
+import functools
 from time import time
 import glob
 import os
@@ -61,6 +62,10 @@ if __name__ == '__main__':
     results_file = config['proteogram_sim_results']
     dataset_dir = config['proteograms_for_sim_dir']
     save_images_dir = config['search_images_dir']
+    # Fallback pad target from config -- used only when the checkpoint doesn't
+    # self-describe its training max_image_size (see below). Defaults to 200 for
+    # backward compatibility with older 200px-trained checkpoints.
+    config_pad_size = config.get('search_pad_size', 200)
 
     def _confirm_overwrite(path, label, is_dir=False):
         """Prompt user to overwrite an existing file/dir; return True if proceeding."""
@@ -115,12 +120,41 @@ if __name__ == '__main__':
     start = time()
     # Initialize Img2Vec with model from torchvision
     img_sim = Img2Vec(model_file, dataset_dir=prot_files, weights='DEFAULT', device=device)
-    # Override transform to match training: pad to 200x200 with gray rather than resize
-    img_sim.transform = transforms.Compose([
-        transforms.Lambda(lambda img: pad_to_size(img, target=200)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+
+    # Resolve the search-time pad target. Prefer the checkpoint's own recorded
+    # max_image_size (embedding checkpoints self-describe it via meta) so it can
+    # never silently mismatch training; fall back to config's search_pad_size
+    # for legacy checkpoints that don't carry it.
+    meta_pad_size = img_sim.embedding_meta.get('max_image_size')
+    if meta_pad_size:
+        search_pad_size = meta_pad_size
+        print(f'Using pad target {search_pad_size} from checkpoint meta '
+              f'(max_image_size at training).')
+        if search_pad_size != config_pad_size:
+            print(f'  Note: overrides config search_pad_size={config_pad_size}.')
+    else:
+        search_pad_size = config_pad_size
+    _pad_fn = functools.partial(pad_to_size, target=search_pad_size)
+
+    # Override transform to match training. ViT-B/16 checkpoints (trained with
+    # --model vit) always resize to a fixed 224x224 (never pad) -- see
+    # train_multiple_models_randomized_eval.py -- while CNN/ResNet18 checkpoints
+    # are trained on proteograms padded (gray) to 200x200. Using the wrong one
+    # here causes a shape mismatch at inference (ViT hard-asserts 224x224 input).
+    if img_sim._ft_is_vit:
+        img_sim.transform = transforms.Compose([
+            transforms.Lambda(lambda img: img.convert('RGB').resize((224, 224))),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    else:
+        img_sim.transform = transforms.Compose([
+            transforms.Lambda(lambda img: pad_to_size(img, target=search_pad_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        print(f'Padding search images to {search_pad_size}x{search_pad_size} '
+              f'(set search_pad_size in config.yml to match training --max_image_size).')
     print(f'Took {time()-start} seconds to initialize Img2Vec object.')
 
     # Create dataset and create embeddings
@@ -145,7 +179,7 @@ if __name__ == '__main__':
         n_results = len(prot_files)  # all including self-hit
         sim_time = img_sim.similarities(n=n_results,
                                         save_result_images_dir=None,
-                                        pad_fn=pad_to_size)
+                                        pad_fn=_pad_fn)
 
         # Save top-k result images with padding
         full_sim_dict = {k: list(v) for k, v in img_sim.sim_dict.items()}
@@ -153,7 +187,7 @@ if __name__ == '__main__':
             img_sim.sim_dict[image_path] = full_sim_dict[image_path][:top_k]
             img_sim.save_images(os.path.join(dataset_dir, image_path), save_images_dir,
                                 scores_n_arr=img_sim.sim_dict[image_path],
-                                pad_fn=pad_to_size, corpus_dir=dataset_dir)
+                                pad_fn=_pad_fn, corpus_dir=dataset_dir)
         img_sim.sim_dict = full_sim_dict  # restore all results for CSV
 
         print(f'Took {sim_time} seconds to calculate similarities / perform search.')

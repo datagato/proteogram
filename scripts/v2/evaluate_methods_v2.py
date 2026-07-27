@@ -198,6 +198,11 @@ def read_usalign_results(usalign_results):
     USalign does not return this data/score (self to self).
     """
     usalign_df = pd.read_csv(usalign_results, sep='\t')
+    n_before = usalign_df.shape[0]
+    usalign_df = usalign_df.dropna(subset=['#PDBchain1', 'PDBchain2']).reset_index(drop=True)
+    n_dropped = n_before - usalign_df.shape[0]
+    if n_dropped:
+        print(f'WARNING: {n_dropped} USalign rows skipped (missing PDBchain1/PDBchain2).')
     data = {}
 
     # dict of ordereddict:
