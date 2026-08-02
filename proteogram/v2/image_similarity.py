@@ -92,11 +92,13 @@ class Img2Vec:
         # projection *is* the trained embedding -- so obtain_children() must
         # keep the whole model instead of stripping fc like the classifier case.
         self._ft_is_embedding = False
-        # Populated by initiate_model() from a self-describing embedding
-        # checkpoint's 'meta' dict (kind/architecture/embed_dim/max_image_size).
-        # Empty for legacy bare-state_dict checkpoints. Lets callers (e.g.
-        # measure_similarity_v2.py) recover the training max_image_size so
-        # search-time padding matches automatically.
+        # Populated by initiate_model() from a self-describing checkpoint's
+        # 'meta' dict -- both embedding (--loss triplet_hierarchy) and
+        # classifier (CE/focal) checkpoints carry one (input_size/resize/
+        # max_image_size, plus kind). Empty for legacy bare-state_dict
+        # checkpoints. Lets callers (e.g. measure_similarity_v2.py) recover the
+        # training grid + pad/resize mode so search-time preprocessing matches
+        # automatically.
         self.embedding_meta = {}
         self.weights = weights
         self.transform = self.assign_transform(weights)
@@ -163,13 +165,15 @@ class Img2Vec:
                 model = loaded
             elif isinstance(loaded, dict) and 'state_dict' in loaded and 'meta' in loaded:
                 # Self-describing checkpoint: {'state_dict':..., 'meta':...}.
-                # Used for embedding models (--loss triplet_hierarchy) whose
-                # state-dict keys are otherwise indistinguishable from a
-                # classifier checkpoint (both are a bare fc.1.weight/fc.1.bias
-                # Sequential(Dropout, Linear) head -- only the *meaning* of the
-                # final Linear's output differs: class logits vs. an embedding).
+                # Both embedding (--loss triplet_hierarchy) and classifier
+                # (CE/focal) checkpoints use this so search-time preprocessing
+                # (grid/resize) can be recovered from the meta. The meta 'kind'
+                # disambiguates the two -- their fc.1.weight/fc.1.bias key
+                # signatures are otherwise identical, only the *meaning* of the
+                # final Linear differs (an embedding vs. class logits), which
+                # also determines whether obtain_children keeps or strips it.
                 self.embedding_meta = dict(loaded['meta'])
-                model = self._model_from_meta(loaded['meta'])
+                model = self._model_from_meta(loaded['meta'], loaded['state_dict'])
                 model.load_state_dict(loaded['state_dict'])
             else:
                 # State dict saved with torch.save(model.state_dict()).
@@ -182,14 +186,23 @@ class Img2Vec:
         model.to(self.device)
         return model.eval()
 
-    def _model_from_meta(self, meta):
+    def _model_from_meta(self, meta, state_dict):
         """Reconstruct a model from the self-describing {'state_dict', 'meta'}
-        checkpoint format (currently only embedding checkpoints use this --
-        see train_multiple_models_randomized_eval.py --loss triplet_hierarchy
-        and build_resnet18_embedding())."""
+        checkpoint format written by train_multiple_models_randomized_eval.py.
+
+          - kind='embedding'  (--loss triplet_hierarchy): fc is the trained
+            embedding projection; keep the whole model (obtain_children returns
+            it unstripped). Architecture is rebuilt from the meta.
+          - kind='classifier' (CE/focal): fc is a classification head to strip;
+            the penultimate features are the retrieval embedding. The
+            architecture is recovered from the state_dict key signatures (same
+            path as legacy bare checkpoints), so the meta only needs to carry
+            preprocessing info (input_size/resize).
+        """
         import torchvision.models as tv_models
 
-        if meta.get('kind') == 'embedding' and meta.get('architecture') == 'resnet18':
+        kind = meta.get('kind')
+        if kind == 'embedding' and meta.get('architecture') == 'resnet18':
             self._ft_is_embedding = True
             model = tv_models.resnet18()
             model.fc = nn.Sequential(
@@ -197,6 +210,10 @@ class Img2Vec:
                 nn.Linear(model.fc.in_features, meta['embed_dim']),
             )
             return model
+        if kind == 'classifier':
+            # _ft_is_embedding stays False (head gets stripped); _ft_is_vit is
+            # set by _model_from_state_dict if the keys are ViT's.
+            return self._model_from_state_dict(state_dict)
         raise ValueError(f"Unrecognized checkpoint meta: {meta}")
 
     def _model_from_state_dict(self, state_dict):

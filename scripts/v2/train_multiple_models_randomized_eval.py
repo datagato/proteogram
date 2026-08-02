@@ -21,6 +21,8 @@ HierarchicalPKSampler using P-K sampling (--triplet_p, --triplet_k) so the model
 an embedding space for retrieval across the whole hierarchy at once rather than a
 classifier for one level. See proteogram/v2/losses.py for the loss implementations.
 
+Note on reproducibility and the use of --test_list (to skip the random split and repeat using the same test set from a previous run): because the test set is applied on top of the current eligibility filters, if you change min_family_size/max_image_size/min_class_size between runs, some listed proteins may get filtered out (you'll see the WARNING with the count) — so keep those filters consistent with the run that generated the list if you want the test set identical.
+
  Usage example:
     python train_multiple_models_randomized_eval.py --model resnet18 --epochs 50 --batch_size 32 --lr 1e-4 --seed 42
     python train_multiple_models_randomized_eval.py --model vit --epochs 50 --batch_size 16 --lr 1e-4 --seed 42
@@ -912,12 +914,37 @@ if __name__ == '__main__':
     parser.add_argument('--save_test_list',
                         action='store_true',
                         help="Flag to save the list of test set image filenames to a text file for later " "reference.")
+    parser.add_argument('--test_list',
+                        type=str,
+                        default=None,
+                        help="Path to a file of test/eval protein prefixes (one SCOPeID per "
+                             "line, e.g. as written by --save_test_list). When given, the "
+                             "held-out test set is exactly the eligible proteograms whose prefix "
+                             "is in this list (instead of a random --test_size split), and "
+                             "train/val are a random split of the remaining eligible proteograms "
+                             "(--val_size is then the validation fraction of that remainder). "
+                             "--test_size is ignored. Lets you repeat training against the same "
+                             "fixed test set across runs.")
     parser.add_argument('--max_image_size',
                         type=int,
                         default=200,
-                        help="Pad proteogram images to this square size (pixels) and exclude any "
-                             "images larger than this value. Equivalent to filtering by max sequence "
-                             "length. Default: 200.")
+                        help="Residue/pixel cutoff: exclude any proteogram larger than this "
+                             "(equivalent to filtering by max sequence length). Also the default "
+                             "target grid size when --input_size is not given. In pad mode this "
+                             "is both the cutoff and the pad target (so nothing exceeds the grid); "
+                             "in --resize mode it is purely the inclusion cutoff, and you can set a "
+                             "smaller --input_size to resize large proteins down. Default: 200.")
+    parser.add_argument('--input_size',
+                        type=int,
+                        default=None,
+                        help="Square target grid (pixels) each proteogram is padded/resized to "
+                             "before the network. Decouples the model input size from the "
+                             "--max_image_size residue cutoff. Defaults to --max_image_size "
+                             "(backward compatible). Most useful with --resize: e.g. "
+                             "'--max_image_size 750 --resize --input_size 256' includes proteins "
+                             "up to 750 residues but resizes them down to an efficient 256x256. "
+                             "In pad mode --input_size must be >= --max_image_size (padding cannot "
+                             "shrink an image larger than the grid).")
     parser.add_argument('--exclude_classes', '-x',
                         type=str,
                         default=None,
@@ -1079,22 +1106,39 @@ if __name__ == '__main__':
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    image_resize = args.max_image_size
+    # Target grid the network sees. Decoupled from the --max_image_size residue
+    # cutoff: --input_size sets the grid, defaulting to --max_image_size so
+    # existing commands are unchanged.
+    image_resize = args.input_size if args.input_size else args.max_image_size
+
+    # In pad mode the grid must be at least as large as the cutoff, or an
+    # included image bigger than the grid can't be padded down to it (padding
+    # never shrinks), producing mismatched shapes the DataLoader can't batch.
+    # Resize mode has no such constraint -- any size is squashed to the grid.
+    if not args.resize and image_resize < args.max_image_size:
+        raise ValueError(
+            f'--input_size ({image_resize}) is smaller than --max_image_size '
+            f'({args.max_image_size}) in pad mode. Padding cannot shrink images larger '
+            f'than the grid. Use --resize to downscale large proteins, or set '
+            f'--input_size >= --max_image_size.')
 
     # ViT-B/16 has fixed, learned positional embeddings sized for a 224x224 input
     # (16x16 patches), so it cannot accept the padded/variable-size images the
     # CNN and ResNet18 paths use. Always resize (never pad) to exactly 224x224
-    # for the ViT path, regardless of what was passed via --resize/--max_image_size.
+    # for the ViT path, regardless of what was passed via --resize/--input_size.
     if args.model == 'vit':
         if not args.resize:
             print('ViT-B/16 requires resizing (not padding) to a fixed input size; '
                   'forcing --resize.')
             args.resize = True
         if image_resize != 224:
-            print(f'ViT-B/16 requires 224x224 input; overriding --max_image_size from '
+            print(f'ViT-B/16 requires 224x224 input; overriding input grid from '
                   f'{image_resize} to 224.')
             image_resize = 224
-            args.max_image_size = 224
+    if image_resize != args.max_image_size:
+        print(f'Input grid {image_resize}x{image_resize} '
+              f'({"resize" if args.resize else "pad"} mode); residue cutoff '
+              f'--max_image_size={args.max_image_size}.')
 
     # ResNet18 was trained with ImageNet normalisation (standardize input images to the same distribution as the data the model was pre-trained on)
     # so the pretrained feature detectors remain valid. The ConvNet was not pretrained, so it doesn't strictly require ImageNet normalisation, but applying the same normalisation to both models allows for a more controlled comparison.
@@ -1141,25 +1185,66 @@ if __name__ == '__main__':
     all_indices = list(range(len(full_dataset)))
     labels = full_dataset.labels
 
-    train_val_indices, test_indices = train_test_split(
-        all_indices,
-        test_size=args.test_size,
-        random_state=args.seed,
-        stratify=[labels[i] for i in all_indices])
+    if args.test_list:
+        # Static test set: held-out = eligible proteograms whose prefix is in
+        # the list; train/val are a random split of the remainder. Prefixes are
+        # matched against each file's basename-without-extension, the same form
+        # --save_test_list writes. Lets a run reproduce an exact test set even
+        # though train/val still vary with --seed. --test_size is ignored here.
+        with open(args.test_list) as f:
+            wanted = {line.strip() for line in f if line.strip()}
 
-    # val fraction relative to the train+val pool
-    val_fraction = args.val_size / (1.0 - args.test_size)
-    train_indices, val_indices = train_test_split(
-        train_val_indices,
-        test_size=val_fraction,
-        random_state=args.seed,
-        stratify=[labels[i] for i in train_val_indices])
+        def _prefix(i):
+            return os.path.splitext(os.path.basename(full_dataset.files[i]))[0]
+
+        test_indices = [i for i in all_indices if _prefix(i) in wanted]
+        pool_indices = [i for i in all_indices if _prefix(i) not in wanted]
+
+        missing = wanted - {_prefix(i) for i in test_indices}
+        if missing:
+            print(f'WARNING: {len(missing)} prefix(es) from --test_list not found among '
+                  f'eligible proteograms (excluded by the current filters, or absent from '
+                  f'--data_dir). Those proteins will NOT be in the test set. '
+                  f'First few: {sorted(missing)[:5]}')
+        if not test_indices:
+            raise RuntimeError('--test_list matched no eligible proteograms — check that its '
+                               'prefixes correspond to files in --data_dir and survive the '
+                               'active filters (min_class_size/min_family_size/max_image_size).')
+        if not pool_indices:
+            raise RuntimeError('--test_list covers every eligible proteogram — no data left '
+                               'for train/val.')
+        if not (0.0 < args.val_size < 1.0):
+            raise ValueError('--val_size must be in (0, 1) when using --test_list.')
+
+        train_indices, val_indices = train_test_split(
+            pool_indices,
+            test_size=args.val_size,
+            random_state=args.seed,
+            stratify=[labels[i] for i in pool_indices])
+        print(f'Static test list ({os.path.basename(args.test_list)}): '
+              f'{len(test_indices)} test held-out; remaining {len(pool_indices)} split '
+              f'(seed={args.seed}) into {len(train_indices)} train / {len(val_indices)} val '
+              f'(val = {args.val_size:.0%} of remainder; --test_size ignored).')
+    else:
+        train_val_indices, test_indices = train_test_split(
+            all_indices,
+            test_size=args.test_size,
+            random_state=args.seed,
+            stratify=[labels[i] for i in all_indices])
+
+        # val fraction relative to the train+val pool
+        val_fraction = args.val_size / (1.0 - args.test_size)
+        train_indices, val_indices = train_test_split(
+            train_val_indices,
+            test_size=val_fraction,
+            random_state=args.seed,
+            stratify=[labels[i] for i in train_val_indices])
+        print(f'Stratified split (seed={args.seed}): '
+              f'{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test (held-out)')
 
     train_split = TransformedSubset(Subset(full_dataset, train_indices), transform_train)
     val_split   = TransformedSubset(Subset(full_dataset, val_indices),   transform_eval)
     test_split  = TransformedSubset(Subset(full_dataset, test_indices),  transform_eval)
-    print(f'Stratified split (seed={args.seed}): '
-          f'{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test (held-out)')
 
     # WeightedRandomSampler: oversample minority classes so each epoch sees
     # a balanced class distribution regardless of raw class frequencies.
@@ -1255,8 +1340,9 @@ if __name__ == '__main__':
         for lvl in SCOPE_LEVELS:
             print(f'  {lvl:12s}: {test_patk[lvl]:.4f}')
 
+        _grid_tag = f'input{image_resize}_{"resize" if args.resize else "pad"}'
         suffix = (f'_{args.model}_lr{lr}_bs{args.triplet_p * args.triplet_k}_e{epochs_trained}_'
-                  f'seed{args.seed}_max_image_size{args.max_image_size}_'
+                  f'seed{args.seed}_max_image_size{args.max_image_size}_{_grid_tag}_'
                   f'min_class_size{args.min_class_size}_loss-triplet_hierarchy_'
                   f'embeddim{args.embed_dim}_famPatK{test_patk["family"]:.3f}')
 
@@ -1279,13 +1365,23 @@ if __name__ == '__main__':
             # embedding projection, not a head to strip.
             torch.save({
                 'state_dict': model.state_dict(),
-                # max_image_size is recorded so search-time padding
-                # (measure_similarity_v2.py) can match the training pad target
-                # automatically -- a mismatch silently crops larger proteins
-                # and reframes smaller ones at the wrong scale.
+                # Recorded so search-time preprocessing (measure_similarity_v2.py /
+                # query_similar_proteins.py) matches training automatically -- a
+                # mismatch silently crops or reframes proteins at the wrong scale:
+                #   input_size     = the GRID the network sees = pad/resize target.
+                #   max_image_size = the residue/pixel cutoff (largest protein the
+                #                    model saw); used only for the query-length
+                #                    cutoff, which differs from the grid in
+                #                    --resize + --input_size runs.
+                #   resize         = whether proteograms were resized (vs padded).
+                # For older/coupled runs (no --input_size) these two sizes are
+                # equal. Consumers prefer input_size for the grid, falling back to
+                # max_image_size only for legacy checkpoints that predate it.
                 'meta': {'kind': 'embedding', 'architecture': 'resnet18',
                          'embed_dim': args.embed_dim,
-                         'max_image_size': args.max_image_size},
+                         'input_size': image_resize,
+                         'max_image_size': args.max_image_size,
+                         'resize': args.resize},
             }, model_path)
             print(f'Saved model to {model_path}')
 
@@ -1352,7 +1448,8 @@ if __name__ == '__main__':
 
         loss_tag = f'focal_g{args.focal_gamma}' if args.loss == 'focal' else 'ce'
         model_tag = f'{args.model}_unfrozen{args.vit_unfrozen_blocks}' if args.model == 'vit' else args.model
-        suffix = f'_{model_tag}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_min_class_size{args.min_class_size}_level-{level}_loss{loss_tag}_acc{overall_accuracy}'
+        _grid_tag = f'input{image_resize}_{"resize" if args.resize else "pad"}'
+        suffix = f'_{model_tag}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_{_grid_tag}_min_class_size{args.min_class_size}_level-{level}_loss{loss_tag}_acc{overall_accuracy}'
 
         plot_losses(training_loss, val_loss,
                     fig_path=os.path.join(output_dir, f'loss_curves{suffix}.png'))
@@ -1364,8 +1461,21 @@ if __name__ == '__main__':
         if os.path.exists(model_path) and not args.overwrite:
             print(f'Model file {model_path} exists and overwrite not set, not saving model.')
         else:
-            # Save only the model weights
-            torch.save(model.state_dict(), model_path)
+            # Self-describing {'state_dict', 'meta'} format so search-time
+            # preprocessing (measure_similarity_v2.py / query_similar_proteins.py)
+            # matches training automatically -- same grid/resize fields as the
+            # embedding path. kind='classifier' tells Img2Vec to recover the
+            # architecture by key-sniffing and strip the classification head
+            # (penultimate features are the retrieval embedding), rather than
+            # keeping fc as an embedding projection. Older bare-state_dict CE
+            # checkpoints still load via Img2Vec's key-signature fallback.
+            torch.save({
+                'state_dict': model.state_dict(),
+                'meta': {'kind': 'classifier', 'architecture': args.model,
+                         'input_size': image_resize,
+                         'max_image_size': args.max_image_size,
+                         'resize': args.resize},
+            }, model_path)
             print(f'Saved model to {model_path}')
 
         if args.save_test_list:

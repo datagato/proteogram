@@ -68,11 +68,12 @@ def pad_to_size(img, target=200, fill=128):
     return PILImage.fromarray(arr.astype('uint8'))
 
 
-def read_checkpoint_max_image_size(model_file):
-    """Peek at a checkpoint's meta to recover the max_image_size it was trained
-    with. Embedding checkpoints (--loss triplet_hierarchy) self-describe it in a
-    {'state_dict':..., 'meta':...} dict; legacy bare-state_dict / ViT checkpoints
-    don't, so this returns None for those (callers fall back to a default).
+def read_checkpoint_meta(model_file):
+    """Peek at a checkpoint's meta dict. Embedding checkpoints (--loss
+    triplet_hierarchy) self-describe their training grid size (input_size /
+    max_image_size) and preprocessing mode (resize) in a {'state_dict':...,
+    'meta':...} dict; legacy bare-state_dict / ViT checkpoints don't, so this
+    returns {} for those (callers fall back to defaults).
 
     Loaded separately/early here because both the query-length cutoff and the
     proteogram creation happen before Img2Vec (which also exposes this via
@@ -82,10 +83,17 @@ def read_checkpoint_max_image_size(model_file):
     try:
         loaded = torch.load(model_file, weights_only=False, map_location='cpu')
     except Exception:
-        return None
+        return {}
     if isinstance(loaded, dict) and 'meta' in loaded:
-        return loaded['meta'].get('max_image_size')
-    return None
+        return dict(loaded['meta'])
+    return {}
+
+
+def checkpoint_grid_size(meta):
+    """Training grid size from a checkpoint meta dict (the pad/resize target).
+    Prefers input_size (clear name); falls back to max_image_size (older
+    checkpoints stored the grid there). None if absent."""
+    return meta.get('input_size') or meta.get('max_image_size')
 
 
 def load_annotations(annot_file):
@@ -155,13 +163,17 @@ if __name__ == '__main__':
                         help='Number of top similar proteins to return. '
                              'Defaults to top_k in config.yml.')
     parser.add_argument('--target_size', type=int, default=None,
-                        help='Size (in pixels, square) the query proteogram is padded '
-                             'to before embedding with a CNN/ResNet18 checkpoint. Must '
-                             'match the --max_image_size used when the model was '
-                             'trained. If omitted, taken from the checkpoint meta '
-                             '(embedding checkpoints self-describe max_image_size), '
-                             'falling back to 200 for legacy checkpoints. Ignored for '
-                             'ViT-B/16 checkpoints, which always resize to 224x224.')
+                        help='Size (in pixels, square) the query proteogram is padded/resized '
+                             'to before embedding with a CNN/ResNet18 checkpoint. Must match '
+                             'the training grid (input_size). If omitted, taken from the '
+                             'checkpoint meta (embedding checkpoints self-describe it), falling '
+                             'back to 200 for legacy checkpoints. Ignored for ViT-B/16 '
+                             'checkpoints, which always resize to 224x224.')
+    parser.add_argument('--resize', action=argparse.BooleanOptionalAction, default=None,
+                        help='Resize the query proteogram to the target grid instead of '
+                             'padding it. Must match how the model was trained (--resize). If '
+                             'omitted, taken from the checkpoint meta, falling back to padding '
+                             'for legacy checkpoints. Pass --no-resize to force padding.')
     parser.add_argument('--sequence_len_lower_cutoff', type=int, default=20,
                         help='Minimum chain length (residues) accepted for the query '
                              'protein. Default: 20.')
@@ -199,33 +211,70 @@ if __name__ == '__main__':
     else:
         cg_method = None if args.cg_method == 'atomistic' else args.cg_method
 
-    # Recover the training max_image_size from the checkpoint meta (if present)
-    # so the query pad target and length cutoff can match training automatically
-    # rather than defaulting to 200 and silently cropping/rescaling the query.
-    ckpt_max_image_size = read_checkpoint_max_image_size(model_file)
+    # Recover training preprocessing (grid size, pad-vs-resize mode, residue
+    # cutoff) from the checkpoint meta so the query is prepared exactly as the
+    # model was trained, rather than defaulting to pad-to-200 and silently
+    # cropping/rescaling. Peeked early because proteogram creation (which needs
+    # the length cutoff) precedes Img2Vec construction.
+    ckpt_meta = read_checkpoint_meta(model_file)
+    if ckpt_meta:
+        print(f'Checkpoint meta: {ckpt_meta}')
+    else:
+        print('Checkpoint meta: (none — legacy checkpoint; using CLI/defaults)')
+    ckpt_grid = checkpoint_grid_size(ckpt_meta)
+    ckpt_resize = ckpt_meta.get('resize')
+    # Residue cutoff = the largest protein the model saw (meta 'max_image_size',
+    # the honest cutoff; 'max_residue_cutoff' is an older alias kept for
+    # compatibility TODO: clean-up later). Falls back to the grid, which equals the cutoff for
+    # coupled (non---input_size) runs.
+    ckpt_residue_cutoff = (ckpt_meta.get('max_residue_cutoff')
+                           or ckpt_meta.get('max_image_size')
+                           or ckpt_grid)
 
-    # Query pad target: explicit --target_size > checkpoint meta > 200.
+    # Query grid target: explicit --target_size > checkpoint meta > 200.
     if args.target_size is not None:
         target_size = args.target_size
-        if ckpt_max_image_size and target_size != ckpt_max_image_size:
-            print(f'Warning: --target_size {target_size} differs from checkpoint '
-                  f'max_image_size {ckpt_max_image_size}; using the explicit value, '
-                  f'but this will mismatch how the model was trained.')
-    elif ckpt_max_image_size:
-        target_size = ckpt_max_image_size
-        print(f'Using query pad target {target_size} from checkpoint meta.')
+        if ckpt_grid and target_size != ckpt_grid:
+            print(f'Warning: --target_size {target_size} differs from checkpoint grid '
+                  f'{ckpt_grid}; using the explicit value, but this will mismatch training.')
+    elif ckpt_grid:
+        target_size = ckpt_grid
+        print(f'Using query grid {target_size} from checkpoint meta.')
     else:
         target_size = 200
 
-    # Query length upper cutoff: explicit CLI > checkpoint meta > 200. A query
-    # longer than the model's training size can't be embedded without cropping,
-    # so the cutoff tracks the same value.
+    # Pad vs resize: explicit --resize/--no-resize > checkpoint meta > pad.
+    if args.resize is not None:
+        query_resize = args.resize
+        if ckpt_resize is not None and query_resize != ckpt_resize:
+            print(f'Warning: --{"resize" if query_resize else "no-resize"} differs from '
+                  f'checkpoint (resize={ckpt_resize}); using the explicit value, but this '
+                  f'will mismatch training.')
+    elif ckpt_resize is not None:
+        query_resize = bool(ckpt_resize)
+        print(f'Using {"resize" if query_resize else "pad"} mode from checkpoint meta.')
+    else:
+        query_resize = False
+
+    # Query length upper cutoff: explicit CLI > training residue cutoff > 200.
+    # In resize mode this is the residue cutoff (not the grid): a large protein
+    # can be resized down, so the grid would wrongly reject in-distribution
+    # queries. In pad mode residue cutoff == grid for older checkpoints.
     if args.sequence_len_upper_cutoff is not None:
         seq_upper_cutoff = args.sequence_len_upper_cutoff
-    elif ckpt_max_image_size:
-        seq_upper_cutoff = ckpt_max_image_size
+    elif ckpt_residue_cutoff:
+        seq_upper_cutoff = ckpt_residue_cutoff
     else:
         seq_upper_cutoff = 200
+
+    # Single query-image preprocessing fn (resize or pad to the grid), shared by
+    # the embedding transform and result-image saving so both match training.
+    if query_resize:
+        def prep_fn(img):
+            return img.convert('RGB').resize((target_size, target_size))
+    else:
+        def prep_fn(img):
+            return pad_to_size(img, target=target_size)
 
     args.output_dir = os.path.expanduser(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -301,10 +350,12 @@ if __name__ == '__main__':
         ])
     else:
         img_sim.transform = transforms.Compose([
-            transforms.Lambda(lambda img: pad_to_size(img, target=target_size)),
+            transforms.Lambda(prep_fn),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+        print(f'{"Resizing" if query_resize else "Padding"} query to '
+              f'{target_size}x{target_size} to match training.')
     img_sim.dataset = corpus
     timings['Img2Vec init'] = perf_counter() - _t0
 
@@ -347,7 +398,7 @@ if __name__ == '__main__':
     os.makedirs(result_img_dir, exist_ok=True)
     _t0 = perf_counter()
     img_sim.save_images(query_jpg, result_img_dir, scores_n_arr=top_results, corpus_dir=corpus_dir,
-                        pad_fn=lambda img: pad_to_size(img, target=target_size))
+                        pad_fn=prep_fn)
     timings['Result image saved'] = perf_counter() - _t0
     print(f'\nResult image saved to {result_img_dir}/')
 
