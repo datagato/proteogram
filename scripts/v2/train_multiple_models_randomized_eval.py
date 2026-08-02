@@ -378,19 +378,24 @@ def build_vit(num_classes, num_unfrozen_blocks=2):
     return model
 
 
-def build_resnet18(num_classes, freeze_layers=('layer1',)):
-    """Pretrained ResNet18 with the classification head replaced.
+def build_resnet18(num_classes, pretrained=True, freeze_layers=('layer1',)):
+    """ResNet18 with the classification head replaced.
 
-    Only the very first residual block (layer1) is frozen — proteograms encode
-    distance-matrix geometry that looks nothing like ImageNet, so the backbone
-    needs freedom to adapt.  Regularisation comes from AdamW weight decay
-    rather than aggressive layer freezing.  A Dropout is inserted before the
-    final linear layer for additional regularisation.
+    pretrained=True (default): ImageNet-initialised, with only the first residual
+    block (layer1) frozen — proteograms encode distance-matrix geometry that looks
+    nothing like ImageNet, so the backbone needs freedom to adapt. Regularisation
+    comes from AdamW weight decay rather than aggressive freezing.
+    pretrained=False: random init (weights=None) with NO freezing — freezing
+    random weights makes no sense; the whole network must train. Used as the
+    from-scratch control that isolates the proteogram signal from ImageNet
+    transfer. A Dropout is inserted before the final linear layer in both cases.
     """
-    model = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
-    for name, param in model.named_parameters():
-        if any(name.startswith(layer) for layer in freeze_layers):
-            param.requires_grad = False
+    weights = tv_models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+    model = tv_models.resnet18(weights=weights)
+    if pretrained:
+        for name, param in model.named_parameters():
+            if any(name.startswith(layer) for layer in freeze_layers):
+                param.requires_grad = False
     in_features = model.fc.in_features
     model.fc = nn.Sequential(
         nn.Dropout(0.5),
@@ -399,19 +404,20 @@ def build_resnet18(num_classes, freeze_layers=('layer1',)):
     return model
 
 
-def build_resnet18_embedding(embed_dim, freeze_layers=('layer1',)):
-    """Pretrained ResNet18 with the classification head replaced by an
-    embedding projection, for hierarchy-aware triplet training (see
-    proteogram.v2.losses.HierarchicalTripletLoss). Same backbone/freezing
-    policy as build_resnet18 -- only layer1 frozen, the rest fine-tuned.
-    Cosine similarity is scale-invariant, so no explicit L2-normalize layer
-    is baked into the model; normalization happens inside the loss and
-    inside compute_val_patk instead.
+def build_resnet18_embedding(embed_dim, pretrained=True, freeze_layers=('layer1',)):
+    """ResNet18 with the classification head replaced by an embedding projection,
+    for hierarchy-aware triplet training (see
+    proteogram.v2.losses.HierarchicalTripletLoss). Same pretrained/freezing
+    policy as build_resnet18 (see there for the from-scratch control). Cosine
+    similarity is scale-invariant, so no explicit L2-normalize layer is baked
+    into the model; normalization happens inside the loss and compute_val_patk.
     """
-    model = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
-    for name, param in model.named_parameters():
-        if any(name.startswith(layer) for layer in freeze_layers):
-            param.requires_grad = False
+    weights = tv_models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+    model = tv_models.resnet18(weights=weights)
+    if pretrained:
+        for name, param in model.named_parameters():
+            if any(name.startswith(layer) for layer in freeze_layers):
+                param.requires_grad = False
     in_features = model.fc.in_features
     model.fc = nn.Sequential(
         nn.Dropout(0.5),
@@ -866,6 +872,14 @@ if __name__ == '__main__':
                              "since ViT-B/16's positional embeddings require a fixed input "
                              "shape and cannot use the padded/variable-size inputs the other "
                              "two architectures accept. Default: cnn.")
+    parser.add_argument('--pretrained', action=argparse.BooleanOptionalAction, default=True,
+                        help="Initialise the ResNet18 backbone from ImageNet weights (default) "
+                             "or, with --no-pretrained, from scratch (random init). From-scratch "
+                             "trains the whole network (no layer freezing) at a uniform learning "
+                             "rate instead of the pretrained differential LR -- it is the control "
+                             "that isolates the proteogram signal from ImageNet transfer. Only "
+                             "affects --model resnet18 (the from-scratch ConvNet is already random "
+                             "init; ViT ignores this). Default: pretrained.")
     parser.add_argument('--vit_unfrozen_blocks',
                         type=int,
                         default=2,
@@ -1309,15 +1323,18 @@ if __name__ == '__main__':
         # Embedding model: no classification head, trained directly for cosine
         # retrieval -- see proteogram/v2/losses.py for why (P@K is the actual
         # target, not per-level classification accuracy).
-        model = build_resnet18_embedding(args.embed_dim)
+        model = build_resnet18_embedding(args.embed_dim, pretrained=args.pretrained)
+        # Uniform LR from scratch; differential (gentle backbone) when pretrained.
+        backbone_lr = args.lr * 0.1 if args.pretrained else args.lr
         backbone_params = [p for n, p in model.named_parameters() if 'fc' not in n and p.requires_grad]
         head_params = list(model.fc.parameters())
         optimizer = optim.AdamW([
-            {'params': backbone_params, 'lr': args.lr * 0.1},
+            {'params': backbone_params, 'lr': backbone_lr},
             {'params': head_params,     'lr': args.lr},
         ], weight_decay=1e-3)
-        print(f'ResNet18 (embedding, dim={args.embed_dim}): '
-              f'backbone LR={args.lr * 0.1:.2e}, head LR={args.lr:.2e}')
+        print(f'ResNet18 (embedding, dim={args.embed_dim}, '
+              f'{"pretrained" if args.pretrained else "from scratch"}): '
+              f'backbone LR={backbone_lr:.2e}, head LR={args.lr:.2e}')
 
         margins = tuple(float(x) for x in args.triplet_margins.split(','))
         loss_criteria = HierarchicalTripletLoss(margins=margins, base_margin=args.triplet_base_margin)
@@ -1341,7 +1358,8 @@ if __name__ == '__main__':
             print(f'  {lvl:12s}: {test_patk[lvl]:.4f}')
 
         _grid_tag = f'input{image_resize}_{"resize" if args.resize else "pad"}'
-        suffix = (f'_{args.model}_lr{lr}_bs{args.triplet_p * args.triplet_k}_e{epochs_trained}_'
+        _scratch_tag = '' if args.pretrained else '_scratch'
+        suffix = (f'_{args.model}{_scratch_tag}_lr{lr}_bs{args.triplet_p * args.triplet_k}_e{epochs_trained}_'
                   f'seed{args.seed}_max_image_size{args.max_image_size}_{_grid_tag}_'
                   f'min_class_size{args.min_class_size}_loss-triplet_hierarchy_'
                   f'embeddim{args.embed_dim}_famPatK{test_patk["family"]:.3f}')
@@ -1381,7 +1399,8 @@ if __name__ == '__main__':
                          'embed_dim': args.embed_dim,
                          'input_size': image_resize,
                          'max_image_size': args.max_image_size,
-                         'resize': args.resize},
+                         'resize': args.resize,
+                         'pretrained': args.pretrained},
             }, model_path)
             print(f'Saved model to {model_path}')
 
@@ -1399,15 +1418,19 @@ if __name__ == '__main__':
 
     else:
         if args.model == 'resnet18':
-            model = build_resnet18(num_classes)
-            # Differential LR: lower rate for pretrained backbone, full rate for new head
+            model = build_resnet18(num_classes, pretrained=args.pretrained)
+            # Differential LR only makes sense for a pretrained backbone (adapt it
+            # gently, train the new head fast). From scratch, train everything at
+            # a uniform rate.
+            backbone_lr = args.lr * 0.1 if args.pretrained else args.lr
             backbone_params = [p for n, p in model.named_parameters() if 'fc' not in n and p.requires_grad]
             head_params = list(model.fc.parameters())
             optimizer = optim.AdamW([
-                {'params': backbone_params, 'lr': args.lr * 0.1},
+                {'params': backbone_params, 'lr': backbone_lr},
                 {'params': head_params,     'lr': args.lr},
             ], weight_decay=1e-3)
-            print(f'ResNet18: backbone LR={args.lr * 0.1:.2e}, head LR={args.lr:.2e}')
+            print(f'ResNet18 ({"pretrained" if args.pretrained else "from scratch"}): '
+                  f'backbone LR={backbone_lr:.2e}, head LR={args.lr:.2e}')
         elif args.model == 'vit':
             model = build_vit(num_classes, num_unfrozen_blocks=args.vit_unfrozen_blocks)
             # Differential LR: lower rate for pretrained backbone, full rate for new head.
@@ -1448,6 +1471,8 @@ if __name__ == '__main__':
 
         loss_tag = f'focal_g{args.focal_gamma}' if args.loss == 'focal' else 'ce'
         model_tag = f'{args.model}_unfrozen{args.vit_unfrozen_blocks}' if args.model == 'vit' else args.model
+        if args.model == 'resnet18' and not args.pretrained:
+            model_tag += '_scratch'
         _grid_tag = f'input{image_resize}_{"resize" if args.resize else "pad"}'
         suffix = f'_{model_tag}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_{_grid_tag}_min_class_size{args.min_class_size}_level-{level}_loss{loss_tag}_acc{overall_accuracy}'
 
@@ -1474,7 +1499,8 @@ if __name__ == '__main__':
                 'meta': {'kind': 'classifier', 'architecture': args.model,
                          'input_size': image_resize,
                          'max_image_size': args.max_image_size,
-                         'resize': args.resize},
+                         'resize': args.resize,
+                         'pretrained': args.pretrained},
             }, model_path)
             print(f'Saved model to {model_path}')
 
