@@ -217,7 +217,7 @@ if __name__ == '__main__':
 
         # Create dataframe of results
         scores_tmp = [[''] * n_results] * len(prot_files)
-        df_res = pd.DataFrame(scores_tmp, columns=[[str(i) for i in range(n_results)]])
+        df_res = pd.DataFrame(scores_tmp, columns=[str(i) for i in range(n_results)])
         df_res['query_image'] = prot_files
         for i, image_path in enumerate(prot_files):
             try:

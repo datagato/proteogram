@@ -199,8 +199,7 @@ class ProteogramDataset(Dataset):
                                 for name in set(self.label_names)}
                 excluded = {n for n, c in label_counts.items() if c < min_class_size}
                 if excluded:
-                    print(f'Excluding {len(excluded)} class(es) with < {min_class_size} samples: '
-                          + ', '.join(f'{n} ({label_counts[n]})' for n in sorted(excluded)))
+                    print(f'Excluding {len(excluded)} class(es) with < {min_class_size} samples.')
                     paired = [(f, l) for f, l in zip(self.files, self.label_names)
                               if l not in excluded]
                     if not paired:
@@ -671,6 +670,16 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
         model.load_state_dict(best_weights)
     return model, training_loss, val_loss_history, best_epoch + 1
 
+def write_prefix_list(indices, full_dataset, path, label):
+    """Write the file-name prefixes (SCOPeIDs) for the given dataset indices,
+    one per line, to path -- the same format --test_list reads back."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w') as f:
+        for i in indices:
+            f.write(os.path.splitext(os.path.basename(full_dataset.files[i]))[0] + '\n')
+    print(f'{label} set file prefixes written to {path}')
+
+
 def split_train_test(full_dataset, generator):
     """Split a PyTorch Dataset object into train and test sets"""
     total_size = len(full_dataset)
@@ -710,13 +719,17 @@ def get_accuracies(model, test_loader, class_names, labels_to_names, device=torc
                 y_pred.append(labels_to_names[int(prediction)])
                 y_test.append(labels_to_names[int(label)])
 
-    # Print accuracy for each class
-    for classname, correct_count in correct_pred.items():
-        try:
-            accuracy = 100 * float(correct_count) / total_pred[classname]
-            print(f'Accuracy for class: {classname:5s} is {accuracy:.1f} %')
-        except ZeroDivisionError:
-            print(f'No samples in test set for class: {classname}')
+    # Print accuracy for each class -- but skip the per-class dump when there
+    # are many classes (e.g. fold/family level), where it's just noise.
+    if len(class_names) > 50:
+        print(f'Per-class accuracies suppressed ({len(class_names)} classes > 50).')
+    else:
+        for classname, correct_count in correct_pred.items():
+            try:
+                accuracy = 100 * float(correct_count) / total_pred[classname]
+                print(f'Accuracy for class: {classname:5s} is {accuracy:.1f} %')
+            except ZeroDivisionError:
+                print(f'No samples in test set for class: {classname}')
     overall_accuracy_str = f"{100 * float(total_correct) / len_data:.1f}"
     print(f'Overall accuracy: {overall_accuracy_str} %')
 
@@ -724,21 +737,45 @@ def get_accuracies(model, test_loader, class_names, labels_to_names, device=torc
     print(classification_report(y_test, y_pred))
 
     name_to_int = {v: k for k, v in labels_to_names.items()}
-    y_test_int = [name_to_int[n] for n in y_test]
+    y_test_int = np.array([name_to_int[n] for n in y_test])
     y_scores_arr = np.vstack(y_scores)
-    if y_scores_arr.shape[1] == 2:
-        # roc_auc_score's multi_class param is only for genuinely multiclass
-        # targets -- with exactly 2 classes it dispatches to the binary case
-        # regardless of multi_class, which requires a 1D score array (P of
-        # the positive/greater-labeled class) and raises "y should be a 1d
-        # array" if given the full (N, 2) softmax output instead. There's
-        # only one ROC curve for binary, so macro == weighted here.
-        auc_macro = auc_weighted = roc_auc_score(y_test_int, y_scores_arr[:, 1])
+    num_score_cols = y_scores_arr.shape[1]
+
+    # One-vs-rest ROC AUC, computed per class over its own softmax column and
+    # averaged, rather than via roc_auc_score(..., multi_class='ovr') on the
+    # full score matrix. With a fixed --test_list (e.g. reused across fold-level
+    # runs) the held-out set usually won't contain every class the model was
+    # trained on, so y_true has fewer classes than y_score has columns -- and
+    # sklearn's multi_class path rejects that mismatch outright. Scoring each
+    # present class one-vs-rest sidesteps it and lets us skip classes whose ROC
+    # curve is undefined here (no positive samples, or -- degenerately -- no
+    # negatives). For a binary model this reduces to the usual single ROC curve
+    # (macro == weighted), so no separate 2-class branch is needed.
+    n_present = int((np.bincount(y_test_int, minlength=num_score_cols) > 0).sum())
+    per_class_auc = []
+    per_class_support = []
+    for c in range(num_score_cols):
+        y_true_bin = (y_test_int == c).astype(int)
+        support = int(y_true_bin.sum())
+        if support == 0 or support == len(y_test_int):
+            # Class absent from the test set, or the only class present: a
+            # one-vs-rest ROC AUC can't be defined either way -- skip it.
+            continue
+        per_class_auc.append(roc_auc_score(y_true_bin, y_scores_arr[:, c]))
+        per_class_support.append(support)
+
+    if per_class_auc:
+        per_class_auc = np.array(per_class_auc)
+        per_class_support = np.array(per_class_support)
+        auc_macro = float(per_class_auc.mean())
+        auc_weighted = float(np.average(per_class_auc, weights=per_class_support))
+        print(f'\nAUC-ROC (one-vs-rest over {len(per_class_auc)} scored class(es); '
+              f'{n_present} present in test set, {num_score_cols} in the model)')
+        print(f'AUC-ROC (macro):    {auc_macro:.4f}')
+        print(f'AUC-ROC (weighted): {auc_weighted:.4f}')
     else:
-        auc_macro    = roc_auc_score(y_test_int, y_scores_arr, multi_class='ovr', average='macro')
-        auc_weighted = roc_auc_score(y_test_int, y_scores_arr, multi_class='ovr', average='weighted')
-    print(f'\nAUC-ROC (macro):    {auc_macro:.4f}')
-    print(f'AUC-ROC (weighted): {auc_weighted:.4f}')
+        print('\nAUC-ROC: not defined (no class had both positive and negative '
+              'samples in the test set).')
 
     return overall_accuracy_str
 
@@ -926,8 +963,16 @@ if __name__ == '__main__':
                         default=0.15,
                         help="Fraction of images to hold out as the final held-out test set (default: 0.15).")
     parser.add_argument('--save_test_list',
+                        action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Save the list of held-out test set image file prefixes "
+                             "(one SCOPeID per line) to a .lst file for later reference "
+                             "(e.g. to reuse the same test set via --test_list). Default: "
+                             "on; pass --no-save_test_list to skip.")
+    parser.add_argument('--save_train_list',
                         action='store_true',
-                        help="Flag to save the list of test set image filenames to a text file for later " "reference.")
+                        help="Also save the list of train set image file prefixes "
+                             "(one SCOPeID per line) to a .lst file (default: off).")
     parser.add_argument('--test_list',
                         type=str,
                         default=None,
@@ -1405,13 +1450,11 @@ if __name__ == '__main__':
             print(f'Saved model to {model_path}')
 
         if args.save_test_list:
-            save_list_name = f"test_list_for_model_{suffix}.lst"
-            save_list_path = os.path.join(output_dir, save_list_name)
-            os.makedirs(os.path.dirname(os.path.abspath(save_list_path)), exist_ok=True)
-            with open(save_list_path, 'w') as f:
-                for i in test_indices:
-                    f.write(os.path.splitext(os.path.basename(full_dataset.files[i]))[0] + '\n')
-            print(f'Test set file prefixes written to {save_list_path}')
+            write_prefix_list(test_indices, full_dataset,
+                              os.path.join(output_dir, f"test_list_for_model_{suffix}.lst"), 'Test')
+        if args.save_train_list:
+            write_prefix_list(train_indices, full_dataset,
+                              os.path.join(output_dir, f"train_list_for_model_{suffix}.lst"), 'Train')
 
         # No get_accuracies/view_pred_set: there's no classifier head or
         # class_names to report against in embedding mode.
@@ -1505,13 +1548,11 @@ if __name__ == '__main__':
             print(f'Saved model to {model_path}')
 
         if args.save_test_list:
-            save_list_name = f"test_list_for_model_{suffix}.lst"
-            save_list_path = os.path.join(output_dir, save_list_name)
-            os.makedirs(os.path.dirname(os.path.abspath(save_list_path)), exist_ok=True)
-            with open(save_list_path, 'w') as f:
-                for i in test_indices:
-                    f.write(os.path.splitext(os.path.basename(full_dataset.files[i]))[0] + '\n')
-            print(f'Test set file prefixes written to {save_list_path}')
+            write_prefix_list(test_indices, full_dataset,
+                              os.path.join(output_dir, f"test_list_for_model_{suffix}.lst"), 'Test')
+        if args.save_train_list:
+            write_prefix_list(train_indices, full_dataset,
+                              os.path.join(output_dir, f"train_list_for_model_{suffix}.lst"), 'Train')
 
         view_pred_set(model,
                       test_loader,
