@@ -39,6 +39,12 @@ from Bio.SCOP import Scop
 
 from proteogram.common import read_yaml
 
+try:
+    from scipy.stats import wilcoxon
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
 
 def lookup(df, filter_col, filter_val, value_col):
     """Return the first matching value or None (avoids iloc[0] on empty results)."""
@@ -71,6 +77,8 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None, limit_to_ids=N
     patk   = {lv: [] for lv in levels}
     mapk   = {lv: [] for lv in levels}
     ratk   = {lv: [] for lv in levels}
+    # Per-query metrics keyed by query_id (pdb_id_chain), for paired bootstrap.
+    per_query = {}
     n_queries = 0
     n_skipped = 0
 
@@ -101,19 +109,116 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None, limit_to_ids=N
             if k >= top_k:
                 break
 
+        per_query[query_id] = {}
         for lv in levels:
-            patk[lv].append(tp[lv] / top_k)
-            mapk[lv].append(prec[lv] / min(r[lv], top_k) if r[lv] > 0 else 0.0)
-            ratk[lv].append(tp[lv] / r[lv] if r[lv] > 0 else 0.0)
+            _p = tp[lv] / top_k
+            _m = prec[lv] / min(r[lv], top_k) if r[lv] > 0 else 0.0
+            _r = tp[lv] / r[lv] if r[lv] > 0 else 0.0
+            patk[lv].append(_p)
+            mapk[lv].append(_m)
+            ratk[lv].append(_r)
+            per_query[query_id][f'patk_{lv}'] = _p
+            per_query[query_id][f'map_{lv}'] = _m
+            per_query[query_id][f'ratk_{lv}'] = _r
 
     if n_skipped:
         print(f'WARNING: {n_skipped} queries skipped (not found in label_df).')
     return {
         'n_queries': n_queries,
+        'per_query': per_query,
         **{f'patk_{lv}': np.mean(patk[lv]) for lv in levels},
         **{f'map_{lv}':  np.mean(mapk[lv])  for lv in levels},
         **{f'ratk_{lv}': np.mean(ratk[lv])  for lv in levels},
     }
+
+
+def paired_bootstrap_delta(prot_vals, algn_vals, n_boot=10000, seed=0, ci=0.95):
+    """Percentile bootstrap CI for the paired mean delta (prot - algn).
+
+    prot_vals, algn_vals: 1-D arrays of the SAME per-query metric, aligned by
+    query (index i is the same protein in both). Resampling the same indices for
+    both preserves the pairing, so the CI reflects query-sampling variance in the
+    *difference* -- i.e. how sensitive the Proteogram-vs-method margin is to which
+    proteins happen to be in the test set.
+
+    Returns (observed_delta, ci_low, ci_high).
+    """
+    prot_vals = np.asarray(prot_vals, dtype=float)
+    algn_vals = np.asarray(algn_vals, dtype=float)
+    diff = prot_vals - algn_vals
+    observed = diff.mean()
+    n = len(diff)
+    rng = np.random.default_rng(seed)
+    # Vectorised: (n_boot, n) index matrix -> mean of resampled diffs.
+    idx = rng.integers(0, n, size=(n_boot, n))
+    boot_means = diff[idx].mean(axis=1)
+    lo = np.percentile(boot_means, (1 - ci) / 2 * 100)
+    hi = np.percentile(boot_means, (1 + ci) / 2 * 100)
+    return observed, lo, hi
+
+
+def wilcoxon_pvalue(prot_vals, algn_vals):
+    """Two-sided Wilcoxon signed-rank p-value on the paired per-query
+    differences (a nonparametric test of whether the median delta is 0).
+    Returns None if scipy is unavailable or the test is undefined (e.g. all
+    per-query differences are exactly 0, common at class level)."""
+    if not _HAVE_SCIPY:
+        return None
+    diff = np.asarray(prot_vals, dtype=float) - np.asarray(algn_vals, dtype=float)
+    if np.allclose(diff, 0):
+        return None
+    try:
+        return wilcoxon(diff, zero_method='wilcox', alternative='two-sided').pvalue
+    except Exception:
+        return None
+
+
+def _sig_stars(p):
+    if p is None:
+        return 'n/a'
+    if p < 1e-3:
+        return '***'
+    if p < 1e-2:
+        return '**'
+    if p < 5e-2:
+        return '*'
+    return 'ns'
+
+
+def report_bootstrap(proteogram_per_query, method_per_query, top_k, n_boot, seed):
+    """Print paired bootstrap deltas (Proteogram - method) with 95% CIs and
+    Wilcoxon p-values, for every method x level x metric.
+
+    proteogram_per_query: {query_id: {metric_level: value}} for Proteogram.
+    method_per_query: {method_name: {query_id: {metric_level: value}}}.
+    """
+    levels = ('class', 'fold', 'superfamily', 'family')
+    metrics = [('patk', 'Precision@K'), ('map', 'MAP@K'), ('ratk', 'Recall@K')]
+
+    print('\n' + '=' * 78)
+    print(f'PAIRED BOOTSTRAP: Proteogram - method  (delta [95% CI] sig)  '
+          f'| {n_boot} resamples, seed {seed}')
+    print('Significance = Wilcoxon signed-rank on paired per-query diffs '
+          '(***<.001 **<.01 *<.05 ns; n/a = scipy missing or all-equal)')
+    print('=' * 78)
+
+    for mkey, mlabel in metrics:
+        print(f'\n{mlabel} (K={top_k})')
+        hdr = f'{"vs Method":<12} | ' + ' | '.join(f'{lv:>22}' for lv in levels)
+        print(hdr)
+        print('-' * len(hdr))
+        for mname, mpq in method_per_query.items():
+            common = sorted(set(proteogram_per_query) & set(mpq))
+            cells = []
+            for lv in levels:
+                key = f'{mkey}_{lv}'
+                prot = np.array([proteogram_per_query[q][key] for q in common])
+                algn = np.array([mpq[q][key] for q in common])
+                d, lo, hi = paired_bootstrap_delta(prot, algn, n_boot=n_boot, seed=seed)
+                p = wilcoxon_pvalue(prot, algn)
+                cells.append(f'{d:+.3f}[{lo:+.3f},{hi:+.3f}]{_sig_stars(p):>3}')
+            print(f'{mname:<12} | ' + ' | '.join(f'{c:>22}' for c in cells))
+        print(f'(paired on {len(common)} shared queries)')
 
 
 def read_gtalign_results(gtalign_results_dir):
@@ -249,6 +354,16 @@ if __name__ == '__main__':
     parser.add_argument('--exclude_classes', '-x', default=None,
                         help='Comma-separated SCOPe class names to exclude from evaluation '
                              '(e.g. "g,h" to drop small/peptide classes).')
+    parser.add_argument('--bootstrap', action='store_true',
+                        help='After the metric tables, report paired per-query bootstrap CIs '
+                             'and Wilcoxon p-values for the Proteogram-minus-alignment delta at '
+                             'each level/metric. Since all methods score the same queries, this '
+                             'tests whether the margin is significant and how sensitive it is to '
+                             'which proteins are in the test set.')
+    parser.add_argument('--n_boot', type=int, default=10000,
+                        help='Number of bootstrap resamples for --bootstrap. Default: 10000.')
+    parser.add_argument('--boot_seed', type=int, default=0,
+                        help='RNG seed for --bootstrap resampling. Default: 0.')
     args = parser.parse_args()
 
     # Files and folders
@@ -344,6 +459,7 @@ if __name__ == '__main__':
     recall_at_ks_classes = []
     n_queries_skipped = 0
     proteogram_evaluated_ids = set()
+    proteogram_per_query = {}  # {query_id: {metric_level: value}} for bootstrap
     for i in range(proteogram_res_df.shape[0]):
         prot_file = os.path.basename(proteogram_res_df.iloc[i,0])
         query_fam   = lookup(label_df, 'proteogram_file', prot_file, 'family')
@@ -423,6 +539,21 @@ if __name__ == '__main__':
         recall_at_ks_sfams.append(tp_sfam / r_sfam if r_sfam > 0 else 0.0)
         recall_at_ks_folds.append(tp_fold / r_fold if r_fold > 0 else 0.0)
         recall_at_ks_classes.append(tp_class / r_class if r_class > 0 else 0.0)
+
+        # Per-query metrics keyed by SCOPeID (== pdb_id_chain, so it pairs with
+        # the alignment methods' per_query dicts) for the paired bootstrap.
+        _qid = os.path.splitext(prot_file)[0]
+        _tp = {'family': tp_fam, 'superfamily': tp_sfam, 'fold': tp_fold, 'class': tp_class}
+        _prec = {'family': prec_at_k_fam, 'superfamily': prec_at_k_sfam,
+                 'fold': prec_at_k_fold, 'class': prec_at_k_class}
+        _r = {'family': r_fam, 'superfamily': r_sfam, 'fold': r_fold, 'class': r_class}
+        proteogram_per_query[_qid] = {}
+        for lv in ('class', 'fold', 'superfamily', 'family'):
+            proteogram_per_query[_qid][f'patk_{lv}'] = _tp[lv] / top_k
+            proteogram_per_query[_qid][f'map_{lv}'] = (
+                _prec[lv] / min(_r[lv], top_k) if _r[lv] > 0 else 0.0)
+            proteogram_per_query[_qid][f'ratk_{lv}'] = (
+                _tp[lv] / _r[lv] if _r[lv] > 0 else 0.0)
 
         # Save images of those with no/full agreement at the configured scope_level
         stem = os.path.splitext(os.path.basename(prot_file))[0]
@@ -534,3 +665,10 @@ if __name__ == '__main__':
     if fs:
         print(f'{"Foldseek":<15} | {fs["ratk_class"]:>8.4f} | {fs["ratk_fold"]:>8.4f} | {fs["ratk_superfamily"]:>11.4f} | {fs["ratk_family"]:>8.4f}')
     print(f'{"Proteogram":<15} | {proteogram_ratk_class:>8.4f} | {proteogram_ratk_fold:>8.4f} | {proteogram_ratk_sfam:>11.4f} | {proteogram_ratk_fam:>8.4f}')
+
+    if args.bootstrap:
+        method_per_query = {'GTalign': gt['per_query'], 'USalign': us['per_query']}
+        if fs:
+            method_per_query['Foldseek'] = fs['per_query']
+        report_bootstrap(proteogram_per_query, method_per_query, top_k,
+                         n_boot=args.n_boot, seed=args.boot_seed)

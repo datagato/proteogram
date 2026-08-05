@@ -188,6 +188,12 @@ if __name__ == '__main__':
                              "'martini' uses the Martini 3-inspired CG model (faster); "
                              "'atomistic' forces full atomistic simulation. Defaults to "
                              "cg_method in config.yml, or atomistic if unset there.")
+    parser.add_argument('--model_file', default=None,
+                        help='Path to the model checkpoint used to embed the query '
+                             'proteogram. Overrides model_file in config.yml.')
+    parser.add_argument('--embed_file', default=None,
+                        help='Path to the precomputed corpus embeddings file searched '
+                             'for similar proteins. Overrides embed_file in config.yml.')
     parser.add_argument('--annot_file', default=None,
                         help='Optional SCOPe label file (TSV/CSV) with columns '
                              'pdb_id_chain, proteogram_file, class, fold, superfamily, '
@@ -200,8 +206,8 @@ if __name__ == '__main__':
 
     config = read_yaml('config.yml')
     top_k      = args.top_k or config['top_k']
-    model_file = os.path.expanduser(config['model_file'])
-    embed_file = os.path.expanduser(config['embed_file'])
+    model_file = os.path.expanduser(args.model_file or config['model_file'])
+    embed_file = os.path.expanduser(args.embed_file or config['embed_file'])
     corpus_dir = config.get('proteograms_for_sim_dir')
     if corpus_dir:
         corpus_dir = os.path.expanduser(corpus_dir)
