@@ -45,6 +45,18 @@ if __name__ == '__main__':
     parser.add_argument('--save_simulated_pdb',
                         action='store_true',
                         help="Save the final simulated PDB structure.")
+    parser.add_argument('--sequence_len_lower_cutoff',
+                        type=int,
+                        default=20,
+                        help="Minimum chain length (residues) accepted for a "
+                             "structure. Chains shorter than this are skipped. "
+                             "Default: 20.")
+    parser.add_argument('--sequence_len_upper_cutoff',
+                        type=int,
+                        default=200,
+                        help="Maximum chain length (residues) accepted for a "
+                             "structure. Chains longer than this are skipped. "
+                             "Default: 200.")
     args = parser.parse_args()
 
     start = time()
@@ -159,17 +171,17 @@ if __name__ == '__main__':
             bname =  os.path.basename(pdb_file)
             chain_id = bname[5].upper()
             # Create ProteogramV2 instance
-            # Note: the cutoff values are in Angstroms for distance and
-            # and are chosen to balance capturing meaningful interactions 
-            # while managing computational cost. These can be adjusted along
-            # with sequence length cutoffs based on the specific proteins 
-            # being analyzed.
+            # Note: the distance cutoff is in Angstroms and is chosen to balance
+            # capturing meaningful interactions while managing computational
+            # cost. The sequence length cutoffs are set via CLI flags
+            # (--sequence_len_lower_cutoff / --sequence_len_upper_cutoff) and can
+            # be adjusted based on the specific proteins being analyzed.
             proteogram = ProteogramV2(pdb_file,
                                       output_dir=proteograms_output_dir,
                                       chain_id=chain_id,
                                       calpha_atom_distance_cutoff=10,
-                                      sequence_len_lower_cutoff=20,
-                                      sequence_len_upper_cutoff=200,
+                                      sequence_len_lower_cutoff=args.sequence_len_lower_cutoff,
+                                      sequence_len_upper_cutoff=args.sequence_len_upper_cutoff,
                                       use_gpu=use_gpu,
                                       cg_method=cg_method)
             
