@@ -29,6 +29,16 @@ dependencies = [
 cuda12 = [
   "openmm==8.4.0",
   "openmm-cuda-12==8.4.0.post2",
+  # Pin the JIT toolchain (nvrtc/nvcc) to a CUDA <=12.2 build so the emitted
+  # PTX ISA is loadable by older drivers (e.g. 535.x / CUDA 12.2). Newer builds
+  # (12.6+/12.9) emit PTX the driver's JIT can't parse -> OpenMM error 222
+  # (CUDA_ERROR_UNSUPPORTED_PTX_VERSION). 12.1.105 is known-good with torch 2.3.
+  "nvidia-cuda-nvrtc-cu12==12.1.105",
+  "nvidia-cuda-nvcc-cu12==12.1.105",
+  # Keep torch on its cu121 runtime so it doesn't pull newer nvidia-cuda-*
+  # packages that would conflict with the 12.1.105 pins above.
+  "torch==2.3.0",
+  "torchvision==0.18.0",
 ]
 test = ["pytest", "pytest-cov"]
 notebook = [
