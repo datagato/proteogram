@@ -33,7 +33,8 @@ This document describes the Martini 3-inspired coarse-grained (CG) pipeline for 
 9. [Comparison with Atomistic Model](#comparison-with-atomistic-model)
 10. [Usage Example](#usage-example)
 11. [Appendix](#appendix)
-12. [References](#references)
+12. [Future Work](#future-work)
+13. [References](#references)
 
 ---
 
@@ -628,6 +629,20 @@ The $c_{\text{rf}}$ constant shifts the potential so that $U_{\text{RF}}(r_c) = 
 #### Why these limitations are acceptable for proteograms
 
 `ProteogramV2.normalize_map()` rescales each energy channel independently to [0–255] (attractive channels via `abs()` first). The **relative spatial pattern** of residue-residue interactions — which pairs are strongly interacting relative to others — is what the downstream model uses for structure comparison. The Martini model captures this pattern while running significantly faster than the atomistic model.
+
+---
+
+## Future Work
+
+### Equilibration protocol refinements
+
+The current equilibration protocol prioritises throughput and relies on a disabled barostat during NVT plus Langevin friction for stability. Two refinements, both common in canonical Martini and all-atom workflows, are worth exploring:
+
+- **Less aggressive equilibration timestep.** Equilibration currently runs at 10 fs — already production-scale for the Martini W-model. More conservative protocols equilibrate at a smaller step (e.g. 2–5 fs) while the system is still settling, then ramp up to the 20 fs production timestep. A smaller equilibration step would reduce the risk of large-force instabilities on the initially under-dense solvation grid and could allow the barostat to be enabled earlier (or the NVT stage to be shortened), at the cost of some wall-clock time. Worth benchmarking whether it improves robustness on difficult (large, highly charged, or poorly packed) inputs without materially slowing the pipeline.
+
+- **Position restraints on the solute during equilibration.** The current pipeline has no position-restraint stage; the protein beads are free to move throughout NVT and NPT. The more standard approach restrains solute (BB, and optionally SC) bead positions with a harmonic potential during equilibration, letting solvent and box relax around a fixed protein before releasing the restraints for production. This decouples solvent/density equilibration from protein relaxation, further reduces the chance of NaN blow-ups, and better preserves the input structure through the density-equilibration phase. This could be implemented as an optional `CustomExternalForce` restraint added during `setup_system()` and removed (or its force constant ramped to zero) before production.
+
+Both changes trade a modest amount of speed for a more conservative, widely-validated equilibration path, and would make the pipeline more forgiving on structures where the current aggressive protocol occasionally requires retries.
 
 ---
 

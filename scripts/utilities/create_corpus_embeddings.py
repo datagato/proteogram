@@ -23,7 +23,8 @@ Usage:
     python create_corpus_embeddings.py \
         --model_file /path/to/model.pt \
         --embed_file /path/to/corpus_embeddings.pkl \
-        --dirs /path/to/proteograms/train /path/to/proteograms/eval
+        --dirs /path/to/proteograms/train /path/to/proteograms/eval \
+        --output_corpus_list /path/to/corpus_ids.lst
 """
 import argparse
 import functools
@@ -83,6 +84,10 @@ if __name__ == '__main__':
                              "Defaults to the checkpoint meta 'max_image_size', then the grid "
                              'size. In pad mode this equals the grid; in resize mode it can be '
                              'larger (bigger proteins are resized down to the grid).')
+    parser.add_argument('--output_corpus_list', default='embedding_corpus_file_prefixes.lst',
+                        help='Optional path to write the file prefixes (filename stems, e.g. '
+                             'SCOPe IDs) of the proteins actually embedded into the corpus -- '
+                             'one per line.')
     args = parser.parse_args()
 
     # Collect all JPGs recursively across all input directories
@@ -226,3 +231,11 @@ if __name__ == '__main__':
         pickle.dump(img_sim.dataset, f)
 
     print(f'Saved {len(img_sim.dataset)} embeddings to {args.embed_file}')
+
+    if args.output_corpus_list:
+        prefixes = sorted(os.path.splitext(k)[0] for k in img_sim.dataset.keys())
+        out_dir = os.path.dirname(os.path.abspath(args.output_corpus_list))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(args.output_corpus_list, 'w') as f:
+            f.write('\n'.join(prefixes) + '\n')
+        print(f'Saved {len(prefixes)} corpus file prefixes to {args.output_corpus_list}')

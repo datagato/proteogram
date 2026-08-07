@@ -585,6 +585,7 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 
 7. **ResNet** - He, K., Zhang, X., Ren, S., & Sun, J. (2016). Deep Residual Learning for Image Recognition. *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)*, 770-778. https://doi.org/10.1109/CVPR.2016.90
 
+8. **Martini 3** - Souza, P.C.T., Alessandri, R., Barnoud, J., Thallmair, S., Faustino, I., Grünewald, F., Patmanidis, I., Abdizadeh, H., Bruininks, B.M.H., Wassenaar, T.A., Kroon, P.C., Melcr, J., Nieto, V., Corradi, V., Khan, H.M., Domański, J., Javanainen, M., Martinez-Seara, H., Reuter, N., Best, R.B., Vattulainen, I., Monticelli, L., Periole, X., Tieleman, D.P., de Vries, A.H., & Marrink, S.J. (2021). Martini 3: a general purpose force field for coarse-grained molecular dynamics. *Nature Methods*, 18(4), 382–388. https://doi.org/10.1038/s41592-021-01098-3
 
 # Docker Guide (uv based)
 
