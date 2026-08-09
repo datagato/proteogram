@@ -647,13 +647,23 @@ class MartiniNonBondedForceModel:
     ) -> np.ndarray:
         """Place W beads on a cubic grid and return clash-free positions.
 
-        Grid spacing is set to the W–W LJ minimum distance (2^(1/6)·σ_W ≈
+        Grid spacing targets the W–W LJ minimum distance (2^(1/6)·σ_W ≈
         0.527 nm) so that adjacent water beads start at zero force — placing
         them at σ (0.47 nm) puts them in the repulsive region and causes the
         minimiser to launch beads. Density is ~6.8 W/nm³, slightly below the
         Martini liquid target of ~8.4; NPT equilibration shrinks the box to
         reach the correct density. W beads within min_clash_nm of any protein
         bead are removed. Clash detection is chunked to cap peak memory.
+
+        The grid MUST be commensurate with the periodic box: each axis is
+        divided into a whole number of planes (n = round(L / spacing)) so the
+        actual per-axis spacing is L/n. Using a raw np.arange(0, L, spacing)
+        instead leaves a wrap-around gap of (L mod spacing) between the last
+        plane and the box edge; when that remainder is near zero the top sheet
+        of water beads sits ~0 nm from the bottom sheet's periodic image,
+        giving LJ energies of ~10^24 kJ/mol that the minimiser cannot relieve
+        (a whole sheet pinned together by periodicity) and blowing up dynamics.
+        The chosen spacing stays within ~1% of 0.527 nm across realistic boxes.
 
         Args:
             protein_pos_box: Protein bead positions in box-frame nm coords.
@@ -667,7 +677,16 @@ class MartiniNonBondedForceModel:
         """
         sigma_w  = _BEAD_TYPE_PARAMS['W'][0]              # 0.47 nm
         spacing  = 2 ** (1.0 / 6.0) * sigma_w             # LJ minimum ≈ 0.527 nm
-        axes = [np.arange(0.0, box_lengths[d], spacing) for d in range(3)]
+        # Commensurate grid: an integer number of planes per axis so the
+        # wrap-around gap equals the in-plane spacing (never a near-zero
+        # sliver). endpoint=False excludes the plane at x=L (its own periodic
+        # image at x=0 is already placed).
+        axes = [
+            np.linspace(0.0, box_lengths[d],
+                        max(1, int(round(box_lengths[d] / spacing))),
+                        endpoint=False)
+            for d in range(3)
+        ]
         gx, gy, gz = np.meshgrid(*axes, indexing='ij')
         grid = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)  # (G, 3)
 
@@ -857,22 +876,27 @@ class MartiniNonBondedForceModel:
         del init_state
 
         rng = np.random.default_rng(42)
+        final_energy_kj = None
         for attempt in range(3):
             failed = False
             try:
                 self.simulation.minimizeEnergy(maxIterations=max_iterations)
                 state = self.simulation.context.getState(
-                    getPositions=True, enforcePeriodicBox=True
+                    getPositions=True, getEnergy=True, enforcePeriodicBox=True
                 )
                 pos_nm = np.asarray(
                     state.getPositions(asNumpy=True).value_in_unit(nanometer),
                     dtype=np.float64,
+                )
+                energy_kj = state.getPotentialEnergy().value_in_unit(
+                    kilojoules_per_mole
                 )
                 del state
                 if np.any(np.isnan(pos_nm)):
                     failed = True
                 else:
                     self.positions = [Vec3(*p) * nanometer for p in pos_nm]
+                    final_energy_kj = energy_kj
             except Exception as exc:
                 if 'NaN' not in str(exc) and 'nan' not in str(exc).lower():
                     raise
@@ -894,6 +918,31 @@ class MartiniNonBondedForceModel:
         else:
             raise RuntimeError(
                 f"Energy minimization failed with NaN after 3 attempts: {self.pdb_path}"
+            )
+
+        # Sanity guard: a healthy CG system minimises to a strongly *negative*
+        # potential energy (order −10 kJ/mol per particle). A large positive
+        # value means the minimiser could not relieve the starting geometry —
+        # e.g. an entire sheet of water beads overlapping their periodic images
+        # (see _build_solvent_box). L-BFGS reports success on such configs (no
+        # NaN), so without this check dynamics would silently explode and the
+        # resulting proteogram would be garbage. Threshold is far above any
+        # legitimate energy yet far below the ~10^15 kJ/mol pathology.
+        n_particles = self.system.getNumParticles() if self.system else 1
+        energy_threshold_kj = 1.0e4 * max(1, n_particles)   # ~10^4 kJ/mol/particle
+        if final_energy_kj is not None and final_energy_kj > energy_threshold_kj:
+            print(
+                f"  WARNING: post-minimization potential energy is "
+                f"{final_energy_kj:.3e} kJ/mol "
+                f"({final_energy_kj / n_particles:.3e} kJ/mol/particle) — "
+                f"far above the expected negative range. This indicates "
+                f"unrelievable overlapping particles (commonly water beads "
+                f"clashing across the periodic boundary); dynamics will explode."
+            )
+            raise RuntimeError(
+                f"Energy minimization did not converge to a physical energy for "
+                f"{self.pdb_path}: {final_energy_kj:.3e} kJ/mol "
+                f"(> {energy_threshold_kj:.3e} kJ/mol threshold). See warning above."
             )
 
         self.cleanup_all_resources(final_run=False)
