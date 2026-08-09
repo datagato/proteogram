@@ -181,8 +181,11 @@ class MartiniNonBondedForceModel:
         self._openmm_exclusions: list[tuple[int, int]] = []
 
         self.energy_log = {
-            'nvt':        {'time_ps': [], 'energy_kj': [], 'stage': 'NVT Equilibration'},
-            'production': {'time_ps': [], 'energy_kj': [], 'stage': 'Production'},
+            'initial':      {'time_ps': [], 'energy_kj': [], 'stage': 'Initial'},
+            'minimization': {'time_ps': [], 'energy_kj': [], 'stage': 'Minimization'},
+            'nvt':          {'time_ps': [], 'energy_kj': [], 'stage': 'NVT Equilibration'},
+            'npt':          {'time_ps': [], 'energy_kj': [], 'stage': 'NPT Equilibration'},
+            'production':   {'time_ps': [], 'energy_kj': [], 'stage': 'Production'},
         }
 
     # ── context manager / cleanup ─────────────────────────────────────────────
@@ -875,6 +878,17 @@ class MartiniNonBondedForceModel:
         )
         del init_state
 
+        # Record the pre-minimization potential energy as the 'initial' stage
+        # single point (debug mode only).
+        if self.debug:
+            init_energy_state = self.simulation.context.getState(getEnergy=True)
+            initial_energy_kj = init_energy_state.getPotentialEnergy().value_in_unit(
+                kilojoules_per_mole
+            )
+            del init_energy_state
+            self.energy_log['initial']['time_ps'].append(0.0)
+            self.energy_log['initial']['energy_kj'].append(initial_energy_kj)
+
         rng = np.random.default_rng(42)
         final_energy_kj = None
         for attempt in range(3):
@@ -945,6 +959,12 @@ class MartiniNonBondedForceModel:
                 f"(> {energy_threshold_kj:.3e} kJ/mol threshold). See warning above."
             )
 
+        # Record the converged post-minimization energy as the 'minimization'
+        # stage single point (debug mode only).
+        if self.debug and final_energy_kj is not None:
+            self.energy_log['minimization']['time_ps'].append(0.0)
+            self.energy_log['minimization']['energy_kj'].append(final_energy_kj)
+
         self.cleanup_all_resources(final_run=False)
         print("Energy minimization complete.")
 
@@ -971,7 +991,7 @@ class MartiniNonBondedForceModel:
                               step=True, potentialEnergy=True,
                               temperature=True, separator='\t')
         )
-        self.simulation.step(steps)
+        self._step_with_energy_logging('nvt', steps, report_interval)
         state = self.simulation.context.getState(
             getPositions=True, enforcePeriodicBox=True
         )
@@ -1006,7 +1026,7 @@ class MartiniNonBondedForceModel:
                               step=True, potentialEnergy=True,
                               temperature=True, volume=True, separator='\t')
         )
-        self.simulation.step(steps)
+        self._step_with_energy_logging('npt', steps, report_interval)
         state = self.simulation.context.getState(
             getPositions=True, getParameterDerivatives=False,
             enforcePeriodicBox=True,
@@ -1030,6 +1050,39 @@ class MartiniNonBondedForceModel:
         del state
         self.cleanup_all_resources(final_run=False)
         print("NPT equilibration complete.")
+
+    def _step_with_energy_logging(
+        self, stage: str, steps: int, log_interval: int
+    ) -> None:
+        """Advance the simulation, recording potential energy for debug plots.
+
+        When debug mode is off this is a single ``simulation.step(steps)`` call,
+        preserving the original one-shot behaviour and cost. When debug mode is
+        on the run is chunked into ``log_interval``-sized blocks and the
+        potential energy after each block is appended to ``self.energy_log[stage]``
+        for later plotting by :meth:`plot_energy_history`.
+
+        Args:
+            stage: Key into ``self.energy_log`` to accumulate into.
+            steps: Total integration steps to advance.
+            log_interval: Steps between energy snapshots (debug mode only).
+        """
+        if not self.debug:
+            self.simulation.step(steps)
+            return
+
+        timestep_ps = self.timestep.value_in_unit(picosecond)
+        chunk = max(1, log_interval)
+        done = 0
+        while done < steps:
+            this_chunk = min(chunk, steps - done)
+            self.simulation.step(this_chunk)
+            done += this_chunk
+            state = self.simulation.context.getState(getEnergy=True)
+            energy_kj = state.getPotentialEnergy().value_in_unit(kilojoules_per_mole)
+            del state
+            self.energy_log[stage]['time_ps'].append(done * timestep_ps)
+            self.energy_log[stage]['energy_kj'].append(energy_kj)
 
     # ── production MD ─────────────────────────────────────────────────────────
 
@@ -1299,8 +1352,137 @@ class MartiniNonBondedForceModel:
         print("Martini CG pipeline complete!", flush=True)
         print("=" * 60, flush=True)
 
+        # Generate energy plots if debug mode is enabled.
+        if self.debug:
+            print("\nGenerating energy plots...")
+            self.plot_energy_history()
+            print("Energy plots saved to debug_plots directory")
+
         self.cleanup_all_resources(final_run=True)
         return results
+
+    # ── energy plotting ───────────────────────────────────────────────────────
+
+    def plot_energy_history(
+        self,
+        output_path: Optional[str] = None,
+        show_plot: bool = False,
+    ) -> None:
+        """Plot potential energy vs. time for all Martini simulation stages.
+
+        Mirrors the atomistic pipeline's debug plot: a combined cumulative-time
+        panel on top and per-stage inset panels below. Only stages with recorded
+        data (populated when the pipeline runs with ``debug=True``) are drawn.
+
+        Args:
+            output_path (str, optional): Path to save the figure. If None, saves
+                to ``<output_dir>/debug_plots/<pdb_stem>_energy.png``.
+            show_plot (bool): Whether to display the plot interactively.
+                Defaults to False.
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "matplotlib not installed. Cannot generate energy plot. "
+                "Install with: pip install matplotlib"
+            )
+            return
+
+        # Collect stages that have data, preserving the logical stage order.
+        stages_with_data = [
+            (key, data) for key, data in self.energy_log.items()
+            if data['energy_kj']
+        ]
+        if not stages_with_data:
+            print("No energy data to plot.")
+            return
+
+        stage_colors = {
+            'initial':      '#2ecc71',  # Green
+            'minimization': '#3498db',  # Blue
+            'nvt':          '#e67e22',  # Orange
+            'npt':          '#9b59b6',  # Purple
+            'production':   '#e74c3c',  # Red
+        }
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), height_ratios=[1, 2])
+
+        # Top panel: combined view with cumulative time across stages.
+        ax_combined = axes[0]
+        cumulative_time = 0.0
+        stage_boundaries = []
+        for stage_key, stage_data in stages_with_data:
+            times = np.array(stage_data['time_ps'])
+            energies = np.array(stage_data['energy_kj'])
+            color = stage_colors.get(stage_key, '#7f8c8d')
+            if len(times) == 0:
+                continue
+            adjusted_times = times + cumulative_time
+            if len(times) == 1:
+                ax_combined.scatter(adjusted_times, energies, color=color,
+                                    s=100, zorder=5, label=stage_data['stage'])
+            else:
+                ax_combined.plot(adjusted_times, energies, color=color,
+                                 linewidth=1.5, label=stage_data['stage'])
+                cumulative_time = adjusted_times[-1]
+                stage_boundaries.append((cumulative_time, stage_data['stage']))
+
+        for boundary_time, _ in stage_boundaries[:-1]:
+            ax_combined.axvline(x=boundary_time, color='gray', linestyle='--',
+                                alpha=0.5, linewidth=0.8)
+
+        ax_combined.set_xlabel('Time (ps)', fontsize=11)
+        ax_combined.set_ylabel('Potential Energy (kJ/mol)', fontsize=11)
+        ax_combined.set_title('Martini CG Energy Evolution Throughout Simulation',
+                              fontsize=12, fontweight='bold')
+        ax_combined.legend(loc='upper right', fontsize=9)
+        ax_combined.grid(True, alpha=0.3)
+
+        # Bottom panel: individual per-stage inset panels for multi-point stages.
+        ax_individual = axes[1]
+        multi_point_stages = [
+            (k, d) for k, d in stages_with_data if len(d['energy_kj']) > 1
+        ]
+        if multi_point_stages:
+            n_stages = len(multi_point_stages)
+            for i, (stage_key, stage_data) in enumerate(multi_point_stages):
+                times = np.array(stage_data['time_ps'])
+                energies = np.array(stage_data['energy_kj'])
+                color = stage_colors.get(stage_key, '#7f8c8d')
+
+                width = 0.8 / n_stages
+                left = 0.1 + i * (0.85 / n_stages)
+                ax_inset = ax_individual.inset_axes([left, 0.15, width * 0.9, 0.75])
+                ax_inset.plot(times, energies, color=color, linewidth=1.2)
+                ax_inset.set_title(stage_data['stage'], fontsize=10, fontweight='bold')
+                ax_inset.set_xlabel('Time (ps)', fontsize=8)
+                ax_inset.set_ylabel('Energy (kJ/mol)', fontsize=8)
+                ax_inset.tick_params(axis='both', labelsize=7)
+                ax_inset.grid(True, alpha=0.3)
+
+                energy_change = energies[-1] - energies[0]
+                change_text = f'ΔE = {energy_change:+.1f} kJ/mol'
+                ax_inset.annotate(change_text, xy=(0.5, 0.02), xycoords='axes fraction',
+                                  ha='center', fontsize=8,
+                                  color='green' if energy_change < 0 else 'red')
+
+        ax_individual.set_visible(False)
+        plt.tight_layout()
+
+        if output_path is None:
+            debug_plots_dir = self.output_dir / "debug_plots"
+            debug_plots_dir.mkdir(parents=True, exist_ok=True)
+            pdb_stem = Path(self.pdb_path).stem
+            output_path = debug_plots_dir / f"{pdb_stem}_energy.png"
+
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+
+        if show_plot:
+            plt.show()
+        else:
+            plt.close()
 
     # ── PDB output ────────────────────────────────────────────────────────────
 
