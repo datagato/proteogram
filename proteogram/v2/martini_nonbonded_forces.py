@@ -1226,9 +1226,19 @@ class MartiniNonBondedForceModel:
         cutoff_mask = self._bead_valid_mask & (dist_nm < _SOLVENT_CUTOFF_NM)
         r_safe = np.where(cutoff_mask, dist_nm, 1.0)
 
-        # ── LJ-12-6 (Lorentz-Berthelot combining rules) ───────────────────────
-        sig_ij  = 0.5 * (self._bead_sigmas[:, np.newaxis] + self._bead_sigmas[np.newaxis, :])
-        eps_ij  = np.sqrt(self._bead_epsilons[:, np.newaxis] * self._bead_epsilons[np.newaxis, :])
+        # ── LJ-12-6 (explicit Martini 3 pair table — matches simulation) ──────
+        # Look up σ_ij/ε_ij from the same per-type-pair tables the simulation
+        # LJ force uses (Discrete2DFunction in setup_system), rather than
+        # recombining single-bead σ/ε via Lorentz-Berthelot. LB deviates by up
+        # to 9 kJ/mol for key Martini 3 pairs, so recomputing the map with it
+        # would score the trajectory under a different, less accurate potential
+        # than the one that produced it. Martini 3 defines nonbonded strengths
+        # as an explicit ε interaction matrix, not via combining rules, so the
+        # pair table is the force field. _bead_type_idx is protein-bead length
+        # (built alongside _bead_sigmas in setup_system), matching this usage.
+        ti      = self._bead_type_idx
+        sig_ij  = _PAIR_SIGMA[ti[:, np.newaxis], ti[np.newaxis, :]]
+        eps_ij  = _PAIR_EPS[ti[:, np.newaxis], ti[np.newaxis, :]]
         sr6     = (sig_ij / r_safe) ** 6
         lj_rep_b = np.where(cutoff_mask,  4.0 * eps_ij * sr6 * sr6, 0.0)
         lj_att_b = np.where(cutoff_mask, -4.0 * eps_ij * sr6,       0.0)

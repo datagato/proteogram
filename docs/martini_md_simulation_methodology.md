@@ -92,27 +92,34 @@ The BB bead is always the first bead within a residue. This ordering is used thr
 
 ### Bead Types and LJ Parameters
 
-Five protein bead types encode chemical identity through different LJ well depths and radii, following approximate Martini 3 parameters [1]:
+Six protein bead types encode chemical identity through different LJ well depths and radii. Each maps to a representative Martini 3 particle type; the σ and ε below are the corresponding self-interaction (diagonal) entries of the `[nonbond_params]` section of `martini_v3.0.0.itp` [1], mirrored in `MARTINI_BEAD_TYPE_PARAMS`:
 
-| Bead type | Residues / role | σ (nm) | ε (kJ/mol) |
-|---|---|---|---|
-| BB | All backbone beads | 0.47 | 5.6 |
-| C | Apolar sidechains (ALA, VAL, LEU, ILE, PRO, MET, CYS) | 0.47 | 4.5 |
-| N | Polar sidechains (SER, THR, ASN, GLN; linker beads of LYS, ARG, HIS) | 0.47 | 3.6 |
-| Q | Charged sidechains (ASP SC1, GLU SC1, LYS SC2, ARG SC2) | 0.47 | 5.6 |
-| TC | Tiny cyclic — aromatic rings (HIS SC2, PHE SC1/SC2, TYR SC1/SC2, TRP SC1/SC2/SC3) | 0.38 | 3.1 |
-
-Three additional bead types are used for explicit solvent and ions (not included in the residue-level energy maps):
-
-| Bead type | Role | σ (nm) | ε (kJ/mol) | Mass (Da) |
+| Bead type | ITP type | Residues / role | σ (nm) | ε (kJ/mol) |
 |---|---|---|---|---|
-| W | CG water (~4 H₂O per bead) | 0.47 | 1.00 | 72.0 |
-| ION_NA | Na⁺ | 0.258 | 0.063 | 22.99 |
-| ION_CL | Cl⁻ | 0.440 | 0.830 | 35.45 |
+| BB | P2 | All backbone beads | 0.47 | 4.06 |
+| C | C3 | Apolar regular sidechain bead (MET SC1) | 0.47 | 3.39 |
+| SC | SC3 | Aliphatic / larger apolar and linker sidechain beads (VAL, LEU, ILE, PRO, PHE, TYR, TRP, LYS linker) | 0.41 | 2.35 |
+| N | N2 | Polar sidechains (SER, THR, ASN, GLN; ARG linker) | 0.47 | 3.52 |
+| Q | Q4 | Charged sidechains (ASP, GLU, LYS, ARG) | 0.47 | 5.95 |
+| TC | TC3 | Tiny apolar / small aromatic subring beads (ALA, CYS, HIS ring, TRP ring) | 0.34 | 1.51 |
 
-Pairwise parameters use Lorentz-Berthelot combining rules:
+Three additional bead types are used for explicit solvent and ions (not included in the residue-level energy maps). Their σ/ε are likewise the ITP self-interaction values:
 
-$$\sigma_{ij} = \frac{\sigma_i + \sigma_j}{2}, \qquad \epsilon_{ij} = \sqrt{\epsilon_i \cdot \epsilon_j}$$
+| Bead type | ITP type | Role | σ (nm) | ε (kJ/mol) | Mass (Da) |
+|---|---|---|---|---|---|
+| W | W | CG water (~4 H₂O per bead) | 0.47 | 4.65 | 72.0 |
+| ION_NA | TQ5 | Na⁺ | 0.354 | 1.18 | 22.99 |
+| ION_CL | TQ5 | Cl⁻ | 0.354 | 1.18 | 35.45 |
+
+> **Notes.** Na⁺ and Cl⁻ share the same Martini 3 TQ5 particle type (they differ only in charge and mass). The single per-type values in these tables are the diagonal of the `MARTINI_PAIR_EPS_KJ` / `MARTINI_PAIR_SIGMA_NM` matrix; all cross-type interactions come from the full 8×8 table, not from combining these diagonal values. Note that W and ion parameters here are reference values only — solvent and ion beads drive the dynamics but are excluded from the residue-level energy maps.
+
+Pairwise parameters are **not** derived from combining rules. Martini 3 defines nonbonded interaction strengths as an explicit per-type-pair matrix — the `[nonbond_params]` section of `martini_v3.0.0.itp` [1] — rather than reconstructing $\sigma_{ij}, \epsilon_{ij}$ from single-bead values. Accordingly, both the LJ force in the OpenMM simulation and the post-hoc bead-level energy maps look $\sigma_{ij}$ and $\epsilon_{ij}$ up directly from a symmetric pair table indexed by bead type:
+
+$$\sigma_{ij} = \Sigma[\text{type}_i, \text{type}_j], \qquad \epsilon_{ij} = \mathrm{E}[\text{type}_i, \text{type}_j]$$
+
+where $\Sigma$ (`MARTINI_PAIR_SIGMA_NM`) and $\mathrm{E}$ (`MARTINI_PAIR_EPS_KJ`) are the 8×8 tables in `proteogram/common/constants.py`. In OpenMM these are supplied as `Discrete2DFunction` tabulated functions; in the numpy energy calculation the same tables are indexed by each bead's integer type. This guarantees the residue-level energy maps are scored under the *identical* potential that produced the trajectory.
+
+Lorentz-Berthelot combining rules ($\sigma_{ij} = (\sigma_i + \sigma_j)/2$, $\epsilon_{ij} = \sqrt{\epsilon_i \epsilon_j}$) are deliberately avoided: for key Martini 3 bead pairs the LB estimate deviates from the tabulated $\epsilon_{ij}$ by up to ~9 kJ/mol, so an LB-reconstructed map would score the dynamics under a measurably different and less accurate force field. The single per-type σ/ε values in the tables above are nominal reference values (and set the W–W grid spacing); the actual pairwise interactions come from the explicit matrix.
 
 Protein beads all have a uniform mass of **72 Da**, the approximate mass of an average amino acid fragment at this level of coarse-graining.
 
@@ -383,7 +390,7 @@ $$U_{LJ,b_1 b_2} = \begin{cases}
 0 & \text{otherwise}
 \end{cases}$$
 
-Split into repulsive (positive $r^{-12}$ term) and attractive (negative $r^{-6}$ term) components.
+Split into repulsive (positive $r^{-12}$ term) and attractive (negative $r^{-6}$ term) components. The per-pair parameters $\sigma_{b_1 b_2}$ and $\epsilon_{b_1 b_2}$ are read from the same explicit Martini 3 pair tables used by the OpenMM LJ force (see [Bead Types and LJ Parameters](#bead-types-and-lj-parameters)) — not recombined via Lorentz-Berthelot — so the map matches the sampled dynamics exactly.
 
 #### Reaction-field Coulomb (protein beads only, upper triangle)
 

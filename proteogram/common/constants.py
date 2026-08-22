@@ -281,7 +281,7 @@ MARTINI_BEAD_TYPE_PARAMS = {
     'N':      (0.47, 3.52),  # polar (N1-N2): self-ε from ITP
     'Q':      (0.47, 5.95),  # charged (Q4): self-ε from ITP
     'TC':     (0.34, 1.51),  # tiny apolar (TC1-TC5): σ & ε from ITP
-    'W':      (0.47, 1.00),  # water bead (~4 H₂O)
+    'W':      (0.47, 4.65),  # water bead (~4 H₂O): W self-ε from ITP
     'ION_NA': (0.354, 1.18), # Na+: TQ5 self-ε from ITP
     'ION_CL': (0.354, 1.18), # Cl-: TQ5 self-ε from ITP
 }
