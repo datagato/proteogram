@@ -11,7 +11,8 @@ from Bio.PDB.PDBParser import PDBParser, PDBConstructionWarning
 from Bio.PDB.Polypeptide import PPBuilder
 
 from ..common.constants import HYDROPHOBICITY_LIST, RESIDUE_LIST, MODIFIED_RESIDUES_TO_STANDARD
-from .nonbonded_forces import NonBondedForceModel
+from .atomistic_nonbonded_forces import AtomisticNonBondedForceModel
+from .martini_nonbonded_forces import MartiniNonBondedForceModel
 
 
 # Ignore PDB construction warnings
@@ -42,7 +43,9 @@ class ProteogramV2:
                  calpha_atom_distance_cutoff=10,
                  sequence_len_lower_cutoff=20,
                  sequence_len_upper_cutoff=1e9,
-                 use_gpu=False):
+                 use_gpu=False,
+                 cg_method=None,
+                 sidechain_completeness_cutoff=0.5):
         """Initialize the ProteogramV2 instance.
 
         Args:
@@ -55,9 +58,17 @@ class ProteogramV2:
             sequence_len_upper_cutoff (float, optional): Maximum sequence length
                 for valid chains. Defaults to 1e9.
             use_gpu (bool, optional): Whether to use GPU acceleration. Defaults to False.
+            cg_method (str | None, optional): Coarse-grained MD method to use.
+                'martini' — Martini 3-inspired multi-bead model.
+                None      — full atomistic simulation (default).
+            sidechain_completeness_cutoff (float, optional): Minimum fraction of
+                non-GLY residues that must have a CB atom. Structures below this
+                threshold (e.g. CA-only or backbone-only PDBs) are rejected by
+                is_valid_chain. Defaults to 0.5.
 
         Raises:
             KeyError: If the specified chain_id is not found in the PDB file.
+            ValueError: If cg_method is not one of 'martini' or None.
         """
         self.pdb_path = pdb_path
         self.output_dir = output_dir
@@ -82,27 +93,44 @@ class ProteogramV2:
         self.sequence = ''.join(
             [self.allowed_amino_acids[res.resname]
              for res in self.chain
-             if res.resname in self.allowed_amino_acids])
+             if res.resname in self.allowed_amino_acids and "CA" in res])
         self.calpha_atom_distance_cutoff = calpha_atom_distance_cutoff
         self.sequence_len_lower_cutoff = sequence_len_lower_cutoff
         self.sequence_len_upper_cutoff = sequence_len_upper_cutoff
+        _valid = {'martini', None}
+        if cg_method not in _valid:
+            raise ValueError(f"cg_method must be one of {_valid}, got {cg_method!r}")
         self.use_gpu = use_gpu
+        self.cg_method = cg_method
+        self.sidechain_completeness_cutoff = sidechain_completeness_cutoff
     
     def is_valid_chain(self):
-        """Check if the chain meets the sequence length criteria.
+        """Check if the chain meets sequence length and sidechain completeness criteria.
 
         Returns:
-            bool: True if the chain length is within the specified cutoffs,
-                False otherwise.
+            bool: True if the chain length is within the specified cutoffs and
+                at least sidechain_completeness_cutoff fraction of non-GLY
+                residues have a CB atom, False otherwise.
         """
         seq_len = len(self.sequence)
-        return (self.sequence_len_lower_cutoff <= seq_len <= self.sequence_len_upper_cutoff)
+        if not (self.sequence_len_lower_cutoff <= seq_len <= self.sequence_len_upper_cutoff):
+            return False
+        if self.sidechain_completeness_cutoff > 0:
+            non_gly = [res for res in self.chain
+                       if res.resname in self.allowed_amino_acids
+                       and self.allowed_amino_acids[res.resname] != 'G']
+            if non_gly:
+                cb_present = sum(1 for res in non_gly if 'CB' in res)
+                if cb_present / len(non_gly) < self.sidechain_completeness_cutoff:
+                    return False
+        return True
     
     def calculate_proteogram(self,
                              return_simulated_pdb: bool = False,
                              debug: bool = False,
                              subtract_solvent_energies: bool = True,
-                             memory_efficient: bool = False):
+                             memory_efficient: bool = False,
+                             cg_method: str | None = 'use_instance'):
         """Calculate the proteogram maps.
 
         Computes distance, hydrophobicity, Van der Waals, and electrostatic maps
@@ -114,9 +142,14 @@ class ProteogramV2:
                 Defaults to False.
             debug (bool): If True, print debug information during calculations.
                 Defaults to False.
-            subtract_solvent_energies (bool): If True, subtract solvent-only 
-                energies from the protein+solvent energies to isolate the protein 
-                contributions. Defaults to False.
+            subtract_solvent_energies (bool): If True, subtract solvent-only
+                energies from the protein+solvent energies to isolate the protein
+                contributions. Ignored for CG methods (no solvent). Defaults to True.
+            memory_efficient (bool): Lower memory footprint at cost of speed.
+                Ignored for CG methods. Defaults to False.
+            cg_method (str | None): Override the instance-level cg_method for
+                this call. 'martini' or None (atomistic). The sentinel
+                'use_instance' (default) falls back to self.cg_method.
 
         Returns:
             tuple: A tuple containing:
@@ -127,30 +160,44 @@ class ProteogramV2:
                 - io.StringIO | None: Production PDB structure stream
                     (only if return_simulated_pdb=True).
         """
-        # Initialize the model
-        model = NonBondedForceModel(
-            pdb_path=self.pdb_path,
-            output_dir=self.output_dir,
-            temperature=310.15, # Kelvin (37 C)
-            timestep=2.0, # Femtoseconds
-            use_gpu=self.use_gpu, # Set True for GPU acceleration
-            memory_efficient=memory_efficient
-        )
+        method = self.cg_method if cg_method == 'use_instance' else cg_method
 
-        energy_calc_interval = 10000  # Default: Calculate energies every 20 ps
-        if memory_efficient:
-            energy_calc_interval = 50000  # Calculate energies every 100 ps
-
-        # Run the full pipeline (recommended)
-        pipeline_result = model.run_full_pipeline(
-            npt_steps=50000,      # 100 ps NPT equilibration
-            nvt_steps=50000,      # 100 ps NVT equilibration
-            production_steps=500000,  # 1 ns production
-            energy_calc_interval=energy_calc_interval,
-            return_simulated_pdb=return_simulated_pdb,
-            debug=debug,
-            subtract_solvent_energies=subtract_solvent_energies # Subtract solvent-only energies
-        )
+        if method == 'martini':
+            model = MartiniNonBondedForceModel(
+                pdb_path=self.pdb_path,
+                output_dir=self.output_dir,
+                temperature=310.15,
+                use_gpu=self.use_gpu,
+            )
+            pipeline_result = model.run_full_pipeline(
+                nvt_steps=25000,          # 250 ps NVT equilibration
+                npt_steps=25000,          # 250 ps NPT equilibration (box volume)
+                production_steps=250000,  # 5 ns production
+                energy_calc_interval=5000,
+                return_simulated_pdb=return_simulated_pdb,
+                debug=debug,
+            )
+        else:
+            model = AtomisticNonBondedForceModel(
+                pdb_path=self.pdb_path,
+                output_dir=self.output_dir,
+                temperature=310.15,
+                timestep=2.0,
+                use_gpu=self.use_gpu,
+                memory_efficient=memory_efficient,
+            )
+            energy_calc_interval = 10000
+            if memory_efficient:
+                energy_calc_interval = 50000
+            pipeline_result = model.run_full_pipeline(
+                nvt_steps=50000,
+                npt_steps=50000,
+                production_steps=500000,
+                energy_calc_interval=energy_calc_interval,
+                return_simulated_pdb=return_simulated_pdb,
+                debug=debug,
+                subtract_solvent_energies=subtract_solvent_energies,
+            )
 
         # Explicit clean-up of OpenMM resources after pipeline completion
         model.cleanup_all_resources(final_run=True)
@@ -165,16 +212,30 @@ class ProteogramV2:
             vdw_e_att, vdw_e_rep, es_e_att, es_e_rep, disto_map = pipeline_result
             simulated_pdb = None
 
-        # Hydrophobicity map depends on the MD-derived distance matrix
-        hydro_map = self.calc_hydrophobicity_map(self.sequence, disto_map)
+        # Hydrophobicity map: always use crystal-structure Cα distances so the
+        # pattern is consistent across atomistic and CG runs. The MD-derived
+        # disto_map uses BB bead centroids in CG (shifted ~0.5–1 Å from Cα),
+        # which changes which pairs fall within the distance cutoff.
+        hydro_map = self.calc_hydrophobicity_map(self.sequence, self.calc_dist_matrix())
         
-        # Normalize all maps to [0-255]
-        norm_disto_map, disto_err = self.normalize_map(disto_map)
-        norm_hydro_map, hydro_err = self.normalize_map(hydro_map)
-        norm_vdw_att_map, vdw_att_err = self.normalize_map(vdw_e_att)
-        norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep)
-        norm_es_att_map, es_att_err = self.normalize_map(es_e_att)
-        norm_es_rep_map, es_rep_err = self.normalize_map(es_e_rep)
+        # Normalize all maps to [0-255].
+        # Attractive energy maps (vdw_att, es_att) have values ≤ 0; zero means no
+        # interaction and would otherwise normalize to 255 (brightest), flooding the
+        # image with spurious signal. Taking abs() first makes zero → 0 (dark = no
+        # interaction) and large magnitude → bright, which is the correct convention.
+        # Repulsive maps (vdw_rep, es_rep) and hydro_map are already ≥ 0 so zero
+        # naturally normalizes to 0 — no transformation needed for those.
+        # For CG (Martini) the hard 1.1 nm cutoff creates many exact zeros; clipping
+        # at the 99th percentile of non-zero values before normalizing spreads the
+        # dynamic range across the actual interaction region rather than letting a few
+        # outlier pairs compress everything else toward black.
+        _pct = 99 if method == 'martini' else None
+        norm_disto_map, disto_err = self.normalize_map(disto_map, percentile=_pct)
+        norm_hydro_map, hydro_err = self.normalize_map(hydro_map, percentile=_pct)
+        norm_vdw_att_map, vdw_att_err = self.normalize_map(np.abs(vdw_e_att), percentile=_pct)
+        norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep, percentile=_pct)
+        norm_es_att_map, es_att_err = self.normalize_map(np.abs(es_e_att), percentile=_pct)
+        norm_es_rep_map, es_rep_err = self.normalize_map(es_e_rep, percentile=_pct)
         
         # Clear the original energy maps to save memory
         del disto_map, hydro_map, vdw_e_att, vdw_e_rep, es_e_att, es_e_rep
@@ -216,11 +277,15 @@ class ProteogramV2:
             return None, {'Error stacking maps': str(e)}
 
     @staticmethod
-    def normalize_map(arr):
+    def normalize_map(arr, percentile=None):
         """Normalize any numpy array to [0-255] using Min-Max linear scaling.
 
         Args:
             arr (numpy.ndarray): Input array to normalize.
+            percentile (float | None): If set, clip the array at this percentile
+                of non-zero values before normalizing. Useful for CG maps where
+                the hard interaction cutoff produces many exact zeros that would
+                otherwise compress the dynamic range. Defaults to None (no clip).
 
         Returns:
             tuple: A tuple containing:
@@ -229,9 +294,20 @@ class ProteogramV2:
         """
         err = ''
         try:
-            arr = ((arr - arr.min()) * (1/(arr.max() - arr.min()) * 255)).astype('uint8')
+            arr = arr.astype(np.float64)
+            if percentile is not None:
+                nonzero = arr[arr > 0]
+                if len(nonzero) > 0:
+                    clip_val = np.percentile(nonzero, percentile)
+                    arr = np.clip(arr, 0, clip_val)
+            lo, hi = arr.min(), arr.max()
+            if lo == hi:
+                arr = np.zeros_like(arr, dtype=np.uint8)
+            else:
+                arr = ((arr - lo) * (255.0 / (hi - lo))).clip(0, 255).astype(np.uint8)
         except Exception as e:
             err = f'Problem normalizing map: {e}'
+            arr = np.zeros_like(arr, dtype=np.uint8)
         return arr, err
         
     def calc_dist_matrix(self):
@@ -247,16 +323,10 @@ class ProteogramV2:
         """
         ca_atoms = [res["CA"] for res in self.chain if "CA" in res]
         n_residues = len(ca_atoms)
-        # Initialize a results matrix with zeros
         distogram = np.zeros((n_residues, n_residues), dtype=np.float64)
-        
-        # Assign upper triangle the c-alpha distances (lower triangle remains all 0)
         for i in range(n_residues):
-            for j in range(i + 1, n_residues): # Only iterate over unique pairs (upper triangle)
-                # Use the distance operator overload for Atom objects
-                distance = ca_atoms[i] - ca_atoms[j]
-                distogram[i, j] = distance
-                
+            for j in range(i + 1, n_residues):
+                distogram[i, j] = ca_atoms[i] - ca_atoms[j]
         return distogram
 
     def calc_hydrophobicity_map(self, sequence, disto_map):

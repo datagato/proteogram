@@ -29,7 +29,7 @@ The goal of this pipeline is to compute **pairwise residue-residue interaction e
 - **Van der Waals (VdW)**: Attractive and repulsive components
 - **Electrostatic (ES)**: Attractive and repulsive components
 
-The pipeline uses the **AMBER ff19SB** force field [4] with **TIP3P-FB** water model, implemented in OpenMM [3].
+The pipeline uses the **AMBER ff19SB** force field [3] with **TIP3P-FB** water model, implemented in OpenMM [2].
 
 ---
 
@@ -50,7 +50,7 @@ Before simulation, the PDB structure is "fixed" using PDBFixer:
 ## System Setup
 
 ### Force Field
-- **Protein**: AMBER ff19SB (`amber19-all.xml`) [2, 4]
+- **Protein**: AMBER ff19SB (`amber19-all.xml`) [1, 3]
 - **Water**: TIP3P-FB (`amber19/tip3pfb.xml`)
 
 ### Solvation
@@ -67,7 +67,7 @@ When `forcefield.createSystem()` is called, OpenMM automatically assigns **parti
 
 #### RESP Charges (Restrained Electrostatic Potential)
 
-AMBER force fields use **RESP charges** [8], which are derived from:
+AMBER force fields use **RESP charges** [4], which are derived from:
 
 1. **Quantum mechanical (QM) calculations** at the HF/6-31G* level of theory
 2. **Electrostatic potential (ESP) fitting** - charges are optimized to reproduce the QM electrostatic potential around the molecule
@@ -176,7 +176,7 @@ Alpha-carbon position restraints are maintained during temperature ramping to pr
 
 ### Van der Waals (Lennard-Jones) Interactions
 
-The Lennard-Jones potential [1] describes van der Waals interactions:
+The Lennard-Jones potential describes van der Waals interactions:
 
 #### Potential Energy
 
@@ -187,7 +187,7 @@ Where:
 - $\epsilon_{ij}$ = well depth (combined)
 - $\sigma_{ij}$ = collision diameter (combined)
 
-#### Combining Rules (Lorentz-Berthelot) [5, 6]
+#### Combining Rules (Lorentz-Berthelot)
 
 $$\sigma_{ij} = \frac{\sigma_i + \sigma_j}{2}$$
 
@@ -202,7 +202,7 @@ $$\epsilon_{ij} = \sqrt{\epsilon_i \cdot \epsilon_j}$$
 
 ---
 
-### Electrostatic (Coulomb) Interactions [7]
+### Electrostatic (Coulomb) Interactions
 
 #### Potential Energy
 
@@ -448,7 +448,7 @@ NPT equilibration complete.
 
 ### Appendix B: Alpha-Carbon Restraint Implementation
 
-During energy minimization, NPT equilibration, and NVT equilibration, alpha-carbon (CA) atoms are restrained using OpenMM's [3] `CustomExternalForce` with a **Cartesian harmonic** potential:
+During energy minimization, NPT equilibration, and NVT equilibration, alpha-carbon (CA) atoms are restrained using OpenMM's [2] `CustomExternalForce` with a **Cartesian harmonic** potential:
 
 $$U_{restraint} = \frac{1}{2} k \left[(x - x_0)^2 + (y - y_0)^2 + (z - z_0)^2\right]$$
 
@@ -492,7 +492,7 @@ for idx in ca_indices:
 system.addForce(restraint_force)
 ```
 
-### Appendix C: RESP Charges [8]
+### Appendix C: RESP Charges [4]
 
 #### RESP Charges Lookup Table Approach
 
@@ -516,7 +516,7 @@ For standard amino acids, charges are **pre-computed and stored** in the force f
 | **Consistency** | Matched to force field VdW parameters | Standalone method |
 | **Use case** | MD simulations | Cheminformatics, docking |
 
-RESP charges are specifically parameterized to work synergistically with the other AMBER force field terms (VdW, bonds, angles, dihedrals), ensuring accurate reproduction of experimental properties like solvation free energies and protein folding thermodynamics [8, 9].
+RESP charges are specifically parameterized to work synergistically with the other AMBER force field terms (VdW, bonds, angles, dihedrals), ensuring accurate reproduction of experimental properties like solvation free energies and protein folding thermodynamics [4, 5].
 
 ---
 
@@ -524,7 +524,7 @@ RESP charges are specifically parameterized to work synergistically with the oth
 
 This appendix provides detailed derivations and unit analysis for the force and energy calculations used in the pipeline.
 
-#### Van der Waals (Lennard-Jones) Interactions [1]
+#### Van der Waals (Lennard-Jones) Interactions
 
 ##### Potential Energy
 
@@ -555,7 +555,7 @@ $$F_{LJ}(r) = \frac{24\epsilon_{ij}}{r} \left[ 2\left(\frac{\sigma_{ij}}{r}\righ
 - **Repulsive**: $F_{rep} = \frac{48\epsilon_{ij}}{r} \left(\frac{\sigma_{ij}}{r}\right)^{12}$ (positive, pushes apart)
 - **Attractive**: $F_{att} = -\frac{24\epsilon_{ij}}{r} \left(\frac{\sigma_{ij}}{r}\right)^{6}$ (negative, pulls together)
 
-##### Combining Rules (Lorentz-Berthelot) [5, 6]
+##### Combining Rules (Lorentz-Berthelot)
 
 $$\sigma_{ij} = \frac{\sigma_i + \sigma_j}{2} \quad \text{(arithmetic mean)}$$
 
@@ -563,13 +563,13 @@ $$\epsilon_{ij} = \sqrt{\epsilon_i \cdot \epsilon_j} \quad \text{(geometric mean
 
 ---
 
-#### Electrostatic (Coulomb) Interactions [7]
+#### Electrostatic (Coulomb) Interactions
 
 ##### Potential Energy
 
 $$U_{elec}(r) = \frac{k_e \cdot q_i \cdot q_j}{r}$$
 
-Where $k_e = 138.935456$ kJ·nm/(mol·e²) is the Coulomb constant in OpenMM units [3].
+Where $k_e = 138.935456$ kJ·nm/(mol·e²) is the Coulomb constant in OpenMM units [2].
 
 ##### Force Derivation
 
@@ -624,12 +624,8 @@ $$[k_e] \cdot [q]^2 / [r]^2 = \frac{\text{kJ} \cdot \text{nm}}{\text{mol} \cdot 
 
 ## References
 
-1. Lennard-Jones, J. E. (1931). "Cohesion". Proceedings of the Physical Society. 43 (5): 461–482.
-2. Case, D. A., et al. (2020). "AMBER 2020 Reference Manual".
-3. Eastman, P., et al. (2017). "OpenMM 7: Rapid development of high performance algorithms for molecular dynamics". PLOS Computational Biology.
-4. Tian, C., et al. (2020). "ff19SB: Amino-Acid-Specific Protein Backbone Parameters Trained against Quantum Mechanics Energy Surfaces in Solution". Journal of Chemical Theory and Computation. 16 (1): 528–552.
-5. Lorentz, H. A. (1881). "Ueber die Anwendung des Satzes vom Virial in der kinetischen Theorie der Gase". Annalen der Physik. 248 (1): 127–136.
-6. Berthelot, D. (1898). "Sur le mélange des gaz". Comptes Rendus. 126: 1703–1706.
-7. Coulomb, C. A. (1785). "Premier mémoire sur l'électricité et le magnétisme". Histoire de l'Académie Royale des Sciences. 569–577.
-8. Bayly, C. I., et al. (1993). "A well-behaved electrostatic potential based method using charge restraints for deriving atomic charges: the RESP model". The Journal of Physical Chemistry. 97 (40): 10269–10280.
-9. Cornell, W. D., et al. (1995). "A Second Generation Force Field for the Simulation of Proteins, Nucleic Acids, and Organic Molecules". Journal of the American Chemical Society. 117 (19): 5179–5197.
+1. Case, D. A., et al. (2020). "AMBER 2020 Reference Manual".
+2. Eastman, P., et al. (2024). "OpenMM 8: Molecular Dynamics Simulation with Machine Learning Potentials". Journal of Physical Chemistry B. 128 (1): 109–116.
+3. Tian, C., et al. (2020). "ff19SB: Amino-Acid-Specific Protein Backbone Parameters Trained against Quantum Mechanics Energy Surfaces in Solution". Journal of Chemical Theory and Computation. 16 (1): 528–552.
+4. Bayly, C. I., et al. (1993). "A well-behaved electrostatic potential based method using charge restraints for deriving atomic charges: the RESP model". The Journal of Physical Chemistry. 97 (40): 10269–10280.
+5. Cornell, W. D., et al. (1995). "A Second Generation Force Field for the Simulation of Proteins, Nucleic Acids, and Organic Molecules". Journal of the American Chemical Society. 117 (19): 5179–5197.

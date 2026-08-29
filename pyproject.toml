@@ -1,6 +1,6 @@
 [project]
 name = "proteogram"
-version = "0.0.3"
+version = "0.0.4"
 description = "Protein structure to image manipulation and analysis."
 requires-python = ">=3.11"
 dependencies = [
@@ -12,28 +12,38 @@ dependencies = [
   "pandas>=3.0",
   "pdbfixer @ git+https://github.com/openmm/pdbfixer@94cfa4c",
   "pillow>=12.1",
-  "torch>=2.2",
-  "torchvision>=0.17",
+  "torch>=2.2,<2.11",
+  "torchvision>=0.17,<0.27",
   "torchsummary>=1.5",
   "kmeans-pytorch>=0.3",
   "tqdm>=4.67",
   "psutil>=7.2.2",
   "objgraph>=3.6.2",
   "PyYAML>=6.0",
+  "goatools>=1.4",
   "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main",
+  "rcsb-api>=1.7.3",
 ]
 
 [project.optional-dependencies]
 cuda12 = [
   "openmm==8.4.0",
-  "nvidia-cuda-nvcc-cu12==12.9.86",
-  "openmm-cuda-12==8.4.0.post2"
+  "openmm-cuda-12==8.4.0.post2",
+  # Pin the JIT toolchain (nvrtc/nvcc) to a CUDA <=12.2 build so the emitted
+  # PTX ISA is loadable by older drivers (e.g. 535.x / CUDA 12.2). Newer builds
+  # (12.6+/12.9) emit PTX the driver's JIT can't parse -> OpenMM error 222
+  # (CUDA_ERROR_UNSUPPORTED_PTX_VERSION). 12.1.105 is known-good with torch 2.3.
+  "nvidia-cuda-nvrtc-cu12==12.1.105",
+  "nvidia-cuda-nvcc-cu12==12.1.105",
+  # Keep torch on its cu121 runtime so it doesn't pull newer nvidia-cuda-*
+  # packages that would conflict with the 12.1.105 pins above.
+  "torch==2.3.0",
+  "torchvision==0.18.0",
 ]
 test = ["pytest", "pytest-cov"]
 notebook = [
   "jupyterlab>=4.2.5",
   "nglview>=3.1.4",
-  "rcsbsearchapi>=1.5.1"
 ]
 
 [tool.setuptools.packages.find]

@@ -45,6 +45,18 @@ if __name__ == '__main__':
     parser.add_argument('--save_simulated_pdb',
                         action='store_true',
                         help="Save the final simulated PDB structure.")
+    parser.add_argument('--sequence_len_lower_cutoff',
+                        type=int,
+                        default=20,
+                        help="Minimum chain length (residues) accepted for a "
+                             "structure. Chains shorter than this are skipped. "
+                             "Default: 20.")
+    parser.add_argument('--sequence_len_upper_cutoff',
+                        type=int,
+                        default=200,
+                        help="Maximum chain length (residues) accepted for a "
+                             "structure. Chains longer than this are skipped. "
+                             "Default: 200.")
     args = parser.parse_args()
 
     start = time()
@@ -75,6 +87,7 @@ if __name__ == '__main__':
     limit_file = config['limit_file']
     structures_dir = config['scope_structures_dir']
     proteograms_output_dir = config['all_proteograms_dir']
+    cg_method = config.get('cg_method', None) or None
 
     # Only create proteograms for these structures in the input limit file
     limit_to_these_structs = []
@@ -158,22 +171,23 @@ if __name__ == '__main__':
             bname =  os.path.basename(pdb_file)
             chain_id = bname[5].upper()
             # Create ProteogramV2 instance
-            # Note: the cutoff values are in Angstroms for distance and
-            # and are chosen to balance capturing meaningful interactions 
-            # while managing computational cost. These can be adjusted along
-            # with sequence length cutoffs based on the specific proteins 
-            # being analyzed.
+            # Note: the distance cutoff is in Angstroms and is chosen to balance
+            # capturing meaningful interactions while managing computational
+            # cost. The sequence length cutoffs are set via CLI flags
+            # (--sequence_len_lower_cutoff / --sequence_len_upper_cutoff) and can
+            # be adjusted based on the specific proteins being analyzed.
             proteogram = ProteogramV2(pdb_file,
                                       output_dir=proteograms_output_dir,
                                       chain_id=chain_id,
                                       calpha_atom_distance_cutoff=10,
-                                      sequence_len_lower_cutoff=20,
-                                      sequence_len_upper_cutoff=200,
-                                      use_gpu=use_gpu)
+                                      sequence_len_lower_cutoff=args.sequence_len_lower_cutoff,
+                                      sequence_len_upper_cutoff=args.sequence_len_upper_cutoff,
+                                      use_gpu=use_gpu,
+                                      cg_method=cg_method)
             
             # Skip chains that don't meet the sequence length cutoffs
             if not proteogram.is_valid_chain():
-                print(f'Skipping {pdb_file}: sequence length {len(proteogram.sequence)} outside [{proteogram.sequence_len_lower_cutoff}, {proteogram.sequence_len_upper_cutoff}]')
+                print(f'Skipping {pdb_file}: sidechain completeness criteria not met or sequence length {len(proteogram.sequence)} outside [{proteogram.sequence_len_lower_cutoff}, {proteogram.sequence_len_upper_cutoff}]')
                 del proteogram
                 continue
 
@@ -191,6 +205,8 @@ if __name__ == '__main__':
                     memory_efficient=args.memory_efficient)
                 simulated_pdb_stream = None
 
+            print(f'Calculated Proteogram for {pdb_file} with error: {err}')
+
             if err is not None and args.verbose:
                 print(f'Error calculating Proteogram for {pdb_file}: {err}')
             
@@ -200,6 +216,8 @@ if __name__ == '__main__':
                 plt.imsave(image_file, final_data.astype('uint8'))
                 plt.close('all')  # Clear matplotlib figures from memory
                 plt.clf()  # Clear current figure
+
+            print(f'Saved Proteogram image to {image_file}')
             
             # Save production simulation PDB structure if requested
             if simulated_pdb_stream is not None and production_pdb_output_dir is not None:
