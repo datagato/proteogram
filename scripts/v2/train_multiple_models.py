@@ -346,27 +346,6 @@ class WithClassLabel(Dataset):
         return image, fold_label, torch.tensor(self.class_labels[orig_idx])
 
 
-class WithProteinId(Dataset):
-    """Wraps a random_split Subset to return (image, label, protein_id).
-
-    Used for ranking-loss training: the DataLoader yields the SCOPe domain ID
-    (filename stem) alongside the image and label so that TM-score ground truth
-    can be looked up per batch.
-    """
-    def __init__(self, subset):
-        self.subset = subset
-
-    def __len__(self):
-        return len(self.subset)
-
-    def __getitem__(self, idx):
-        orig_idx = self.subset.indices[idx]
-        image, label = self.subset[idx]
-        filepath = self.subset.dataset.files[orig_idx]
-        protein_id = os.path.splitext(os.path.basename(filepath))[0]
-        return image, label, protein_id
-
-
 def train_model(model, train_loader, val_loader, optimizer, epochs,
                 patience=None, device=torch.device('cpu')):
     """Train the ConvNet, tracking train and val loss each epoch.
@@ -399,8 +378,8 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
             with torch.set_grad_enabled(phase == 'train'):
                 for batch in loaders[phase]:
                     data, target = batch[0].to(device), batch[1].to(device)
-                    # batch[2] may be a tensor (class labels / triplet) or a
-                    # tuple of strings (protein IDs for ranking loss)
+                    # batch[2], when present, is a class-label tensor used by
+                    # the triplet loss for negative mining.
                     if len(batch) == 3:
                         aux = batch[2]
                         class_target = aux.to(device) if isinstance(aux, torch.Tensor) else aux
@@ -657,30 +636,6 @@ if __name__ == '__main__':
                              "CrossEntropyLoss. Requires --model resnet18. Uses SCOPFoldSampler "
                              "to guarantee positive pairs per batch and loads class labels as "
                              "negative-mining anchors. Typical use: --level fold --triplet.")
-    parser.add_argument('--ranking_loss',
-                        action='store_true',
-                        help="Add a physics-informed ListNet ranking loss on top of "
-                             "CrossEntropyLoss. The ranking loss directly optimises cosine "
-                             "similarities to match USalign TM-score order, bypassing the "
-                             "classification objective. Requires --tm_score_file and "
-                             "--model resnet18. Typical use: --level fold --ranking_loss "
-                             "--tm_score_file /path/to/usalign_out.tsv")
-    parser.add_argument('--tm_score_file',
-                        type=str,
-                        default=None,
-                        help="Path to USalign all-vs-all TSV (columns: #PDBchain1, PDBchain2, "
-                             "TM1, TM2). Required when --ranking_loss is set.")
-    parser.add_argument('--ranking_weight',
-                        type=float,
-                        default=0.5,
-                        help="Weight β for the ranking loss in: total = CE + β × ranking. "
-                             "Default: 0.5. Higher values shift the model towards TM-score "
-                             "alignment; lower values preserve classification accuracy.")
-    parser.add_argument('--ranking_temperature',
-                        type=float,
-                        default=0.1,
-                        help="Softmax temperature for TM-score GT distribution in ListNet "
-                             "loss. Lower = sharper targets (default: 0.1).")
     args = parser.parse_args()
 
     config = read_yaml('config.yml')
@@ -802,22 +757,6 @@ if __name__ == '__main__':
             shuffle=False,
             worker_init_fn=seed_worker,
             generator=g)
-    elif args.ranking_loss and args.model == 'resnet18':
-        if not args.tm_score_file:
-            raise ValueError("--tm_score_file is required when --ranking_loss is set.")
-        train_loader = DataLoader(
-            WithProteinId(train_split),
-            batch_size=batch_size,
-            sampler=torch.utils.data.WeightedRandomSampler(
-                weights=sample_weights, num_samples=len(sample_weights), replacement=True),
-            worker_init_fn=seed_worker)
-        val_loader = DataLoader(
-            WithProteinId(val_split),
-            batch_size=batch_size,
-            shuffle=False,
-            worker_init_fn=seed_worker,
-            generator=g)
-        print(f'Ranking-loss mode: loading TM-scores from {args.tm_score_file}')
     else:
         train_loader = DataLoader(train_split,
                                   batch_size=batch_size,
@@ -865,26 +804,6 @@ if __name__ == '__main__':
                     _emb_store['emb'], targets, class_labels)
             return ce
         print(f'Triplet loss enabled: CE + {_TRIPLET_W} × triplet (margin=0.3)')
-    elif args.ranking_loss and args.model == 'resnet18':
-        from proteogram.v2.ranking_loss import TmScoreRankingLoss
-        _ranking = TmScoreRankingLoss(
-            args.tm_score_file,
-            temperature=args.ranking_temperature,
-        )
-        _RANKING_W = args.ranking_weight
-        model.avgpool.register_forward_hook(
-            lambda m, i, o: _emb_store.update({'emb': torch.flatten(o, 1)}))
-        def loss_criteria(logits, targets, protein_ids=None):
-            ce = _ce(logits, targets)
-            if protein_ids is not None and 'emb' in _emb_store:
-                ids = list(protein_ids)
-                cov = _ranking.batch_coverage(ids)
-                if cov > 0.0:
-                    r_loss = _ranking.listnet_loss(_emb_store['emb'], ids)
-                    return ce + _RANKING_W * r_loss
-            return ce
-        print(f'Ranking loss enabled: CE + {_RANKING_W} × ListNet  '
-              f'(temperature={args.ranking_temperature})')
     else:
         def loss_criteria(logits, targets, class_labels=None):
             return _ce(logits, targets)
