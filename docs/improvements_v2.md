@@ -507,6 +507,14 @@ print("Round-trip test passed.")
 
 ## 2. Global Percentile Normalisation
 
+> **Update:** the code snippets below reflect the original design. The shipped
+> `--save_npy_matrices` implementation initially had a bug that fed
+> already-normalised pixel data (not raw physical-unit energies) into
+> `compute_norm_stats.py`, defeating the purpose of this feature. See
+> [`percentile_normalisation_bug_fix_and_validation.md`](percentile_normalisation_bug_fix_and_validation.md)
+> for the bug, the fix, and the new `validate_normalisation.py` tool for
+> measuring before/after impact.
+
 ### 2.1 Motivation
 
 The current `ProteogramV2.normalize_map()` applies **per-protein min-max normalisation** independently to each energy channel:
@@ -784,6 +792,14 @@ python create_v2_proteograms.py \
 ```
 
 ### 2.6 Validation Steps
+
+> Steps 1 and 4 below (pixel-distribution and clipping-rate checks) are now
+> implemented as a single runnable tool, `scripts/v2/validate_normalisation.py`,
+> which also adds an inter-protein variance ratio and a correlation-with-raw-scale
+> check that these steps didn't originally include. See
+> [`percentile_normalisation_bug_fix_and_validation.md`](percentile_normalisation_bug_fix_and_validation.md)
+> for exact commands and how to read the output. Steps 2 and 3 (visual inspection,
+> downstream MAP@K) remain manual/expensive as described below.
 
 #### Step 1 — Sanity check: pixel distribution
 

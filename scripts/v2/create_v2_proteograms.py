@@ -1,6 +1,7 @@
 from proteogram.v2 import ProteogramV2
 import gc
 import glob
+import numpy as np
 import os
 from time import time
 import matplotlib
@@ -225,32 +226,39 @@ if __name__ == '__main__':
                 del proteogram
                 continue
 
-            # Raw energy matrices are written before normalisation, so the
-            # export has to be requested up front rather than recovered from
-            # the returned RGB composite.
-            save_npy_prefix = None
-            if args.save_npy_matrices:
-                save_npy_prefix = os.path.join(
-                    proteograms_output_dir, 'energy_matrices',
-                    os.path.splitext(os.path.basename(image_file))[0])
-
             # Calculate Proteogram with optional simulated PDB output
-            if args.save_simulated_pdb:
+            if args.save_simulated_pdb and args.save_npy_matrices:
+                final_data, err, simulated_pdb_stream, raw_channels = proteogram.calculate_proteogram(
+                    return_simulated_pdb=True,
+                    return_raw_channels=True,
+                    subtract_solvent_energies=True,
+                    debug=args.debug,
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
+            elif args.save_simulated_pdb:
                 final_data, err, simulated_pdb_stream = proteogram.calculate_proteogram(
                     return_simulated_pdb=True,
                     subtract_solvent_energies=True,
                     debug=args.debug,
                     memory_efficient=args.memory_efficient,
-                    norm_stats=norm_stats,
-                    save_npy_prefix=save_npy_prefix)
+                    norm_stats=norm_stats)
+                raw_channels = None
+            elif args.save_npy_matrices:
+                final_data, err, raw_channels = proteogram.calculate_proteogram(
+                    return_raw_channels=True,
+                    subtract_solvent_energies=True,
+                    debug=args.debug,
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
+                simulated_pdb_stream = None
             else:
                 final_data, err = proteogram.calculate_proteogram(
                     subtract_solvent_energies=True,
                     debug=args.debug,
                     memory_efficient=args.memory_efficient,
-                    norm_stats=norm_stats,
-                    save_npy_prefix=save_npy_prefix)
+                    norm_stats=norm_stats)
                 simulated_pdb_stream = None
+                raw_channels = None
 
             print(f'Calculated Proteogram for {pdb_file} with error: {err}')
 
@@ -266,8 +274,22 @@ if __name__ == '__main__':
 
             print(f'Saved Proteogram image to {image_file}')
 
-            if save_npy_prefix is not None and args.verbose:
-                print(f'Saved raw energy matrices to {save_npy_prefix}_*.npy')
+            # Optionally save raw (pre-normalisation) per-channel energy matrices
+            # as .npy files.  These are consumed by compute_norm_stats.py to
+            # build norm_stats.json — they must be genuine physical-unit values
+            # (kJ/mol, Å), never pixel data sliced from the normalised image,
+            # or the resulting percentile bounds would just describe whatever
+            # normalisation already ran once (per-protein min-max by default),
+            # defeating the purpose of global normalisation.
+            if args.save_npy_matrices and raw_channels is not None:
+                npy_dir = os.path.join(proteograms_output_dir, 'energy_matrices')
+                os.makedirs(npy_dir, exist_ok=True)
+                bname_base = os.path.splitext(os.path.basename(image_file))[0]
+                for ch_name, ch_arr in raw_channels.items():
+                    npy_path = os.path.join(npy_dir, f'{bname_base}_{ch_name}.npy')
+                    np.save(npy_path, ch_arr.astype('float32'))
+                if args.verbose:
+                    print(f'Saved .npy matrices to {npy_dir}/{bname_base}_*.npy')
             
             # Save production simulation PDB structure if requested
             if simulated_pdb_stream is not None and production_pdb_output_dir is not None:

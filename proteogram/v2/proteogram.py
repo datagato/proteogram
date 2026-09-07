@@ -4,7 +4,6 @@ This module defines the ProteogramV2 class, which provides methods for generatin
 Van der Waals, and electrostatic interaction maps. The class also integrates with the NonBondedForceModel module to perform molecular dynamics simulations for calculating the non-bonded interaction energies."""
 
 import numpy as np
-import os
 import warnings
 import gc
 
@@ -134,7 +133,7 @@ class ProteogramV2:
                              memory_efficient: bool = False,
                              cg_method: str | None = 'use_instance',
                              norm_stats: dict = None,
-                             save_npy_prefix: str = None):
+                             return_raw_channels: bool = False):
         """Calculate the proteogram maps.
 
         Computes distance, hydrophobicity, Van der Waals, and electrostatic maps
@@ -160,21 +159,25 @@ class ProteogramV2:
                 normalise every channel so that inter-protein energy scale is
                 preserved in pixel values.  When ``None`` (default), the
                 original per-protein min-max normalisation is applied.
-            save_npy_prefix (str | None): If set, write the six raw energy /
-                property matrices (in physical units, after the abs() transform
-                and before normalisation) to
-                ``<save_npy_prefix>_<channel>.npy``. These are the inputs
-                compute_norm_stats.py expects when building norm_stats.json.
-                Defaults to None (no export).
+            return_raw_channels (bool): If True, also return a dict of the six
+                pre-normalisation energy/property matrices (physical units:
+                kJ/mol for the energy channels, Å for distance), keyed by the
+                names in ``normalisation.CHANNEL_NAMES``. This is the data
+                ``compute_norm_stats.py`` needs — normalised pixel values must
+                never be fed back into it, since percentiles over already-
+                normalised data no longer reflect physical energy scale.
+                Defaults to False.
 
         Returns:
-            tuple: A tuple containing:
+            tuple: A tuple containing, in order:
                 - numpy.ndarray | None: The stacked proteogram array if
                     successful, None otherwise.
                 - dict | None: Error dictionary if any errors occurred,
                     None otherwise.
                 - io.StringIO | None: Production PDB structure stream
                     (only if return_simulated_pdb=True).
+                - dict | None: Raw per-channel matrices (only if
+                    return_raw_channels=True).
         """
         method = self.cg_method if cg_method == 'use_instance' else cg_method
 
@@ -243,20 +246,6 @@ class ProteogramV2:
         vdw_e_att = np.abs(vdw_e_att)
         es_e_att = np.abs(es_e_att)
 
-        # Export raw matrices before normalisation. These are in physical units
-        # (kJ/mol, Å, dimensionless hydrophobicity) and carry the same abs()
-        # transform that the normalisation below applies, so percentile bounds
-        # derived from them by compute_norm_stats.py line up with the values
-        # normalize_map_global clips against at --global_norm time.
-        if save_npy_prefix is not None:
-            self._save_raw_matrices(save_npy_prefix,
-                                    disto_map=disto_map,
-                                    hydro_map=hydro_map,
-                                    vdw_e_att=vdw_e_att,
-                                    vdw_e_rep=vdw_e_rep,
-                                    es_e_att=es_e_att,
-                                    es_e_rep=es_e_rep)
-
         # Normalize all maps to [0-255].
         if norm_stats is not None:
             # Corpus-level percentile bounds preserve inter-protein energy scale.
@@ -281,7 +270,24 @@ class ProteogramV2:
             norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep, percentile=_pct)
             norm_es_att_map,  es_att_err  = self.normalize_map(es_e_att, percentile=_pct)
             norm_es_rep_map,  es_rep_err  = self.normalize_map(es_e_rep, percentile=_pct)
-        
+
+        # Capture the true pre-normalisation matrices before they are freed.
+        # normalise_channel()/normalize_map() never mutate their input in place,
+        # so these are still the raw physical-unit values computed above — and
+        # they carry the same abs() transform the normalisation applies, so
+        # percentile bounds derived from them by compute_norm_stats.py line up
+        # with the values normalize_map_global clips against at --global_norm.
+        raw_channels = None
+        if return_raw_channels:
+            raw_channels = {
+                'vdw_attractive': vdw_e_att,
+                'vdw_repulsive':  vdw_e_rep,
+                'es_attractive':  es_e_att,
+                'es_repulsive':   es_e_rep,
+                'distance':       disto_map,
+                'hydrophobicity': hydro_map,
+            }
+
         # Clear the original energy maps to save memory
         del disto_map, hydro_map, vdw_e_att, vdw_e_rep, es_e_att, es_e_rep
         del pipeline_result
@@ -312,41 +318,22 @@ class ProteogramV2:
             del norm_disto_map, norm_hydro_map, norm_vdw_att_map, norm_vdw_rep_map
             del norm_es_att_map, norm_es_rep_map, final_upper, final_lower
             gc.collect()  # Force garbage collection after large array operations
+            if return_simulated_pdb and return_raw_channels:
+                return final_data, None, simulated_pdb, raw_channels
             if return_simulated_pdb:
                 return final_data, None, simulated_pdb
+            if return_raw_channels:
+                return final_data, None, raw_channels
             return final_data, None
         except Exception as e:
             gc.collect()  # Force garbage collection even on error
+            if return_simulated_pdb and return_raw_channels:
+                return None, {'Error stacking maps': str(e)}, simulated_pdb, raw_channels
             if return_simulated_pdb:
                 return None, {'Error stacking maps': str(e)}, simulated_pdb
+            if return_raw_channels:
+                return None, {'Error stacking maps': str(e)}, raw_channels
             return None, {'Error stacking maps': str(e)}
-
-    @staticmethod
-    def _save_raw_matrices(prefix, *, disto_map, hydro_map,
-                           vdw_e_att, vdw_e_rep, es_e_att, es_e_rep):
-        """Write the six raw channel matrices as float32 .npy files.
-
-        Files are named ``<prefix>_<channel>.npy`` using the channel keys from
-        proteogram.v2.normalisation.CHANNEL_NAMES, which is the layout
-        scripts/v2/compute_norm_stats.py globs for.
-
-        Args:
-            prefix (str): Path prefix, e.g. ``/out/energy_matrices/1abcA``.
-                Parent directories are created if absent.
-            disto_map, hydro_map, vdw_e_att, vdw_e_rep, es_e_att, es_e_rep
-                (numpy.ndarray): Raw matrices in physical units.
-        """
-        os.makedirs(os.path.dirname(os.path.abspath(prefix)), exist_ok=True)
-        channels = {
-            'vdw_attractive': vdw_e_att,
-            'vdw_repulsive': vdw_e_rep,
-            'es_attractive': es_e_att,
-            'es_repulsive': es_e_rep,
-            'distance': disto_map,
-            'hydrophobicity': hydro_map,
-        }
-        for name, arr in channels.items():
-            np.save(f'{prefix}_{name}.npy', np.asarray(arr, dtype=np.float32))
 
     @staticmethod
     def normalize_map(arr, percentile=None):
