@@ -13,6 +13,7 @@ from Bio.PDB.Polypeptide import PPBuilder
 from ..common.constants import HYDROPHOBICITY_LIST, RESIDUE_LIST, MODIFIED_RESIDUES_TO_STANDARD
 from .atomistic_nonbonded_forces import AtomisticNonBondedForceModel
 from .martini_nonbonded_forces import MartiniNonBondedForceModel
+from .normalisation import normalise_channel
 
 
 # Ignore PDB construction warnings
@@ -130,7 +131,9 @@ class ProteogramV2:
                              debug: bool = False,
                              subtract_solvent_energies: bool = True,
                              memory_efficient: bool = False,
-                             cg_method: str | None = 'use_instance'):
+                             cg_method: str | None = 'use_instance',
+                             norm_stats: dict = None,
+                             return_raw_channels: bool = False):
         """Calculate the proteogram maps.
 
         Computes distance, hydrophobicity, Van der Waals, and electrostatic maps
@@ -150,15 +153,31 @@ class ProteogramV2:
             cg_method (str | None): Override the instance-level cg_method for
                 this call. 'martini' or None (atomistic). The sentinel
                 'use_instance' (default) falls back to self.cg_method.
+            norm_stats (dict | None): Optional dict loaded from ``norm_stats.json``
+                (via :func:`~proteogram.v2.normalisation.load_norm_stats`).
+                When supplied, corpus-level percentile bounds are used to
+                normalise every channel so that inter-protein energy scale is
+                preserved in pixel values.  When ``None`` (default), the
+                original per-protein min-max normalisation is applied.
+            return_raw_channels (bool): If True, also return a dict of the six
+                pre-normalisation energy/property matrices (physical units:
+                kJ/mol for the energy channels, Å for distance), keyed by the
+                names in ``normalisation.CHANNEL_NAMES``. This is the data
+                ``compute_norm_stats.py`` needs — normalised pixel values must
+                never be fed back into it, since percentiles over already-
+                normalised data no longer reflect physical energy scale.
+                Defaults to False.
 
         Returns:
-            tuple: A tuple containing:
+            tuple: A tuple containing, in order:
                 - numpy.ndarray | None: The stacked proteogram array if
                     successful, None otherwise.
                 - dict | None: Error dictionary if any errors occurred,
                     None otherwise.
                 - io.StringIO | None: Production PDB structure stream
                     (only if return_simulated_pdb=True).
+                - dict | None: Raw per-channel matrices (only if
+                    return_raw_channels=True).
         """
         method = self.cg_method if cg_method == 'use_instance' else cg_method
 
@@ -217,26 +236,58 @@ class ProteogramV2:
         # disto_map uses BB bead centroids in CG (shifted ~0.5–1 Å from Cα),
         # which changes which pairs fall within the distance cutoff.
         hydro_map = self.calc_hydrophobicity_map(self.sequence, self.calc_dist_matrix())
-        
-        # Normalize all maps to [0-255].
+
         # Attractive energy maps (vdw_att, es_att) have values ≤ 0; zero means no
         # interaction and would otherwise normalize to 255 (brightest), flooding the
         # image with spurious signal. Taking abs() first makes zero → 0 (dark = no
         # interaction) and large magnitude → bright, which is the correct convention.
         # Repulsive maps (vdw_rep, es_rep) and hydro_map are already ≥ 0 so zero
         # naturally normalizes to 0 — no transformation needed for those.
-        # For CG (Martini) the hard 1.1 nm cutoff creates many exact zeros; clipping
-        # at the 99th percentile of non-zero values before normalizing spreads the
-        # dynamic range across the actual interaction region rather than letting a few
-        # outlier pairs compress everything else toward black.
-        _pct = 99 if method == 'martini' else None
-        norm_disto_map, disto_err = self.normalize_map(disto_map, percentile=_pct)
-        norm_hydro_map, hydro_err = self.normalize_map(hydro_map, percentile=_pct)
-        norm_vdw_att_map, vdw_att_err = self.normalize_map(np.abs(vdw_e_att), percentile=_pct)
-        norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep, percentile=_pct)
-        norm_es_att_map, es_att_err = self.normalize_map(np.abs(es_e_att), percentile=_pct)
-        norm_es_rep_map, es_rep_err = self.normalize_map(es_e_rep, percentile=_pct)
-        
+        vdw_e_att = np.abs(vdw_e_att)
+        es_e_att = np.abs(es_e_att)
+
+        # Normalize all maps to [0-255].
+        if norm_stats is not None:
+            # Corpus-level percentile bounds preserve inter-protein energy scale.
+            # NOTE: norm_stats must be computed on the same abs()-transformed
+            # matrices, or the bounds will not match the values being clipped.
+            norm_disto_map,   disto_err   = normalise_channel(disto_map, 'distance', norm_stats)
+            norm_hydro_map,   hydro_err   = normalise_channel(hydro_map, 'hydrophobicity', norm_stats)
+            norm_vdw_att_map, vdw_att_err = normalise_channel(vdw_e_att, 'vdw_attractive', norm_stats)
+            norm_vdw_rep_map, vdw_rep_err = normalise_channel(vdw_e_rep, 'vdw_repulsive', norm_stats)
+            norm_es_att_map,  es_att_err  = normalise_channel(es_e_att, 'es_attractive', norm_stats)
+            norm_es_rep_map,  es_rep_err  = normalise_channel(es_e_rep, 'es_repulsive', norm_stats)
+        else:
+            # Per-protein min-max. For CG (Martini) the hard 1.1 nm cutoff creates
+            # many exact zeros; clipping at the 99th percentile of non-zero values
+            # before normalizing spreads the dynamic range across the actual
+            # interaction region rather than letting a few outlier pairs compress
+            # everything else toward black.
+            _pct = 99 if method == 'martini' else None
+            norm_disto_map,   disto_err   = self.normalize_map(disto_map, percentile=_pct)
+            norm_hydro_map,   hydro_err   = self.normalize_map(hydro_map, percentile=_pct)
+            norm_vdw_att_map, vdw_att_err = self.normalize_map(vdw_e_att, percentile=_pct)
+            norm_vdw_rep_map, vdw_rep_err = self.normalize_map(vdw_e_rep, percentile=_pct)
+            norm_es_att_map,  es_att_err  = self.normalize_map(es_e_att, percentile=_pct)
+            norm_es_rep_map,  es_rep_err  = self.normalize_map(es_e_rep, percentile=_pct)
+
+        # Capture the true pre-normalisation matrices before they are freed.
+        # normalise_channel()/normalize_map() never mutate their input in place,
+        # so these are still the raw physical-unit values computed above — and
+        # they carry the same abs() transform the normalisation applies, so
+        # percentile bounds derived from them by compute_norm_stats.py line up
+        # with the values normalize_map_global clips against at --global_norm.
+        raw_channels = None
+        if return_raw_channels:
+            raw_channels = {
+                'vdw_attractive': vdw_e_att,
+                'vdw_repulsive':  vdw_e_rep,
+                'es_attractive':  es_e_att,
+                'es_repulsive':   es_e_rep,
+                'distance':       disto_map,
+                'hydrophobicity': hydro_map,
+            }
+
         # Clear the original energy maps to save memory
         del disto_map, hydro_map, vdw_e_att, vdw_e_rep, es_e_att, es_e_rep
         del pipeline_result
@@ -267,13 +318,21 @@ class ProteogramV2:
             del norm_disto_map, norm_hydro_map, norm_vdw_att_map, norm_vdw_rep_map
             del norm_es_att_map, norm_es_rep_map, final_upper, final_lower
             gc.collect()  # Force garbage collection after large array operations
+            if return_simulated_pdb and return_raw_channels:
+                return final_data, None, simulated_pdb, raw_channels
             if return_simulated_pdb:
                 return final_data, None, simulated_pdb
+            if return_raw_channels:
+                return final_data, None, raw_channels
             return final_data, None
         except Exception as e:
             gc.collect()  # Force garbage collection even on error
+            if return_simulated_pdb and return_raw_channels:
+                return None, {'Error stacking maps': str(e)}, simulated_pdb, raw_channels
             if return_simulated_pdb:
                 return None, {'Error stacking maps': str(e)}, simulated_pdb
+            if return_raw_channels:
+                return None, {'Error stacking maps': str(e)}, raw_channels
             return None, {'Error stacking maps': str(e)}
 
     @staticmethod

@@ -1,6 +1,7 @@
 from proteogram.v2 import ProteogramV2
 import gc
 import glob
+import numpy as np
 import os
 from time import time
 import matplotlib
@@ -57,7 +58,41 @@ if __name__ == '__main__':
                         help="Maximum chain length (residues) accepted for a "
                              "structure. Chains longer than this are skipped. "
                              "Default: 200.")
+    # ── Global normalisation options ────────────────────────────────
+    parser.add_argument('--global_norm',
+                        action='store_true',
+                        help=(
+                            'Use corpus-level percentile normalisation instead of '
+                            'per-protein min-max.  Preserves inter-protein energy '
+                            'scale in pixel values.  Requires --norm_stats_file.'
+                        ))
+    parser.add_argument('--norm_stats_file',
+                        type=str,
+                        default=None,
+                        help=(
+                            'Path to norm_stats.json produced by '
+                            'compute_norm_stats.py.  Required when --global_norm '
+                            'is set.'
+                        ))
+    parser.add_argument('--save_npy_matrices',
+                        action='store_true',
+                        help=(
+                            'Save the raw per-channel energy matrices (physical '
+                            'units, pre-normalisation) as .npy files under '
+                            '<proteograms_dir>/energy_matrices/.  These are the '
+                            'input compute_norm_stats.py needs to build '
+                            'norm_stats.json for --global_norm.'
+                        ))
     args = parser.parse_args()
+
+    # ── Validate and load global normalisation stats ─────────────────────────
+    norm_stats = None
+    if args.global_norm:
+        if not args.norm_stats_file:
+            parser.error('--global_norm requires --norm_stats_file pointing to norm_stats.json')
+        from proteogram.v2.normalisation import load_norm_stats
+        norm_stats = load_norm_stats(args.norm_stats_file)
+        print(f'Global normalisation enabled.  Loaded stats from {args.norm_stats_file}')
 
     start = time()
 
@@ -192,18 +227,38 @@ if __name__ == '__main__':
                 continue
 
             # Calculate Proteogram with optional simulated PDB output
-            if args.save_simulated_pdb:
+            if args.save_simulated_pdb and args.save_npy_matrices:
+                final_data, err, simulated_pdb_stream, raw_channels = proteogram.calculate_proteogram(
+                    return_simulated_pdb=True,
+                    return_raw_channels=True,
+                    subtract_solvent_energies=True,
+                    debug=args.debug,
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
+            elif args.save_simulated_pdb:
                 final_data, err, simulated_pdb_stream = proteogram.calculate_proteogram(
                     return_simulated_pdb=True,
                     subtract_solvent_energies=True,
                     debug=args.debug,
-                    memory_efficient=args.memory_efficient)
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
+                raw_channels = None
+            elif args.save_npy_matrices:
+                final_data, err, raw_channels = proteogram.calculate_proteogram(
+                    return_raw_channels=True,
+                    subtract_solvent_energies=True,
+                    debug=args.debug,
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
+                simulated_pdb_stream = None
             else:
                 final_data, err = proteogram.calculate_proteogram(
                     subtract_solvent_energies=True,
                     debug=args.debug,
-                    memory_efficient=args.memory_efficient)
+                    memory_efficient=args.memory_efficient,
+                    norm_stats=norm_stats)
                 simulated_pdb_stream = None
+                raw_channels = None
 
             print(f'Calculated Proteogram for {pdb_file} with error: {err}')
 
@@ -218,6 +273,23 @@ if __name__ == '__main__':
                 plt.clf()  # Clear current figure
 
             print(f'Saved Proteogram image to {image_file}')
+
+            # Optionally save raw (pre-normalisation) per-channel energy matrices
+            # as .npy files.  These are consumed by compute_norm_stats.py to
+            # build norm_stats.json — they must be genuine physical-unit values
+            # (kJ/mol, Å), never pixel data sliced from the normalised image,
+            # or the resulting percentile bounds would just describe whatever
+            # normalisation already ran once (per-protein min-max by default),
+            # defeating the purpose of global normalisation.
+            if args.save_npy_matrices and raw_channels is not None:
+                npy_dir = os.path.join(proteograms_output_dir, 'energy_matrices')
+                os.makedirs(npy_dir, exist_ok=True)
+                bname_base = os.path.splitext(os.path.basename(image_file))[0]
+                for ch_name, ch_arr in raw_channels.items():
+                    npy_path = os.path.join(npy_dir, f'{bname_base}_{ch_name}.npy')
+                    np.save(npy_path, ch_arr.astype('float32'))
+                if args.verbose:
+                    print(f'Saved .npy matrices to {npy_dir}/{bname_base}_*.npy')
             
             # Save production simulation PDB structure if requested
             if simulated_pdb_stream is not None and production_pdb_output_dir is not None:
