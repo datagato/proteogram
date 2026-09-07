@@ -954,8 +954,11 @@ class Img2Vec:
             save_npy:          Also save raw arrays as ``.npy`` files.
 
         Returns:
-            Float32 numpy array of shape ``(3, H, W)``, per-channel attributions
-            in ``[0, 1]``.
+            Float32 numpy array of shape ``(3, H, W)`` of **unnormalised**
+            per-channel attributions, directly comparable across channels.
+            Use these for any statistic that combines channels (e.g. the
+            Energy/Distance ratio).  The figure is drawn from a separate,
+            per-channel-rescaled copy that must not be used for aggregation.
         """
         from .gradcam import GradCAM, _preprocess_image
         from PIL import Image as _Image
@@ -970,15 +973,16 @@ class Img2Vec:
             query_image_path, target_image_path
         )
 
-        # Per-channel energy decomposition
-        attributions, _ = gcam.compute_decomposed(q_tensor, t_tensor)
+        # Per-channel energy decomposition.  attr_display is rescaled per
+        # channel for plotting; attr_raw preserves cross-channel magnitudes.
+        attr_display, attr_raw, _ = gcam.compute_decomposed(q_tensor, t_tensor)
 
         query_name  = os.path.splitext(os.path.basename(query_image_path))[0]
         target_name = os.path.splitext(os.path.basename(target_image_path))[0]
         query_img   = np.array(_Image.open(query_image_path).convert("RGB"))
 
         gcam.save_decomposed_figure(
-            attributions=attributions,
+            attributions=attr_display,
             combined_heatmap=combined,
             query_img=query_img,
             cos_sim=cos_sim,
@@ -989,8 +993,10 @@ class Img2Vec:
         )
 
         if save_npy:
-            gcam.save_decomposed_npy(attributions, query_name, target_name,
-                                     output_dir)
+            gcam.save_decomposed_npy(attr_raw, query_name, target_name,
+                                     output_dir, suffix="_raw")
+            gcam.save_decomposed_npy(attr_display, query_name, target_name,
+                                     output_dir, suffix="_display")
             gcam.save_npy(combined, query_name, target_name, output_dir)
 
         print(
@@ -998,4 +1004,4 @@ class Img2Vec:
             f"{output_dir}/{query_name}_vs_{target_name}_gradcam_decomposed.png"
             f"  (cos_sim={cos_sim:.4f})"
         )
-        return attributions
+        return attr_raw

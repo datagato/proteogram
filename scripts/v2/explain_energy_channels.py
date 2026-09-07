@@ -60,6 +60,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from proteogram.v2.image_similarity import Img2Vec
+from proteogram.v2.masking import embed_array, load_padded_array
+from proteogram.v2.shapley import channel_shapley
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +148,30 @@ def channel_dominance_stats(attributions: np.ndarray) -> dict:
     a model driven by physics should show higher energy-channel attribution for
     truly similar proteins and lower for dissimilar ones.
 
+    IMPORTANT: ``attributions`` must be the **unnormalised** array returned by
+    ``Img2Vec.gradcam_decomposed_similarity`` / ``GradCAM.compute_decomposed``
+    (``attr_raw``).  Every statistic here compares magnitudes *across*
+    channels, which is only meaningful when the channels share a scale.  If a
+    per-channel min-max rescaled array is passed instead, all three channels
+    span [0, 1] by construction and the ratio degenerates into a comparison of
+    distribution shape rather than of how much the model relies on each force.
+
     Args:
-        attributions: Float32 array ``(3, H, W)``.
+        attributions: Float32 array ``(3, H, W)`` of raw attributions.
 
     Returns:
         Dict with keys: ch0_mean, ch1_mean, ch2_mean, dominant_channel,
         dominance_fraction, energy_distance_ratio.
     """
+    # Guard against the per-channel-rescaled array being passed by mistake:
+    # its signature is every channel spanning exactly [0, 1].
+    if all(np.isclose(attributions[k].min(), 0.0) and
+           np.isclose(attributions[k].max(), 1.0) for k in range(3)):
+        print('  WARNING: attributions look per-channel min-max normalised '
+              '(every channel spans exactly [0, 1]).  Cross-channel statistics '
+              'including the Energy/Distance ratio are not meaningful on such '
+              'an array — pass the raw attributions instead.')
+
     means = [attributions[k].mean() for k in range(3)]
     dominant = int(np.argmax(means))
     channel_names = ['VdW (R)', 'Electrostatic (G)', 'Distance/Hydrophob (B)']
@@ -197,6 +216,12 @@ def main():
                         help="Torch device (default: auto-detect).")
     parser.add_argument('--save_npy', action='store_true',
                         help="Also save raw attribution arrays as .npy files.")
+    parser.add_argument('--no_shapley', action='store_true',
+                        help="Skip the exact channel-level Shapley values "
+                             "(8 extra forward passes per pair). They are the "
+                             "axiomatically grounded counterpart to the "
+                             "gradient-based E/D ratio, so this is normally "
+                             "worth the cost.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -254,9 +279,24 @@ def main():
                 stats['category'] = category
                 stats['query_id'] = query_id
                 stats['target_id'] = target_id
+
+                # Exact channel-level Shapley values (8 forward passes).
+                # Unlike the gradient-based E/D ratio these satisfy the
+                # efficiency axiom, so they are a share of a real quantity:
+                # sum(phi) == cos(query, target) - cos(neutral, target).
+                if not args.no_shapley:
+                    q_arr = load_padded_array(query_path)
+                    t_arr = load_padded_array(target_path)
+                    t_emb = embed_array(img2vec.embed, t_arr, img2vec.device)
+                    stats.update(channel_shapley(
+                        img2vec.embed, img2vec.device, q_arr, t_emb))
+
                 stats_rows.append(stats)
-                print(f"dominant={stats['dominant_channel']} "
-                      f"({stats['dominance_fraction']:.0%})")
+                msg = (f"dominant={stats['dominant_channel']} "
+                       f"({stats['dominance_fraction']:.0%})")
+                if 'energy_share' in stats:
+                    msg += f"  shapley energy share={stats['energy_share']:.1%}"
+                print(msg)
             except Exception as exc:
                 print(f"ERROR: {exc}")
 
@@ -280,11 +320,32 @@ def main():
             print(f"    VdW (R):                    {grp['ch0_mean'].mean():.4f}")
             print(f"    Electrostatic (G):          {grp['ch1_mean'].mean():.4f}")
             print(f"    Distance/Hydro (B):         {grp['ch2_mean'].mean():.4f}")
-            print(f"    Energy/Distance ratio:      {ratio:.3f}  ← key paper metric")
+            print(f"    Energy/Distance ratio:      {ratio:.3f}  (gradient-based heuristic)")
             print(f"    Dominant channel:           {grp['dominant_channel'].mode().iloc[0]}")
+            if 'energy_share' in grp.columns:
+                print(f"    -- exact channel Shapley --")
+                print(f"    phi ch0 / ch1 / ch2:        "
+                      f"{grp['shap_ch0'].mean():+.4f} / "
+                      f"{grp['shap_ch1'].mean():+.4f} / "
+                      f"{grp['shap_ch2'].mean():+.4f}")
+                print(f"    explained similarity:       {grp['explained_delta'].mean():+.4f}"
+                      f"  (cos_full - cos_neutral)")
+                print(f"    energy share of that:       {grp['energy_share'].mean():.1%}"
+                      f"   (no-preference baseline = 66.7%)")
+                print(f"    energy share vs baseline:   "
+                      f"{grp['energy_share_vs_null'].mean():+.1%}"
+                      f"  ← axiomatic replacement for E/D; >0 means the energy "
+                      f"channels carry more than their share")
+                print(f"    Shapley E/D ratio:          "
+                      f"{grp['shap_energy_distance_ratio'].mean():.3f}"
+                      f"   (no-preference baseline = 2.0)")
         print("-" * 70)
         print("  Energy/Distance ratio increases with structural similarity →")
         print("  physics channels carry more weight for genuinely similar proteins.")
+        if 'efficiency_residual' in stats_df.columns:
+            worst = stats_df['efficiency_residual'].abs().max()
+            print(f"  Shapley efficiency check: max |sum(phi) - explained| = {worst:.2e}"
+                  f"  (must be ~0)")
 
     print("\nDone.")
 

@@ -5,6 +5,12 @@ from .martini_nonbonded_forces import MartiniNonBondedForceModel
 from .losses import HierarchicalTripletLoss, HierarchicalPKSampler, SCOPE_LEVELS
 from .faiss_search import FaissIndex
 from .gradcam import GradCAM
+from .shapley import (
+    channel_shapley,
+    residue_shapley,
+    exact_shapley,
+    permutation_shapley,
+)
 from .normalisation import (
     CHANNEL_NAMES,
     load_norm_stats,
@@ -25,6 +31,10 @@ __all__ = [
     'SCOPE_LEVELS',
     'FaissIndex',
     'GradCAM',
+    'channel_shapley',
+    'residue_shapley',
+    'exact_shapley',
+    'permutation_shapley',
     'CHANNEL_NAMES',
     'load_norm_stats',
     'save_norm_stats',

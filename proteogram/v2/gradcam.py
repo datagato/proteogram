@@ -32,6 +32,43 @@ from PIL import Image
 
 
 # ---------------------------------------------------------------------------
+# Preprocessing constants
+# ---------------------------------------------------------------------------
+
+#: ImageNet normalisation applied by the training pipeline (and mirrored here).
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+#: Neutral pixel value used both as the pad fill in ``_pad_to_size`` and as the
+#: structural-zero sentinel written by ``normalisation.ZERO_FILL_VALUE``.
+#: Attribution is measured relative to this value — see ``_input_baseline``.
+NEUTRAL_PIXEL_VALUE = 128
+
+
+def _input_baseline(device: torch.device) -> torch.Tensor:
+    """Return the ImageNet-normalised value of the neutral pixel, per channel.
+
+    Grad × Input attribution multiplies the gradient by the *input value*, so
+    what counts as "no signal" must be the neutral sentinel (128), not 0.
+    After ImageNet normalisation 128 maps to a different number in each
+    channel (+0.074 R, +0.205 G, +0.426 B — a ~6x spread), so using the raw
+    normalised tensor gives every channel a different attribution floor purely
+    from preprocessing constants, and makes padding / structural-zero regions
+    accrue non-zero attribution.
+
+    Subtracting this baseline makes the multiplier ``(pixel - 128) / std_k``.
+    The three ``std`` values differ by under 2%, so channels become directly
+    comparable and genuinely empty regions contribute exactly zero.
+
+    Returns:
+        Float tensor of shape ``(1, 3, 1, 1)`` on ``device``.
+    """
+    v = NEUTRAL_PIXEL_VALUE / 255.0
+    vals = [(v - m) / s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)]
+    return torch.tensor(vals, dtype=torch.float32, device=device).view(1, 3, 1, 1)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -119,7 +156,7 @@ def _preprocess_image(image_path: str) -> torch.Tensor:
 
     transform = T.Compose([
         T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        T.Normalize(mean=list(IMAGENET_MEAN), std=list(IMAGENET_STD)),
     ])
     return transform(pil).unsqueeze(0)          # (1, 3, H, W)
 
@@ -399,9 +436,15 @@ class GradCAM:
 
         Returns:
             Tuple of:
-            - attributions: Float32 numpy array of shape ``(3, H, W)``, values
-              in ``[0, 1]``.  ``attributions[k]`` is the attribution for
-              channel k.
+            - attr_display: Float32 array ``(3, H, W)``, each channel
+              independently min-max scaled to ``[0, 1]``.  **For plotting
+              only** — that per-channel rescaling destroys cross-channel
+              magnitude comparability, so never aggregate across channels
+              with it (this is what silently broke the Energy/Distance ratio).
+            - attr_raw: Float32 array ``(3, H, W)`` of unnormalised
+              baseline-corrected Grad × Input magnitudes.  Directly comparable
+              across channels — use this for any statistic that combines or
+              compares channels.
             - cos_sim: Scalar cosine similarity (float).
         """
         query  = query_tensor.to(self.device).float().requires_grad_(True)
@@ -425,24 +468,34 @@ class GradCAM:
 
         # Gradient w.r.t. input: (1, 3, H, W)
         grad = query.grad.detach()                       # (1, 3, H, W)
-        inp  = query_tensor.to(self.device).float()      # (1, 3, H, W)
+        # .detach() is required: on CPU ``.to(device).float()`` returns the
+        # very tensor that had requires_grad_(True) set on it in-place above,
+        # so without this the product carries a grad_fn and .numpy() raises.
+        inp  = query_tensor.to(self.device).float().detach()   # (1, 3, H, W)
 
-        # Gradient × Input attribution per channel
-        # abs() keeps both excitatory and inhibitory contributions
-        attr = (grad * inp).abs()                        # (1, 3, H, W)
-        attr = attr.squeeze(0).cpu().numpy()             # (3, H, W)
+        # Baseline-corrected Gradient × Input attribution per channel.
+        # The baseline is the neutral sentinel (128) rather than 0 so that the
+        # per-channel offsets introduced by ImageNet normalisation cancel and
+        # empty regions score zero — see _input_baseline() for why.
+        # abs() keeps both excitatory and inhibitory contributions.
+        baseline = _input_baseline(self.device)          # (1, 3, 1, 1)
+        attr = (grad * (inp - baseline)).abs()           # (1, 3, H, W)
+        attr_raw = attr.squeeze(0).cpu().numpy().astype(np.float32)   # (3, H, W)
 
-        # Normalise each channel independently to [0, 1]
-        out = np.zeros_like(attr, dtype=np.float32)
+        # Display copy: each channel independently min-max scaled to [0, 1] so
+        # every panel of the figure uses its full colourmap.  This is a
+        # presentation transform ONLY — it makes channels mutually
+        # incomparable, so cross-channel statistics must use attr_raw.
+        attr_display = np.zeros_like(attr_raw, dtype=np.float32)
         for k in range(3):
-            ch = attr[k]
+            ch = attr_raw[k]
             mn, mx = ch.min(), ch.max()
             if mx > mn:
-                out[k] = (ch - mn) / (mx - mn)
+                attr_display[k] = (ch - mn) / (mx - mn)
             else:
-                out[k] = ch
+                attr_display[k] = ch
 
-        return out, cos_sim_val
+        return attr_display, attr_raw, cos_sim_val
 
     def compute_decomposed_from_paths(
         self,
@@ -456,9 +509,9 @@ class GradCAM:
             target_path: Path to target proteogram JPG.
 
         Returns:
-            Tuple of:
-            - attributions: Float32 numpy array of shape ``(3, H, W)``.
-            - cos_sim: Cosine similarity (float).
+            Tuple of ``(attr_display, attr_raw, cos_sim)`` — see
+            :meth:`compute_decomposed` for the distinction between the two
+            attribution arrays.
         """
         q_tensor = _preprocess_image(query_path)
         t_tensor = _preprocess_image(target_path)
@@ -555,20 +608,24 @@ class GradCAM:
         query_name: str,
         target_name: str,
         output_dir: str,
+        suffix: str = "",
     ) -> str:
-        """Save raw per-channel attributions as a ``.npy`` file.
+        """Save per-channel attributions as a ``.npy`` file.
 
         Args:
             attributions: Float32 array ``(3, H, W)``.
             query_name:   SCOPe ID of query.
             target_name:  SCOPe ID of target.
             output_dir:   Destination directory.
+            suffix:       Optional filename suffix, e.g. ``"_raw"``, used to
+                          keep the unnormalised and display arrays apart.
 
         Returns:
             Absolute path of the saved ``.npy`` file.
         """
         os.makedirs(output_dir, exist_ok=True)
         stem = f"{query_name}_vs_{target_name}"
-        out_path = os.path.join(output_dir, f"{stem}_gradcam_decomposed.npy")
+        out_path = os.path.join(
+            output_dir, f"{stem}_gradcam_decomposed{suffix}.npy")
         np.save(out_path, attributions)
         return out_path

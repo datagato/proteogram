@@ -55,15 +55,17 @@ In the original Proteogram Grad-CAM implementation (already present before this 
 
 The original heatmap answers **WHERE** the model focused. The new decomposed Grad-CAM answers **WHICH FORCE** drove the focus.
 
-Instead of computing one combined heatmap over all three channels, we compute three separate attribution maps — one per input channel — using **Gradient × Input** saliency:
+Instead of computing one combined heatmap over all three channels, we compute three separate attribution maps — one per input channel — using **baseline-corrected Gradient × Input** saliency:
 
 ```
-attribution_k(i, j) = |∂(cosine_sim) / ∂(input[k, i, j])| × |input[k, i, j]|
+attribution_k(i, j) = | ∂(cosine_sim) / ∂(input[k, i, j])  ×  (input[k, i, j] − baseline_k) |
 ```
 
 In plain English: for each residue pair (i, j) and each physical channel k, this measures "how much would the cosine similarity change if I slightly changed the VdW / electrostatic / distance value at this position?"
 
-The multiplication by the actual input value is important — it means we weight the gradient by the magnitude of the signal. A large gradient at a pixel where the energy is near-zero doesn't matter; a large gradient at a pixel with strong VdW energy matters a lot.
+The multiplication by the input value is important — it weights the gradient by the magnitude of the signal. A large gradient at a pixel carrying no energy doesn't matter; a large gradient at a pixel with strong VdW energy matters a lot.
+
+**Why the baseline term.** "No signal" in a proteogram is the neutral sentinel 128 (used both as the pad fill and, via `normalisation.ZERO_FILL_VALUE`, for structural zeros) — not 0. After ImageNet normalisation, 128 maps to a *different* value in each channel (+0.074 R, +0.205 G, +0.426 B — a ~6× spread), so multiplying by the raw normalised input gives each channel a different attribution floor purely from preprocessing constants, and makes padding and structural-zero regions accrue attribution they should not have. Subtracting `baseline_k` makes the multiplier `(pixel − 128) / std_k`; the three `std` values differ by under 2%, so the channels become directly comparable and genuinely empty regions score exactly zero.
 
 ### Output
 
@@ -83,7 +85,18 @@ From the three channel attributions, we compute:
 Energy/Distance ratio = (mean VdW attribution + mean Electrostatic attribution) / mean Distance attribution
 ```
 
-This ratio measures how much the model relies on **physical energy terms** (VdW + electrostatic) relative to **pure geometry** (distance) when assessing similarity. A ratio of 1.0 means equal reliance; 2.0 means the model uses energy terms twice as intensively as distance.
+This ratio measures how much the model relies on **physical energy terms** (VdW + electrostatic) relative to **pure geometry** (distance) when assessing similarity.
+
+> **Correction — the no-preference baseline is 2.0, not 1.0.** An earlier
+> version of this document stated that "a ratio of 1.0 means equal reliance."
+> That is wrong: the numerator aggregates *two* channels and the denominator
+> *one*, so a model with no channel preference whatsoever scores **2.0**. A
+> ratio of 1.77 is therefore *below* no-preference — relatively
+> distance-leaning — rather than evidence of energy dominance. Any
+> interpretation of the older E/D figures that read them against 1.0 has the
+> direction of the effect backwards.
+
+**The ratio must be computed on unnormalised attributions.** `compute_decomposed()` returns two arrays: `attr_display`, in which each channel is independently min-max scaled to [0, 1] so every panel of the figure uses its full colourmap, and `attr_raw`, the unnormalised magnitudes. Every statistic here compares magnitudes *across* channels, which is only meaningful when the channels share a scale — on a per-channel-rescaled array all three channels span [0, 1] by construction and the ratio degenerates into a comparison of distribution shape rather than of reliance on each force. `Img2Vec.gradcam_decomposed_similarity()` therefore returns `attr_raw`, and `channel_dominance_stats()` warns if it is handed an array bearing the min-max signature.
 
 ### Files changed
 
@@ -92,6 +105,7 @@ This ratio measures how much the model relies on **physical energy terms** (VdW 
 | `proteogram/v2/gradcam.py` | Added `compute_decomposed()`, `compute_decomposed_from_paths()`, `save_decomposed_figure()`, `save_decomposed_npy()` methods to the `GradCAM` class. Channel labels and colourmap constants added. Fixed `tight_layout` warning by switching to `layout="constrained"`. |
 | `proteogram/v2/image_similarity.py` | Added `gradcam_decomposed_similarity()` wrapper method to `Img2Vec`, making decomposed Grad-CAM accessible from the main API. |
 | `scripts/v2/explain_energy_channels.py` | **New script.** Handles pair selection (manual via TSV or automatic via USalign categories), runs decomposed Grad-CAM on all pairs, saves figures, computes and saves channel attribution statistics CSV. |
+| `scripts/v2/validate_attribution_faithfulness.py` | **New script.** Deletion / insertion curves testing whether the attribution maps actually track what the model relies on, versus a random-ordering control. |
 
 ### How to run
 
@@ -119,6 +133,12 @@ The `--auto` flag selects three categories of protein pairs automatically:
 
 ## Example Output (Illustrative)
 
+> **These numbers predate the E/D ratio and baseline-correction fixes** and
+> were computed on per-channel-rescaled attributions, so they are not
+> comparable to output from the current code and should not be quoted. They
+> are retained purely to illustrate the shape of the report. Re-run to get
+> figures that mean what the metric claims.
+
 The table below is from an earlier internal run of `explain_energy_channels.py`
 against a plain CrossEntropy-trained baseline model, with the default
 `--top_k_auto 5` (5 pairs per category — a small, illustrative sample, not a
@@ -139,6 +159,66 @@ artifact of a 5-pair sample, increase `--top_k_auto` substantially (20+, or
 all available pairs) and check variance across pairs, not just the mean.
 
 ---
+
+## Channel-Level Shapley Values (the axiomatic replacement for E/D)
+
+The E/D ratio, even computed correctly on raw attributions, is a heuristic:
+nothing guarantees that a ratio of mean `|grad × input|` measures "reliance."
+`proteogram/v2/shapley.py` provides a grounded alternative that treats the
+three channels as three players in a cooperative game.
+
+With only 3 players, Shapley values are computed **exactly** from all 8
+coalitions — 8 forward passes per pair, no sampling. The payoff of a coalition
+is the cosine similarity when only those channels retain their real values and
+the rest are masked to the neutral sentinel. This satisfies **efficiency**:
+
+```
+phi_ch0 + phi_ch1 + phi_ch2  ==  cos(query, target) − cos(neutral, target)
+```
+
+So each channel's number is a share of a genuinely measurable quantity, and
+"VdW accounts for 42% of this pair's similarity" becomes a falsifiable claim
+rather than a unit-free index. The computation reports
+`efficiency_residual` as a built-in self-check — it must be ~0.
+
+It runs by default in `explain_energy_channels.py` alongside the gradient-based
+E/D ratio, so the two can be compared on identical pairs (`--no_shapley` to
+skip). Report `energy_share_vs_null`, which is already expressed relative to
+the 2/3 no-preference baseline, rather than the raw share.
+
+## Validating That the Attributions Are Faithful
+
+A heatmap that looks convincing is not evidence that the model relies on what
+it highlights. `scripts/v2/validate_attribution_faithfulness.py` tests that
+property directly with deletion / insertion curves (Petsiuk et al., RISE,
+2018), comparing both attribution methods against a random-ordering control:
+
+- **Deletion** — progressively replace the highest-attributed regions of the
+  query with the neutral sentinel, re-embed, re-measure cosine similarity. A
+  faithful map makes similarity collapse quickly, so **lower AUC is better**.
+- **Insertion** — start from an all-neutral image and restore the
+  highest-attributed regions first. **Higher AUC is better.**
+
+```bash
+# From scripts/v2/
+uv run python validate_attribution_faithfulness.py \
+    --model_file /path/to/trained_model.pt \
+    --proteograms_dir /path/to/proteograms/eval \
+    --auto \
+    --usalign_results /path/to/usalign_out.tsv \
+    --annotations_tsv /path/to/annotations.tsv \
+    --output_dir /path/to/faithfulness
+```
+
+`--granularity residue` (the default) masks whole residues — row *i* plus
+column *i* — which matches how a proteogram encodes structure and is the fair
+setting when comparing against the coarse Grad-CAM map; `pixel` masks
+individual residue pairs.
+
+**How to read it:** an attribution method whose faithfulness gap does not
+clearly beat `random` is not explaining the model, whatever its heatmaps look
+like. Run this before quoting any attribution-derived result, including the
+E/D ratio.
 
 ## Recommended Next Steps
 
@@ -170,6 +250,10 @@ The Energy/Distance ratio — `(mean(A_VdW) + mean(A_electrostatic)) / mean(A_di
 
 | Limitation | Impact | Mitigation |
 |------------|--------|-----------|
+| **The combined Grad-CAM panel cannot resolve residue pairs** | ResNet18's last conv layer is **7×7** for a 200×200 proteogram, bilinearly upsampled to 200×200 — each cell covers ~29×29 pixels ≈ **816 residue pairs**. Per-residue-pair claims are only supportable from the Grad × Input panels, which are genuinely per-pixel; the two appear side by side in the same figure at different effective granularities | Read the combined panel as regional, not per-pair; use the decomposed panels for residue-pair claims |
 | 5 pairs per category by default in E/D ratio computation | Underpowered; high variance; not publishable as is | Increase to ≥ 20 pairs or use all available pairs |
-| Gradient × Input vs Integrated Gradients | G×I attribution does not satisfy completeness axiom; can miss saturation effects at zero input | Run IG as ablation; expect similar E/D ratio trend |
+| Gradient × Input vs Integrated Gradients | The baseline correction fixes the channel-offset bias, but G×I still does not satisfy the completeness axiom and can miss saturation effects | Run IG as ablation (it reuses the same 128 baseline); expect a similar E/D trend |
+| Attribution is computed w.r.t. the query only | The target is detached, so `explain(A,B) ≠ explain(B,A)` even though `cos(A,B)` is symmetric — half the evidence is structurally invisible | Report both directions, or average them |
+| Grad-CAM applies ReLU to the CAM | Regions that *decreased* similarity are dropped, so "why is this not a match" is unanswerable | Inspect signed CAMs if negative evidence matters |
+| Channel↔force mapping is triangle-dependent | Because the proteogram stacks two maps per channel (upper vs. rotated lower triangle), channel 0 is VdW-attractive in the upper triangle and ES-attractive in the lower — "channel 0 = VdW" is only half true | Split statistics by triangle before attributing to a named force |
 | No variance/significance reporting in the script's console summary | A single mean per category can look like a clean trend even when driven by 1-2 outlier pairs | Compute per-category std/CI from `channel_attribution_stats.csv` before quoting a ratio |
