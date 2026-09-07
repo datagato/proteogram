@@ -50,6 +50,25 @@ if __name__ == '__main__':
     parser.add_argument('--embed', action=argparse.BooleanOptionalAction, default=True,
                         help='Recompute and save embeddings (default: True). '
                              'Use --no-embed to load from embed_file instead.')
+    # ── FAISS options ────────────────────────────────────────────────────────
+    parser.add_argument('--faiss', action='store_true',
+                        help=(
+                            'Use FAISS ANN index for similarity search instead of '
+                            'brute-force cosine similarity.  Much faster for large '
+                            'corpora (> 10 K proteins).  Requires faiss-cpu or '
+                            'faiss-gpu to be installed.'
+                        ))
+    parser.add_argument('--faiss_pq', action='store_true',
+                        help=(
+                            'Use IVF-PQ compressed FAISS index (recommended for '
+                            '> 100 K proteins).  Slightly lower recall but 4-32x '
+                            'lower memory than IVFFlat.'
+                        ))
+    parser.add_argument('--faiss_index_file', type=str, default=None,
+                        help=(
+                            'Path to save / load the FAISS index.  Defaults to '
+                            'embed_file with a .faiss extension.'
+                        ))
     args = parser.parse_args()
 
     # Run embedding vs loading saved embeddings
@@ -114,6 +133,14 @@ if __name__ == '__main__':
                       if os.path.splitext(os.path.basename(f))[0] not in excluded_sids]
         print(f'Excluded {before - len(prot_files)} proteograms from class(es): '
               + ', '.join(sorted(excluded)))
+
+    if not prot_files:
+        raise ValueError(
+            'No proteogram .jpg files found for similarity search. '\
+            f'Checked dataset_dir={dataset_dir!r}. '\
+            'If you are running from scripts/v2/, ensure config paths are correct '\
+            'relative to that working directory.'
+        )
         
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
@@ -184,6 +211,11 @@ if __name__ == '__main__':
     with torch.no_grad():
         if embed:
            img_sim.embed_dataset()
+           if not img_sim.dataset:
+               raise ValueError(
+                   'Embedding dataset is empty after embed_dataset(). '\
+                   'Verify input proteogram files are readable and preprocessing succeeded.'
+               )
            # Save embeddings
            with open(embed_file, 'wb') as pklout:
                pickle.dump(img_sim.dataset, pklout)
@@ -192,6 +224,11 @@ if __name__ == '__main__':
             if embed_file:
                 with open(embed_file, 'rb') as pklin:
                     img_sim.dataset = pickle.load(pklin)
+            if not img_sim.dataset:
+                raise ValueError(
+                    'Loaded embedding dataset is empty. '\
+                    f'Check embed_file={embed_file!r} or rerun with --embed.'
+                )
             
         # Search to find similar images using cosine-similarity amongst embeddings.
         # Save all corpus results (including self-hit) so Recall@K can be computed at
@@ -199,9 +236,29 @@ if __name__ == '__main__':
         # Image saving is done separately at top_k to avoid PIL's 65500px dimension limit.
         start = time()
         n_results = len(prot_files)  # all including self-hit
-        sim_time = img_sim.similarities(n=n_results,
-                                        save_result_images_dir=None,
-                                        pad_fn=_prep_fn)
+
+        if args.faiss:
+            # ── FAISS ANN search ─────────────────────────────────────────────
+            if args.faiss_index_file:
+                faiss_index_file = args.faiss_index_file
+            else:
+                base, _ = os.path.splitext(embed_file)
+                faiss_index_file = base + '.faiss'
+            if os.path.exists(faiss_index_file) and not args.overwrite:
+                print(f'Loading existing FAISS index from {faiss_index_file}')
+                img_sim.load_faiss_index(faiss_index_file)
+            else:
+                print(f'Building FAISS index (use_pq={args.faiss_pq}) ...')
+                img_sim.build_faiss_index(use_pq=args.faiss_pq)
+                img_sim.save_faiss_index(faiss_index_file)
+            sim_time = img_sim.similarities_faiss(n=n_results,
+                                                  save_result_images_dir=None,
+                                                  pad_fn=_prep_fn)
+        else:
+            # ── Brute-force cosine search (original) ─────────────────────────
+            sim_time = img_sim.similarities(n=n_results,
+                                            save_result_images_dir=None,
+                                            pad_fn=_prep_fn)
 
         # Save top-k result images with padding
         full_sim_dict = {k: list(v) for k, v in img_sim.sim_dict.items()}
@@ -222,7 +279,8 @@ if __name__ == '__main__':
         for i, image_path in enumerate(prot_files):
             try:
                 scores = img_sim.sim_dict[os.path.basename(image_path)]
-                df_res.iloc[i, :n_results] = [f'{a},{b}' for (a, b) in scores]
+                row_vals = [f'{a},{b}' for (a, b) in scores[:n_results]]
+                df_res.iloc[i, :len(row_vals)] = row_vals
             except KeyError as e:
                 print(f'Key error for {e}')
         # Reorder cols

@@ -23,6 +23,7 @@ dependencies = [
   "goatools>=1.4",
   "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main",
   "rcsb-api>=1.7.3",
+  "faiss-cpu>=1.13.2",
 ]
 
 [project.optional-dependencies]

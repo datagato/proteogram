@@ -757,3 +757,103 @@ class Img2Vec:
             self.display_clusters()
 
         return
+
+    # ------------------------------------------------------------------
+    # FAISS wrapper methods
+    # These are thin delegators to proteogram.v2.faiss_search.FaissIndex.
+    # The FaissIndex instance is stored as self._faiss so scripts can also
+    # access it directly if needed.
+    # ------------------------------------------------------------------
+
+    def build_faiss_index(self,
+                          use_pq: bool = False,
+                          nlist: int = None,
+                          nprobe: int = None,
+                          pq_m: int = 8,
+                          pq_nbits: int = 8) -> None:
+        """Build a FAISS ANN index from the currently loaded embedding dataset.
+
+        Delegates to :class:`~proteogram.v2.faiss_search.FaissIndex`.
+        After calling this, ``similarities_faiss()`` can be used as a fast
+        drop-in replacement for ``similarities()``.
+
+        Args:
+            use_pq:   Use IVF-PQ compressed index (recommended for > 100 K
+                      proteins).  Defaults to ``False`` (IVFFlat, exact).
+            nlist:    Voronoi cell count.  Defaults to ``sqrt(N)``.
+            nprobe:   Cells searched per query.  Defaults to ``nlist // 10``.
+            pq_m:     Sub-quantiser count (IVF-PQ only).
+            pq_nbits: Bits per sub-quantiser (IVF-PQ only).
+        """
+        from .faiss_search import FaissIndex
+        self._faiss = FaissIndex.from_dataset(
+            self.dataset,
+            use_pq=use_pq,
+            nlist=nlist,
+            nprobe=nprobe,
+            pq_m=pq_m,
+            pq_nbits=pq_nbits,
+        )
+
+    def similarities_faiss(self,
+                            n: int = 10,
+                            save_result_images_dir: str = None,
+                            pad_fn=None) -> float:
+        """ANN similarity search via FAISS — drop-in replacement for ``similarities()``.
+
+        Populates ``self.sim_dict`` with the same ``{filename: [(target, score)]}``
+        format so all downstream scripts work without modification.
+
+        Call ``build_faiss_index()`` (or ``load_faiss_index()``) first.
+
+        Args:
+            n:                      Top-N results per query (self-hit included
+                                    at rank 0).
+            save_result_images_dir: Optional directory to write result images.
+            pad_fn:                 Padding callable passed to ``save_images()``.
+
+        Returns:
+            Wall-clock seconds spent in FAISS search.
+        """
+        if not hasattr(self, '_faiss'):
+            raise RuntimeError(
+                "Call build_faiss_index() or load_faiss_index() before "
+                "similarities_faiss()."
+            )
+        start = time()
+        self.sim_dict = self._faiss.search_all(top_k=n)
+        elapsed = time() - start
+
+        if save_result_images_dir:
+            for image_path in self.sim_dict:
+                full_path = os.path.join(
+                    os.path.dirname(self.files[0]) if self.files else '',
+                    image_path,
+                )
+                self.save_images(full_path, save_result_images_dir,
+                                 scores_n_arr=self.sim_dict[image_path],
+                                 pad_fn=pad_fn)
+        return elapsed
+
+    def save_faiss_index(self, index_path: str) -> None:
+        """Persist the FAISS index to disk.
+
+        Args:
+            index_path: Destination file path (e.g. ``corpus.faiss``).
+                        A companion ``<index_path>.keys.pkl`` is written
+                        alongside.
+        """
+        if not hasattr(self, '_faiss'):
+            raise RuntimeError("No FAISS index to save.  Call build_faiss_index() first.")
+        self._faiss.save(index_path)
+
+    def load_faiss_index(self, index_path: str) -> None:
+        """Load a previously saved FAISS index.
+
+        Args:
+            index_path: Path to the ``.faiss`` file written by
+                        ``save_faiss_index()``.
+        """
+        from .faiss_search import FaissIndex
+        self._faiss = FaissIndex.load(index_path)
+
