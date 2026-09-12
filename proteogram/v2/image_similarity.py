@@ -20,6 +20,8 @@ import torchvision.transforms as transforms
 from kmeans_pytorch import kmeans
 from PIL import Image, ImageDraw, ImageFont
 
+from .faiss_search import FaissIndex
+
 
 class Img2Vec:
     """
@@ -110,6 +112,9 @@ class Img2Vec:
         self.image_clusters = {}
         self.cluster_centers = {}
         self.sim_dict = {}
+        # Built on demand by build_faiss_index()/load_faiss_index(); only
+        # similarities_faiss() needs it, similarities() ignores it entirely.
+        self.faiss_index = None
         self.files = self.validate_source(dataset_dir)
 
     def validate_model(self, model_name_or_path):
@@ -757,3 +762,67 @@ class Img2Vec:
             self.display_clusters()
 
         return
+
+    def build_faiss_index(self, use_pq=False, nlist=None, nprobe=None,
+                          pq_m=8, pq_nbits=8):
+        """Build a FAISS ANN index over the currently loaded embedding dataset.
+
+        The index is kept on self.faiss_index, so callers that need more than
+        similarities_faiss() offers can reach through to it directly. See
+        proteogram.v2.faiss_search.FaissIndex for what the arguments mean.
+
+        Parameters:
+        -----------
+        use_pq: use a product-quantised index, for corpora large enough that
+            the uncompressed vectors are a memory problem (roughly >100k).
+        nlist: number of Voronoi cells, defaults to sqrt(N).
+        nprobe: cells visited per query, defaults to nlist // 10.
+        pq_m: number of PQ sub-quantisers, IVF-PQ only.
+        pq_nbits: bits per sub-quantiser, IVF-PQ only.
+        """
+        self.faiss_index = FaissIndex.from_dataset(self.dataset, use_pq=use_pq,
+                                                   nlist=nlist, nprobe=nprobe,
+                                                   pq_m=pq_m, pq_nbits=pq_nbits)
+
+    def similarities_faiss(self, n=10, save_result_images_dir=None, pad_fn=None):
+        """ANN equivalent of similarities(), backed by FAISS.
+
+        Fills self.sim_dict with the same {filename: [(target, score), ...]}
+        structure, self-hit included at rank 0, so downstream scripts do not
+        need to know which search path produced it.
+
+        Call build_faiss_index() or load_faiss_index() first.
+
+        Parameters:
+        -----------
+        n: number of results per query, including the self-hit.
+        save_result_images_dir: directory to write result images to, or None.
+        pad_fn: padding callable handed to save_images().
+
+        Returns the seconds spent in the FAISS search.
+        """
+        if self.faiss_index is None:
+            raise RuntimeError('No FAISS index, call build_faiss_index() or '
+                               'load_faiss_index() before similarities_faiss().')
+        start = time()
+        self.sim_dict = self.faiss_index.search_all(top_k=n)
+        elapsed = time() - start
+
+        if save_result_images_dir:
+            corpus_dir = os.path.dirname(self.files[0]) if self.files else ''
+            for image_path in self.sim_dict:
+                self.save_images(os.path.join(corpus_dir, image_path),
+                                 save_result_images_dir,
+                                 scores_n_arr=self.sim_dict[image_path],
+                                 pad_fn=pad_fn)
+        return elapsed
+
+    def save_faiss_index(self, index_path):
+        """Write the FAISS index to index_path, plus a .keys.pkl companion."""
+        if self.faiss_index is None:
+            raise RuntimeError('No FAISS index to save, call build_faiss_index() first.')
+        self.faiss_index.save(index_path)
+
+    def load_faiss_index(self, index_path):
+        """Load a FAISS index previously written by save_faiss_index()."""
+        self.faiss_index = FaissIndex.load(index_path)
