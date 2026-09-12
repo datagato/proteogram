@@ -2,9 +2,12 @@
 
 *Applies to `scripts/v2/measure_similarity_v2.py` and `proteogram.v2.FaissIndex`.*
 
-> **Read this before turning on `--faiss`.** Used with its default settings it
-> is *slower* than the brute-force path it replaces. The speedup only exists
-> if you also cap the ranking depth with `--faiss_top_k`.
+> **Read this before turning on `--faiss`.** Plain `--faiss` ranks the whole
+> corpus, which makes it *5x slower* than brute force. Always pair it with
+> `--faiss_top_k`. On the released 13,503-proteogram corpus a tuned index is
+> ~5x faster than brute force at 96% Recall@10; the shipped default is
+> deliberately conservative at 1.9x and 99.1%. See
+> [Measured cost and recall](#measured-cost-and-recall).
 
 ## Why
 
@@ -39,47 +42,74 @@ So: **cap the depth.** Set `--faiss_top_k` to the largest K you actually
 evaluate at. The script prints a warning that metrics beyond that K are not
 computable from the run.
 
-## Measured cost
+## Measured cost and recall
 
-Random 512-dimensional vectors, single CPU. `N=2008` is the size of the SCOPe
-eval set used in Step 4; `N=13503` is the released demo corpus.
+Measured on the **released 13,503-proteogram corpus embeddings** (the ResNet18
+superfamily CE checkpoint, 512-d), retrieving top-10, single machine, 4 FAISS
+threads against a 4-thread OpenBLAS brute-force reference. Brute-force top-10
+over this corpus takes 1.82 s.
 
-| corpus | brute force, full ranking | `--faiss`, full ranking | `--faiss --faiss_top_k 100` |
-|---|---|---|---|
-| N = 2,008 | 0.11 s | 1.46 s | 0.07 s |
-| N = 13,503 | 4.28 s | 77.37 s | 1.60 s |
+`nlist` defaults to `sqrt(N) = 116` here, so `nprobe` is the fraction of the
+corpus scanned. Recall@10 is measured against the exact cosine ranking:
 
-Index build time is small and is not the problem: 0.10 s at N=2,008 and 0.16 s
-at N=13,503.
+| `nprobe` | % of corpus scanned | time | vs brute force | Recall@10 |
+|---|---|---|---|---|
+| 1 | 0.9% | 0.14 s | **12.6x** | 0.841 |
+| 2 | 1.7% | 0.25 s | **7.3x** | 0.916 |
+| 3 | 2.6% | 0.34 s | 5.4x | 0.946 |
+| 4 | 3.4% | 0.38 s | 4.8x | 0.962 |
+| 6 | 5.2% | 0.52 s | 3.5x | 0.977 |
+| 8 | 6.9% | 0.69 s | 2.6x | 0.984 |
+| 11 *(default)* | 9.5% | 0.94 s | 1.9x | 0.991 |
+| 16 | 13.8% | 1.65 s | 1.1x | 0.997 |
+| 24 | 20.7% | 2.97 s | 0.6x | 0.999 |
+| 116 | 100% | 9.76 s | 0.2x | 1.000 |
 
-Two things to take from this. Plain `--faiss` costs you roughly **18x** at the
-demo corpus size and gets worse as the corpus grows, because the full ranking
-is exhaustive either way. With the depth capped at 100, FAISS is **~2.7x
-faster** than brute force at N=13,503, and the gap widens with N since the
-brute-force path stays O(N^2) while the capped ANN path does not.
+There is a broad useful range here. Around `nprobe = 4` (3.4% of the corpus)
+the index is roughly **5x faster than brute force while keeping 96% of the
+exact top-10**. Pushing to `nprobe = 1` buys 12.6x at 84% recall.
 
-Note that these are random vectors, which have no cluster structure for the
-coarse quantiser to exploit. Real proteogram embeddings are clustered by fold
-and superfamily, so recall at a given `nprobe` should be better than what
-random data suggests -- but measure it on your own corpus rather than assuming.
+The shipped default of `nprobe = nlist // 10` sits at the conservative end:
+1.9x faster, 99.1% recall. That is a defensible default -- it barely perturbs
+the ranking -- but if search time matters, lowering it is where the gains are.
 
-## Recall
+Two settings to avoid:
 
-ANN trades recall for speed, and the default `nprobe = nlist // 10` is
-aggressive. On random 512-d vectors, Recall@20 against the exact ranking was
-**0.26** at the default and **0.71** at `nprobe = nlist // 2`. Again, random
-vectors are the worst case -- but the shape of the tradeoff is real.
+- **A full-corpus ranking.** At `nprobe = nlist` the index scans everything and
+  is **5x slower** than brute force (9.76 s vs 1.82 s), since it does the same
+  work plus indexing overhead. This is what plain `--faiss` does by default,
+  which is why `--faiss_top_k` matters.
+- **`nprobe` above ~15% of the corpus.** Past that the index is slower than
+  brute force for recall gains in the third decimal place.
 
-Before trusting `--faiss` numbers in a comparison against GTalign, USalign or
-Foldseek, run both paths on the same corpus and confirm the retrieval metrics
-agree. If they do not, raise `nprobe`:
+Index build time is negligible and is not part of this tradeoff: 0.16 s.
 
-```python
-from proteogram.v2 import FaissIndex
+### Why random test vectors are not a proxy
 
-index = FaissIndex.from_dataset(img_sim.dataset)
-index.nprobe = index._index.nlist // 2   # clamped to [1, nlist]
-```
+Earlier revisions of this document quoted figures measured on random gaussian
+vectors. Those understated real performance by a wide margin and have been
+removed. At matched N and dimension, Recall@10 on real proteogram embeddings
+versus random vectors:
+
+| % of corpus scanned | real embeddings | random gaussian |
+|---|---|---|
+| 4.3% | 0.702 | 0.225 |
+| 8.7% | 0.869 | 0.307 |
+| 17.4% | 0.968 | 0.437 |
+| 34.8% | 0.998 | 0.633 |
+
+Roughly a 3x difference at the same scanned fraction. This is expected: the
+model is trained to cluster structures by fold and superfamily, so the coarse
+quantiser has genuine structure to exploit, whereas isotropic gaussian vectors
+have none. Benchmark against real embeddings.
+
+### Scaling
+
+The numbers above are for one corpus size. Brute-force cost grows as O(N^2)
+while the IVF path at fixed `nprobe/nlist` does not, so the advantage should
+widen with N -- but that has not been measured beyond 13,503 on real data, and
+the useful `nprobe` may shift as `nlist = sqrt(N)` grows. Re-run the sweep if
+you move to a substantially larger corpus.
 
 ## Usage
 
@@ -138,7 +168,7 @@ index = FaissIndex.load('corpus.faiss')
 | Parameter | Default | Effect |
 |---|---|---|
 | `nlist` | `sqrt(N)` | Voronoi cells. More cells means finer partitioning and slower training; capped at N |
-| `nprobe` | `nlist // 10` | Cells visited per query. **The main recall/speed dial** |
+| `nprobe` | `nlist // 10` | Cells visited per query. **The main recall/speed dial.** The default is conservative; `nlist // 30` gave ~5x at 96% Recall@10 on the released corpus |
 | `pq_m` | 8 | IVF-PQ sub-quantisers. Must divide the embedding dimension; reduced automatically until it does |
 | `pq_nbits` | 8 | Bits per sub-quantiser |
 

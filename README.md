@@ -354,10 +354,16 @@ Key optional flags:
 
 By default the script ranks the **entire** corpus for every query, so that
 Recall@K can be computed afterwards at any K. That is the right default for
-benchmarking, and it is why plain `--faiss` is *slower* than brute force: an
-exhaustive ranking gives an ANN index nothing to skip. Cap the ranking depth
-with `--faiss_top_k` to get the speedup, at the cost of not being able to
-evaluate beyond that depth.
+benchmarking, and it is why plain `--faiss` is *5x slower* than brute force: an
+exhaustive ranking gives an ANN index nothing to skip. Always pair `--faiss`
+with `--faiss_top_k`, at the cost of not being able to evaluate beyond that
+depth.
+
+On the released 13,503-proteogram corpus, a depth-capped index is **~5x faster
+than brute force while retaining 96% of the exact top-10**, and up to 12.6x if
+you accept 84%. The shipped `nprobe` default is deliberately conservative
+(1.9x, 99.1% recall); [docs/faiss_search.md](docs/faiss_search.md) has the full
+speed/recall sweep and how to tune it.
 
 ---
 
