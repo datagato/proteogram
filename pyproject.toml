@@ -23,7 +23,6 @@ dependencies = [
   "goatools>=1.4",
   "pyrotein @ git+https://github.com/carbonscott/pyrotein.git@main",
   "rcsb-api>=1.7.3",
-  "faiss-cpu>=1.13.2",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +40,10 @@ cuda12 = [
   "torch==2.3.0",
   "torchvision==0.18.0",
 ]
+# ANN search backend for Img2Vec.similarities_faiss(). Optional because
+# the brute-force similarities() path needs nothing extra. Swap faiss-cpu
+# for faiss-gpu on a CUDA box.
+search = ["faiss-cpu>=1.13.2"]
 test = ["pytest", "pytest-cov"]
 notebook = [
   "jupyterlab>=4.2.5",
@@ -49,7 +52,7 @@ notebook = [
 
 [tool.setuptools.packages.find]
 # Exclude patterns should match the full package name
-exclude = ["assets", "docs", "paper", "notebooks", "scripts", "tmp"] 
+exclude = ["assets", "docs", "paper", "notebooks", "scripts", "tests", "tmp"] 
 
 [build-system]
 requires = ["setuptools>=61.0"]

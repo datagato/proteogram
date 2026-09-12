@@ -2703,7 +2703,6 @@ version = "0.0.4"
 source = { editable = "." }
 dependencies = [
     { name = "biopython" },
-    { name = "faiss-cpu" },
     { name = "goatools" },
     { name = "kmeans-pytorch" },
     { name = "matplotlib" },
@@ -2737,6 +2736,9 @@ notebook = [
     { name = "jupyterlab" },
     { name = "nglview" },
 ]
+search = [
+    { name = "faiss-cpu" },
+]
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -2745,7 +2747,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "biopython", specifier = ">=1.8" },
-    { name = "faiss-cpu", specifier = ">=1.13.2" },
+    { name = "faiss-cpu", marker = "extra == 'search'", specifier = ">=1.13.2" },
     { name = "goatools", specifier = ">=1.4" },
     { name = "jupyterlab", marker = "extra == 'notebook'", specifier = ">=4.2.5" },
     { name = "kmeans-pytorch", specifier = ">=0.3" },
@@ -2775,7 +2777,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'cuda12'", specifier = "==0.18.0" },
     { name = "tqdm", specifier = ">=4.67" },
 ]
-provides-extras = ["cuda12", "test", "notebook"]
+provides-extras = ["cuda12", "search", "test", "notebook"]
 
 [[package]]
 name = "psutil"

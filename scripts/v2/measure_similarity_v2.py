@@ -50,25 +50,24 @@ if __name__ == '__main__':
     parser.add_argument('--embed', action=argparse.BooleanOptionalAction, default=True,
                         help='Recompute and save embeddings (default: True). '
                              'Use --no-embed to load from embed_file instead.')
-    # ── FAISS options ────────────────────────────────────────────────────────
+    # FAISS search options
     parser.add_argument('--faiss', action='store_true',
-                        help=(
-                            'Use FAISS ANN index for similarity search instead of '
-                            'brute-force cosine similarity.  Much faster for large '
-                            'corpora (> 10 K proteins).  Requires faiss-cpu or '
-                            'faiss-gpu to be installed.'
-                        ))
+                        help='Search with a FAISS ANN index instead of brute-force '
+                             'cosine similarity. Pays off on large corpora; on a few '
+                             'thousand proteograms the brute-force path is usually '
+                             'faster. Needs faiss-cpu or faiss-gpu installed.')
     parser.add_argument('--faiss_pq', action='store_true',
-                        help=(
-                            'Use IVF-PQ compressed FAISS index (recommended for '
-                            '> 100 K proteins).  Slightly lower recall but 4-32x '
-                            'lower memory than IVFFlat.'
-                        ))
+                        help='Use a product-quantised (IVF-PQ) FAISS index, which '
+                             'trades some recall for much lower memory. Worth it '
+                             'above roughly 100k proteograms.')
+    parser.add_argument('--faiss_top_k', type=int, default=None,
+                        help='Depth of the FAISS ranking to write out. Defaults to the '
+                             'whole corpus, which forces an exhaustive search and gives '
+                             'up the ANN speedup; set it to the largest K you evaluate '
+                             'at to keep the search approximate.')
     parser.add_argument('--faiss_index_file', type=str, default=None,
-                        help=(
-                            'Path to save / load the FAISS index.  Defaults to '
-                            'embed_file with a .faiss extension.'
-                        ))
+                        help='Where to save or load the FAISS index. Defaults to '
+                             'embed_file with a .faiss extension.')
     args = parser.parse_args()
 
     # Run embedding vs loading saved embeddings
@@ -135,13 +134,10 @@ if __name__ == '__main__':
               + ', '.join(sorted(excluded)))
 
     if not prot_files:
-        raise ValueError(
-            'No proteogram .jpg files found for similarity search. '\
-            f'Checked dataset_dir={dataset_dir!r}. '\
-            'If you are running from scripts/v2/, ensure config paths are correct '\
-            'relative to that working directory.'
-        )
-        
+        raise ValueError(f'No proteogram .jpg files found under {dataset_dir!r}. '
+                         'Config paths are resolved against the working directory, '
+                         'so check them if running from inside scripts/v2/.')
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
 
@@ -212,10 +208,8 @@ if __name__ == '__main__':
         if embed:
            img_sim.embed_dataset()
            if not img_sim.dataset:
-               raise ValueError(
-                   'Embedding dataset is empty after embed_dataset(). '\
-                   'Verify input proteogram files are readable and preprocessing succeeded.'
-               )
+               raise ValueError('embed_dataset() produced no embeddings. Check that the '
+                                'proteogram files are readable and preprocessing worked.')
            # Save embeddings
            with open(embed_file, 'wb') as pklout:
                pickle.dump(img_sim.dataset, pklout)
@@ -225,10 +219,8 @@ if __name__ == '__main__':
                 with open(embed_file, 'rb') as pklin:
                     img_sim.dataset = pickle.load(pklin)
             if not img_sim.dataset:
-                raise ValueError(
-                    'Loaded embedding dataset is empty. '\
-                    f'Check embed_file={embed_file!r} or rerun with --embed.'
-                )
+                raise ValueError(f'No embeddings in {embed_file!r}, rerun with --embed '
+                                 'to recompute them.')
             
         # Search to find similar images using cosine-similarity amongst embeddings.
         # Save all corpus results (including self-hit) so Recall@K can be computed at
@@ -238,24 +230,28 @@ if __name__ == '__main__':
         n_results = len(prot_files)  # all including self-hit
 
         if args.faiss:
-            # ── FAISS ANN search ─────────────────────────────────────────────
             if args.faiss_index_file:
                 faiss_index_file = args.faiss_index_file
             else:
-                base, _ = os.path.splitext(embed_file)
-                faiss_index_file = base + '.faiss'
+                faiss_index_file = os.path.splitext(embed_file)[0] + '.faiss'
             if os.path.exists(faiss_index_file) and not args.overwrite:
                 print(f'Loading existing FAISS index from {faiss_index_file}')
                 img_sim.load_faiss_index(faiss_index_file)
             else:
-                print(f'Building FAISS index (use_pq={args.faiss_pq}) ...')
+                print(f'Building FAISS index (use_pq={args.faiss_pq})')
                 img_sim.build_faiss_index(use_pq=args.faiss_pq)
                 img_sim.save_faiss_index(faiss_index_file)
-            sim_time = img_sim.similarities_faiss(n=n_results,
+            # An IVF search only returns what sits in the cells it probes, so
+            # asking for the full corpus ranking makes it scan every cell.
+            # Ranking less deeply is what keeps the search approximate, and fast.
+            faiss_top_k = min(args.faiss_top_k or n_results, n_results)
+            sim_time = img_sim.similarities_faiss(n=faiss_top_k,
                                                   save_result_images_dir=None,
                                                   pad_fn=_prep_fn)
+            if faiss_top_k < n_results:
+                print(f'Ranked the top {faiss_top_k} of {n_results} results per query; '
+                      f'metrics beyond K={faiss_top_k} cannot be computed from this run.')
         else:
-            # ── Brute-force cosine search (original) ─────────────────────────
             sim_time = img_sim.similarities(n=n_results,
                                             save_result_images_dir=None,
                                             pad_fn=_prep_fn)
@@ -273,16 +269,22 @@ if __name__ == '__main__':
         print(f'Took {time()-start} seconds overall (including optional image result saving).')
 
         # Create dataframe of results
-        scores_tmp = [[''] * n_results] * len(prot_files)
-        df_res = pd.DataFrame(scores_tmp, columns=[str(i) for i in range(n_results)])
+        # Width the table to the deepest ranking actually produced. The FAISS
+        # path can return fewer than n_results per query, and blank trailing
+        # cells read back as NaN, which evaluate_methods_v2.py cannot parse.
+        n_cols = min((len(v) for v in img_sim.sim_dict.values()), default=n_results)
+        scores_tmp = [[''] * n_cols] * len(prot_files)
+        df_res = pd.DataFrame(scores_tmp, columns=[str(i) for i in range(n_cols)])
         df_res['query_image'] = prot_files
         for i, image_path in enumerate(prot_files):
             try:
                 scores = img_sim.sim_dict[os.path.basename(image_path)]
-                row_vals = [f'{a},{b}' for (a, b) in scores[:n_results]]
-                df_res.iloc[i, :len(row_vals)] = row_vals
+                df_res.iloc[i, :n_cols] = [f'{a},{b}' for (a, b) in scores[:n_cols]]
             except KeyError as e:
                 print(f'Key error for {e}')
+        if n_cols < n_results:
+            print(f'Wrote {n_cols} of {n_results} possible result columns, limited by '
+                  f'the query with the fewest hits.')
         # Reorder cols
         df_res.drop('query_image', inplace=True, axis=1)
         df_res.insert(0, 'query_image', prot_files)
