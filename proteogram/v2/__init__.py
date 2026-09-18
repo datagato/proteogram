@@ -3,7 +3,9 @@ from .image_similarity import Img2Vec
 from .atomistic_nonbonded_forces import AtomisticNonBondedForceModel
 from .martini_nonbonded_forces import MartiniNonBondedForceModel
 from .losses import HierarchicalTripletLoss, HierarchicalPKSampler, SCOPE_LEVELS
+from .faiss_search import FaissIndex
 
 
 __all__ = ['ProteogramV2', 'Img2Vec', 'AtomisticNonBondedForceModel', 'MartiniNonBondedForceModel',
-           'HierarchicalTripletLoss', 'HierarchicalPKSampler', 'SCOPE_LEVELS']
+           'HierarchicalTripletLoss', 'HierarchicalPKSampler', 'SCOPE_LEVELS',
+           'FaissIndex']
