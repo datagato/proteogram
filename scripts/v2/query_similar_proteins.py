@@ -107,14 +107,17 @@ def load_annotations(annot_file):
 
 def lookup_label_row(label_df, filename):
     """Find the annotation row for a proteogram path, matched by
-    proteogram_file basename first, falling back to pdb_id_chain vs.
+    proteogram_file stem first, falling back to pdb_id_chain vs.
     the filename stem. Returns None if not found.
+
+    Both sides are compared without their extension so a label table stays
+    joinable across image formats — png is the current default, jpg for
+    tables written before the switch.
     """
-    basename = os.path.basename(filename)
-    stem = os.path.splitext(basename)[0]
+    stem = os.path.splitext(os.path.basename(filename))[0]
     if 'proteogram_file' in label_df.columns:
         match = label_df.loc[label_df['proteogram_file'].apply(
-            lambda x: os.path.basename(str(x))) == basename]
+            lambda x: os.path.splitext(os.path.basename(str(x)))[0]) == stem]
         if not match.empty:
             return match.iloc[0]
     if 'pdb_id_chain' in label_df.columns:
@@ -124,14 +127,14 @@ def lookup_label_row(label_df, filename):
     return None
 
 
-def compute_agreement(label_df, query_jpg, top_results, levels=SCOPE_LEVELS):
+def compute_agreement(label_df, query_image, top_results, levels=SCOPE_LEVELS):
     """Compute per-level structural agreement between the query and its
     top-K results.
 
     Returns a dict {level: (n_agree, n_labeled)} or None if the query
     itself has no annotation row.
     """
-    query_row = lookup_label_row(label_df, query_jpg)
+    query_row = lookup_label_row(label_df, query_image)
     if query_row is None:
         return None
 
@@ -323,14 +326,14 @@ if __name__ == '__main__':
         raise RuntimeError('Proteogram calculation returned no data.')
 
     query_name = os.path.splitext(os.path.basename(args.pdb_file))[0]
-    query_jpg  = os.path.join(args.output_dir, f'{query_name}.jpg')
-    plt.imsave(query_jpg, final_data.astype('uint8'))
+    query_image = os.path.join(args.output_dir, f'{query_name}.png')
+    plt.imsave(query_image, final_data.astype('uint8'))
     plt.close('all')
     del proteogram, final_data
     gc.collect()
-    if not os.path.isfile(query_jpg):
-        raise RuntimeError(f'Failed to save query proteogram — file not found after imsave: {query_jpg}')
-    print(f'Saved query proteogram to {query_jpg}')
+    if not os.path.isfile(query_image):
+        raise RuntimeError(f'Failed to save query proteogram — file not found after imsave: {query_image}')
+    print(f'Saved query proteogram to {query_image}')
 
     # --- Step 2: Load corpus embeddings and embed the query image ---
     print(f'Loading corpus embeddings from {embed_file}...')
@@ -342,7 +345,7 @@ if __name__ == '__main__':
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     _t0 = perf_counter()
-    img_sim = Img2Vec(model_file, dataset_dir=[query_jpg], device=device)
+    img_sim = Img2Vec(model_file, dataset_dir=[query_image], device=device)
     # Override transform to match training. ViT-B/16 checkpoints (trained with
     # --model vit) always resize to a fixed 224x224 (never pad) -- see
     # train_multiple_models_randomized_eval.py -- while CNN/ResNet18 checkpoints
@@ -368,7 +371,7 @@ if __name__ == '__main__':
     print('Embedding query proteogram...')
     _t0 = perf_counter()
     with torch.no_grad():
-        query_vec = img_sim.embed_image(query_jpg)
+        query_vec = img_sim.embed_image(query_image)
     timings['Query embedding'] = perf_counter() - _t0
 
     # --- Step 3: Cosine similarity against corpus ---
@@ -384,7 +387,7 @@ if __name__ == '__main__':
     scores.sort(key=lambda x: x[1], reverse=True)
 
     # Exclude the query protein itself if it appears in the corpus.
-    query_basename = os.path.basename(query_jpg)
+    query_basename = os.path.basename(query_image)
     scores_filtered = [(p, s) for p, s in scores
                        if os.path.basename(p) != query_basename]
     top_results = scores_filtered[:top_k]
@@ -403,7 +406,7 @@ if __name__ == '__main__':
     result_img_dir = os.path.join(args.output_dir, 'search_results')
     os.makedirs(result_img_dir, exist_ok=True)
     _t0 = perf_counter()
-    img_sim.save_images(query_jpg, result_img_dir, scores_n_arr=top_results, corpus_dir=corpus_dir,
+    img_sim.save_images(query_image, result_img_dir, scores_n_arr=top_results, corpus_dir=corpus_dir,
                         pad_fn=prep_fn)
     timings['Result image saved'] = perf_counter() - _t0
     print(f'\nResult image saved to {result_img_dir}/')
@@ -413,7 +416,7 @@ if __name__ == '__main__':
         print(f'\nLoading annotations from {args.annot_file}...')
         _t0 = perf_counter()
         label_df = load_annotations(args.annot_file)
-        agreement = compute_agreement(label_df, query_jpg, top_results)
+        agreement = compute_agreement(label_df, query_image, top_results)
         timings['Agreement calculation'] = perf_counter() - _t0
 
         print(f'\nStructural agreement within top {top_k} results:')

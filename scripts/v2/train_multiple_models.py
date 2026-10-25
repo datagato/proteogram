@@ -14,7 +14,6 @@ import copy
 from sched import scheduler
 import pandas as pd
 import numpy as np
-import glob
 import os
 import random
 import matplotlib
@@ -32,7 +31,7 @@ import torch.optim as optim
 import torchvision.models as tv_models
 import torchvision.transforms as transforms
 
-from proteogram.common import read_yaml
+from proteogram.common import read_yaml, find_proteogram_images
 
 
 matplotlib.use('agg')
@@ -75,7 +74,7 @@ class ProteogramDataset(Dataset):
         """
         self.annot_frame = pd.read_csv(tsv_file, sep='\t')
         self.root_dir = root_dir
-        self.files = glob.glob(os.path.join(self.root_dir, '*.jpg'))
+        self.files = find_proteogram_images(self.root_dir)
 
         if min_image_size > 0:
             small = []
@@ -104,7 +103,7 @@ class ProteogramDataset(Dataset):
         self.label_names = []
         missing = []
         for file in self.files:
-            bname = os.path.basename(file).replace('.jpg', '')
+            bname = os.path.splitext(os.path.basename(file))[0]
             row = self.annot_frame[self.annot_frame['SCOPeID'] == bname]
             if len(row) == 0:
                 missing.append(bname)
@@ -121,7 +120,7 @@ class ProteogramDataset(Dataset):
         if not paired:
             raise RuntimeError(
                 f'No images matched any entry in the TSV SCOPeID column. '
-                f'Check that image basenames (without .jpg) match the SCOPeID values.')
+                f'Check that image basenames (without extension) match the SCOPeID values.')
         self.files, self.label_names = zip(*paired)
         self.files, self.label_names = list(self.files), list(self.label_names)
 
@@ -192,7 +191,12 @@ class ProteogramDataset(Dataset):
         img_name = self.files[idx]
         label = torch.tensor(self.labels[idx])
         if self.pad:
-            image = plt.imread(img_name)
+            # PIL, not plt.imread: matplotlib returns uint8 [0,255] for JPEG but
+            # float32 [0,1] for PNG, so the gray pad below would land 128x out of
+            # range on PNG input and ToTensor (which rescales uint8 but not float)
+            # would pass it straight through. convert('RGB') also drops any alpha
+            # channel and matches pad_to_size() in measure_similarity_v2.py.
+            image = np.array(Image.open(img_name).convert('RGB'))
             H, W = image.shape[0], image.shape[1]
             DH, DW = self.new_size, self.new_size # desired height / width
             padding = (self.get_pad(H, DH), self.get_pad(W, DW), (0, 0))

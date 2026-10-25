@@ -90,19 +90,22 @@ if __name__ == '__main__':
                              'one per line.')
     args = parser.parse_args()
 
-    # Collect all JPGs recursively across all input directories
+    # Collect all proteogram images recursively across all input directories.
+    # png is create_v2_proteograms.py's default output format; jpg is still
+    # accepted so corpora built before the switch keep working.
     all_files = []
     for d in args.dirs:
         if not os.path.isdir(d):
             print(f'WARNING: {d} is not a directory, skipping.')
             continue
-        found = glob.glob(os.path.join(d, '**', '*.jpg'), recursive=True)
-        found += glob.glob(os.path.join(d, '**', '*.JPG'), recursive=True)
+        found = []
+        for ext in ('png', 'PNG', 'jpg', 'JPG'):
+            found += glob.glob(os.path.join(d, '**', f'*.{ext}'), recursive=True)
         print(f'  {d}: {len(found)} images')
         all_files.extend(found)
 
     if not all_files:
-        raise RuntimeError('No JPG files found in the specified directories.')
+        raise RuntimeError('No PNG or JPG files found in the specified directories.')
 
     # Warn about basename collisions — last file with that name wins in the pickle
     basenames = [os.path.basename(f) for f in all_files]

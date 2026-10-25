@@ -4,7 +4,6 @@ Proteogram (image) search
 import argparse
 import functools
 from time import time
-import glob
 import os
 import numpy as np
 import pandas as pd
@@ -15,7 +14,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 
 from proteogram.v2 import Img2Vec
-from proteogram.common import read_yaml
+from proteogram.common import read_yaml, find_proteogram_images
 
 
 def pad_to_size(img, target=200, fill=128):
@@ -112,7 +111,7 @@ if __name__ == '__main__':
     _confirm_overwrite(embed_file, 'embed_file')
     _confirm_overwrite(results_file, 'results_file')
 
-    prot_files = sorted(glob.glob(os.path.join(dataset_dir, '*.jpg')))
+    prot_files = find_proteogram_images(dataset_dir)
 
     if args.exclude_classes:
         excluded = {c.strip() for c in args.exclude_classes.split(',')}
@@ -134,7 +133,7 @@ if __name__ == '__main__':
               + ', '.join(sorted(excluded)))
 
     if not prot_files:
-        raise ValueError(f'No proteogram .jpg files found under {dataset_dir!r}. '
+        raise ValueError(f'No proteogram .jpg/.png files found under {dataset_dir!r}. '
                          'Config paths are resolved against the working directory, '
                          'so check them if running from inside scripts/v2/.')
 
