@@ -4,20 +4,6 @@
 
 Proteogram is a novel approach to protein structure similarity search that represents protein structures as image data, enabling the use of computer vision models for efficient and accurate similarity detection. This repository leverages the SCOPe 2.08 protein structure dataset and classification hierarchy (https://scop.berkeley.edu) both to train as well as evaluate models.
 
-### Proteogram v1: Distance, Hydrophobicity, and Charge Maps
-
-The original Proteogram approach creates an NxN 3-channel image representation (where N is the residue length) by stacking three categories of residue-level information:
-
-1. **Alpha-carbon backbone distances** - Pair-wise residue Cα distances (distogram)
-2. **Hydrophobicity similarities** - Residue-residue hydrophobicity comparisons
-3. **Charge similarities** - Residue-residue charge state comparisons
-
-This representation captures both spatial similarity through distograms and physicochemical properties through hydrophobicity and charge maps. The resulting RGB image is inherently sequence-alignment independent and can be processed by standard computer vision models to generate embedding vectors for cosine-similarity-based search.
-
-Example proteogram v1 (symmetric):
-
-![](assets/figures/3KFD_A.jpg)
-
 ### Proteogram v2: Incorporating MD Simulations
 
 Proteogram v2 extends the original approach by incorporating molecular dynamics (MD) simulations to compute physics-based residue-residue interaction energies. Instead of using static distance and property maps, v2 runs a complete MD simulation pipeline using OpenMM with the AMBER ff19SB force field to calculate:
@@ -54,7 +40,21 @@ Each of the six maps is independently min-max scaled to [0–255] before combini
 
 Example Proteogram v2 (asymmetric):
 
-![](assets/figures/d3kfda_.jpg)
+![](assets/figures/d3kfda_.png)
+
+### Proteogram v1: Distance, Hydrophobicity, and Charge Maps
+
+The original Proteogram approach creates an NxN 3-channel image representation (where N is the residue length) by stacking three categories of residue-level information:
+
+1. **Alpha-carbon backbone distances** - Pair-wise residue Cα distances (distogram)
+2. **Hydrophobicity similarities** - Residue-residue hydrophobicity comparisons
+3. **Charge similarities** - Residue-residue charge state comparisons
+
+This representation captures both spatial similarity through distograms and physicochemical properties through hydrophobicity and charge maps. The resulting RGB image is inherently sequence-alignment independent and can be processed by standard computer vision models to generate embedding vectors for cosine-similarity-based search.
+
+Example proteogram v1 (symmetric):
+
+![](assets/figures/3KFD_A.jpg)
 
 ## Getting started with Proteogram v2
 
@@ -179,10 +179,10 @@ model_file: /path/to/proteogram_model_resnet18_lr0.001_bs8_e53_seed0_max_image_s
 embed_file: /path/to/resnet18_lr0.001_bs8_e53_seed0_max_image_size300_input200_resize_min_class_size20_level-superfamily_lossce_acc93.9_cg_embeddings.pkl
 top_k: 5
 cg_method: martini  # coarse-grained Martini pipeline for query proteogram creation
-proteograms_for_sim_dir: /path/to/corpus/proteogram/images  # optional: parent or root dir containing corpus .jpg files (searched recursively)
+proteograms_for_sim_dir: /path/to/corpus/proteogram/images  # optional: parent or root dir containing corpus .png/.jpg files (searched recursively)
 ```
 
-> **Note:** `proteograms_for_sim_dir` is optional (allows the retrieval of the actual images themselves to build a composite image with query and targets). Set it to any directory that contains (or recursively contains) the corpus proteogram `.jpg` files. Without it, the side-by-side result image will show only the query proteogram, since the matching corpus images cannot be located on disk.
+> **Note:** `proteograms_for_sim_dir` is optional (allows the retrieval of the actual images themselves to build a composite image with query and targets). Set it to any directory that contains (or recursively contains) the corpus proteogram `.png` files (`.jpg` is also accepted, for corpora built before png became the default). Without it, the side-by-side result image will show only the query proteogram, since the matching corpus images cannot be located on disk.
 
 
 **Run from the `scripts/v2/` folder:**
@@ -200,7 +200,7 @@ Arguments:
 - `--pdb_file / -p`: Path to the query PDB file (required)
 - `--chain_id / -c`: Chain ID to extract, e.g. `A` (required)
 - `--cg_method`: `martini` (fast, coarse-grained; recommended) or `atomistic` (slow, all-atom). Defaults to `cg_method` in `config.yml`, or atomistic if unset
-- `--output_dir / -o`: Directory to save the query proteogram JPG and result images (default: current directory)
+- `--output_dir / -o`: Directory to save the query proteogram PNG and result images (default: current directory)
 - `--top_k / -k`: Number of top results to return (default: `top_k` from `config.yml`)
 - `--model_file` / `--embed_file`: Override the model checkpoint / corpus embeddings from `config.yml`
 - `--annot_file`: Optional SCOPe label file (`scope_eval_set_labels.tsv` format) — when provided and the query is present in it, prints a class/fold/superfamily/family agreement report for the top-K results
@@ -210,7 +210,7 @@ Arguments:
 > The query preprocessing (grid size, resize vs. pad, and the accepted chain-length cutoff) is read from the checkpoint metadata so the query is prepared exactly as the model was trained; the flags above are only needed to override that for legacy checkpoints.
 
 **Output:**
-- The query proteogram saved as `<pdb_basename>.jpg` in `--output_dir`
+- The query proteogram saved as `<pdb_basename>.png` in `--output_dir`
 - A ranked list of top-K similar proteins with cosine similarity scores printed to the console
 - A side-by-side result image saved to `<output_dir>/search_results/`
 - A per-step performance report (timings), plus the optional structural agreement report when `--annot_file` is given
@@ -252,6 +252,7 @@ Key optional flags:
 - `--memory-efficient`: Lower peak RAM at the cost of speed (for proteins > ~150 residues on constrained hardware)
 - `--sequence_len_lower_cutoff`: Minimum chain length (residues) accepted; shorter chains are skipped (default: `20`)
 - `--sequence_len_upper_cutoff`: Maximum chain length (residues) accepted; longer chains are skipped (default: `200`)
+- `--image-format {png,jpg}`: Output image format (default: `png`, lossless). JPEG chroma subsampling discards much of what distinguishes the channels from one another — it keeps only ~51% of the R-vs-G contrast — so png is the right default for both training and the per-channel ablation study. Use `jpg` only to reproduce datasets generated before the switch
 
 > Proteogram creation runs an MD pipeline (energy minimization + equilibration + production). The Martini CG path is markedly faster than the all-atom path per protein; the atomistic path expects ~5 min for small domains (~50 residues) up to ~1 hour for larger ones (~200 residues) on a GPU. Use `--max_workers` to parallelize across cores, and split `--limit_file` across multiple instances/nodes to scale further.
 
@@ -265,7 +266,7 @@ This step may be used to create a single Proteogram as well for inference (inclu
 
 Use `train_multiple_models_randomized_eval.py`, the current trainer. It performs its own reproducible, seeded train/val/**test** split from a single directory of proteograms (no manual `train/`/`eval/` split needed) and — importantly — writes a self-describing checkpoint: the grid size (`input_size`), preprocessing mode (`resize`), and residue cutoff (`max_image_size`) are stored in the checkpoint's `meta`, so the corpus-embedding and inference scripts recover the exact preprocessing automatically. Set in `config.yml`:
 ```yaml
-training_data_dir: /path/to/proteograms        # single dir of proteogram .jpg files
+training_data_dir: /path/to/proteograms        # single dir of proteogram .png files (.jpg also accepted)
 model_file_prefix: proteogram_model
 ```
 
@@ -315,7 +316,7 @@ model_file: /path/to/proteogram_model_resnet18_..._acc93.9.pt
 embed_file: /path/to/resnet18_..._acc93.9_cg_embeddings.pkl
 ```
 
-Run using the utility script (searches the given directories recursively for `.jpg` files):
+Run using the utility script (searches the given directories recursively for `.png` and `.jpg` files):
 ```bash
 python ../utilities/create_corpus_embeddings.py \
   --model_file /path/to/proteogram_model_resnet18_..._acc93.9.pt \
@@ -548,7 +549,7 @@ The `v1` and `v2` subfolders have their own `config.yml` (copy from the correspo
 | Script | Purpose | Config Variables (`config.yml`) | Command-Line Arguments |
 |--------|---------|--------------------------------|------------------------|
 | `v2/create_v2_proteograms.py` | Create proteograms using MD-based nonbonded energy calculations, distances, and hydrophobicity deltas. `cg_method: martini` selects the fast coarse-grained path; null/empty uses the all-atom path. Note: `calpha_atom_distance_cutoff=10` Å is **hard-coded** in the script (not config/CLI) | `limit_file`, `scope_structures_dir`, `all_proteograms_dir`, `cg_method` | `--max_workers/-w`, `--overwrite`, `--verbose`, `--debug`, `--memory-efficient`, `--save_simulated_pdb`, `--sequence_len_lower_cutoff` (default 20), `--sequence_len_upper_cutoff` (default 200), `--image-format {png,jpg}` (**default png**, lossless; `jpg` only to reproduce pre-switch datasets) |
-| `v2/query_similar_proteins.py` | Create a proteogram for a single query PDB and find the top-K most similar proteins from a pre-computed corpus | `top_k`, `model_file`, `embed_file`, `cg_method`, `proteograms_for_sim_dir` (optional — parent or root directory containing corpus `.jpg` files, searched recursively, needed for result image) | `--pdb_file/-p`, `--chain_id/-c`, `--cg_method` (`martini`\|`atomistic`), `--output_dir/-o`, `--top_k/-k`, `--model_file`, `--embed_file`, `--annot_file` (optional agreement report), `--target_size`, `--resize/--no-resize`, `--sequence_len_lower_cutoff`, `--sequence_len_upper_cutoff`. Preprocessing (grid/resize/cutoff) defaults to the checkpoint meta |
+| `v2/query_similar_proteins.py` | Create a proteogram for a single query PDB and find the top-K most similar proteins from a pre-computed corpus | `top_k`, `model_file`, `embed_file`, `cg_method`, `proteograms_for_sim_dir` (optional — parent or root directory containing corpus `.png`/`.jpg` files, searched recursively, needed for result image) | `--pdb_file/-p`, `--chain_id/-c`, `--cg_method` (`martini`\|`atomistic`), `--output_dir/-o`, `--top_k/-k`, `--model_file`, `--embed_file`, `--annot_file` (optional agreement report), `--target_size`, `--resize/--no-resize`, `--sequence_len_lower_cutoff`, `--sequence_len_upper_cutoff`. Preprocessing (grid/resize/cutoff) defaults to the checkpoint meta |
 | `v2/measure_similarity_v2.py` | Batch similarity search across all proteograms. Brute-force cosine by default; `--faiss` switches to an ANN index (see [docs/faiss_search.md](docs/faiss_search.md)) | `top_k`, `model_file`, `embed_file`, `proteogram_sim_results`, `proteograms_for_sim_dir`, `search_images_dir` | `--exclude_classes/-x`, `--overwrite`, `--embed/--no-embed`, `--faiss`, `--faiss_top_k`, `--faiss_pq`, `--faiss_index_file` |
 | `v2/train_multiple_models_randomized_eval.py` | **Current trainer.** Train ResNet18/ConvNet/ViT-B/16 with a reproducible seeded train/val/**test** split from a single directory; writes a self-describing checkpoint (grid/resize/cutoff in `meta`). Supports classification (`ce`/`focal`) and retrieval (`triplet_hierarchy`) losses | `training_data_dir`, `model_file_prefix`, `pretrained` | `--data_dir/-d`, `--model/-m` (`cnn`\|`resnet18`\|`vit`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--pretrained/--no-pretrained`, `--seed`, `--max_image_size`, `--input_size`, `--resize`, `--level`, `--min_class_size`, `--loss` (`ce`\|`focal`\|`triplet_hierarchy`), `--patience`, `--val_size`, `--test_size`, `--save_test_list/--no-save_test_list`, `--save_train_list`, `--test_list`, `--exclude_classes/-x`, `--tsv_file/-t`, `--overwrite/-o`, `--verbose/-v` (plus `--triplet_*`, `--focal_gamma`, `--embed_dim` for the respective losses) |
 | `v2/train_multiple_models.py` | Legacy trainer (manual `train/`/`eval/` split, no self-describing meta). Prefer the randomized-eval trainer above for new models | `training_data_dir`, `num_epochs`, `learning_rate`, `batch_size`, `scope_level`, `model_file_prefix` | `--data_dir/-d` (overrides `training_data_dir`), `--epochs/-e`, `--batch_size/-b`, `--lr/-l`, `--model/-m` (`cnn`\|`resnet18`), `--level` (`class`\|`fold`\|`superfamily`\|`family`, default: `class`), `--tsv_file/-t`, `--patience`, `--val_size`, `--exclude_classes/-x`, `--overwrite/-o`, `--resize`, `--verbose/-v` |
