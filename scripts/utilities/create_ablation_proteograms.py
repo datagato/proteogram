@@ -11,6 +11,16 @@ Proteogram channel mapping (from proteogram/v2/proteogram.py):
   Upper-right triangle: R=VdW-attractive, G=VdW-repulsive,  B=Distance
   Lower-left  triangle: R=ES-attractive,  G=ES-repulsive,   B=Hydrophobicity
 
+Images are read and written as lossless PNG. JPEG is not usable here: the
+channel differences this study measures (notably upper-R vdW-attractive vs
+upper-G vdW-repulsive, which are the two halves of the same Lennard-Jones term
+and so already highly correlated) live largely in chroma, which 4:2:0
+subsampling discards. Measured on a reconstructed d1s3ja_ map, a default-quality
+JPEG save raises corr(R, G) over bright pixels from 0.92 to 0.99, and re-saving
+an ablated image as JPEG degrades the *retained* channel against its own source
+to corr 0.88 while bleeding ringing into the supposedly flat mean-fill triangle.
+PNG is create_v2_proteograms.py's default output format.
+
 Usage:
     python create_ablation_proteogram.py <input_dir> <output_dir>
 
@@ -43,16 +53,31 @@ ABLATION_TARGETS = [
 ]
 
 CHANNEL_NAMES = {0: "R", 1: "G", 2: "B"}
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
+# PNG only, in and out — see the module docstring on why lossy input invalidates
+# a per-channel ablation.
+IMAGE_EXTENSION = ".png"
+LOSSY_EXTENSIONS = {".jpg", ".jpeg"}
 
 
 def get_image_paths(input_dir: Path) -> list[Path]:
     paths = sorted([
         p for p in input_dir.iterdir()
-        if p.suffix.lower() in IMAGE_EXTENSIONS
+        if p.suffix.lower() == IMAGE_EXTENSION
     ])
     if not paths:
-        sys.exit(f"No image files found in {input_dir}")
+        lossy = sorted(
+            p for p in input_dir.iterdir() if p.suffix.lower() in LOSSY_EXTENSIONS
+        )
+        if lossy:
+            sys.exit(
+                f"No {IMAGE_EXTENSION} images found in {input_dir}, but "
+                f"{len(lossy)} JPEG(s) are present. Per-channel ablation needs "
+                f"lossless input — regenerate the proteograms with "
+                f"create_v2_proteograms.py (png is its default output format) "
+                f"rather than converting the JPEGs, which cannot recover the "
+                f"discarded chroma."
+            )
+        sys.exit(f"No {IMAGE_EXTENSION} images found in {input_dir}")
     return paths
 
 
@@ -141,8 +166,8 @@ def main() -> None:
 
         for triangle, channel_idx, feature_name in ABLATION_TARGETS:
             ablated = create_ablated_image(img, masks[triangle], channel_idx, channel_means)
-            out_path = subdirs[(triangle, channel_idx)] / path.name
-            Image.fromarray(ablated, mode="RGB").save(out_path)
+            out_path = subdirs[(triangle, channel_idx)] / f"{path.stem}{IMAGE_EXTENSION}"
+            Image.fromarray(ablated, mode="RGB").save(out_path, format="PNG")
 
         print(f"  Processed: {path.name}")
 

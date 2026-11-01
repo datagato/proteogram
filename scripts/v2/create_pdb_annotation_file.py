@@ -195,7 +195,7 @@ if __name__ == '__main__':
             continue
 
         pdb_id_chain = f'{pdb_id}_{chain_id}'
-        proteogram_file = f'{pdb_id_chain}.jpg'
+        proteogram_file = f'{pdb_id_chain}.png'
         seq = get_sequence(pdb_file)
 
         # GO annotations — one API call per PDB entry, shared across chains
