@@ -1,12 +1,7 @@
 # Energy-Decomposed Grad-CAM
 
-> **Note:** this document previously also covered a physics-informed ListNet
-> ranking loss (`proteogram/v2/ranking_loss.py`). That feature was removed
-> from the codebase (see PR history) — its novelty/impact did not justify the
-> added training-pipeline complexity. This document has been reduced to the
-> energy-decomposed Grad-CAM explainability tool, which is independent of the
-> training loss used and still works on any trained Proteogram model
-> (including a plain CrossEntropy-only model).
+> The tools described here are independent of the training loss and work on
+> any trained Proteogram model, including a plain CrossEntropy-only model.
 
 ## What This Document Covers
 
@@ -106,6 +101,9 @@ This ratio measures how much the model relies on **physical energy terms** (VdW 
 | `proteogram/v2/image_similarity.py` | Added `gradcam_decomposed_similarity()` wrapper method to `Img2Vec`, making decomposed Grad-CAM accessible from the main API. |
 | `scripts/v2/explain_energy_channels.py` | **New script.** Handles pair selection (manual via TSV or automatic via USalign categories), runs decomposed Grad-CAM on all pairs, saves figures, computes and saves channel attribution statistics CSV. |
 | `scripts/v2/validate_attribution_faithfulness.py` | **New script.** Deletion / insertion curves testing whether the attribution maps actually track what the model relies on, versus a random-ordering control. |
+| `proteogram/v2/masking.py` | **New module.** Shared neutral-value (128) masking of residues, pixels and channels, used by Shapley and the faithfulness curves. |
+| `proteogram/v2/shapley.py` | **New module.** Exact channel-level and permutation-sampled residue-level Shapley values. |
+| `tests/test_attribution.py` | **New tests.** Masking semantics, Shapley axioms (efficiency, symmetry, null player, convergence), and the Grad × Input baseline giving zero on neutral pixels. No trained model needed. |
 
 ### How to run
 
@@ -128,35 +126,6 @@ The `--auto` flag selects three categories of protein pairs automatically:
 - `same_fold_high_sim`: same SCOP fold, TM-score ≥ 0.7 (true positives — the model should get these right)
 - `same_fold_low_sim`: same fold, TM-score ≤ 0.4 (hard cases — same fold but dissimilar)
 - `diff_fold_low_sim`: different fold, TM-score ≤ 0.3 (true negatives — clearly unrelated)
-
----
-
-## Example Output (Illustrative)
-
-> **These numbers predate the E/D ratio and baseline-correction fixes** and
-> were computed on per-channel-rescaled attributions, so they are not
-> comparable to output from the current code and should not be quoted. They
-> are retained purely to illustrate the shape of the report. Re-run to get
-> figures that mean what the metric claims.
-
-The table below is from an earlier internal run of `explain_energy_channels.py`
-against a plain CrossEntropy-trained baseline model, with the default
-`--top_k_auto 5` (5 pairs per category — a small, illustrative sample, not a
-statistically powered result). It's included here only to show what the
-tool's output looks like and how to read it, not as a validated finding:
-
-| Category | VdW (R) | Electrostatic (G) | Distance (B) | E/D ratio |
-|---|---|---|---|---|
-| diff_fold_low_sim | 0.0099 | 0.0174 | 0.0250 | 1.084 |
-| same_fold_low_sim | 0.0161 | 0.0161 | 0.0255 | 1.221 |
-| same_fold_high_sim | 0.0266 | 0.0313 | 0.0345 | 1.767 |
-
-**How to read this**: the E/D ratio rises from `diff_fold_low_sim` to
-`same_fold_high_sim` — i.e., for pairs the model believes are genuinely
-similar, it leans more on the VdW and electrostatic channels relative to raw
-distance. Before treating a result like this as a finding rather than an
-artifact of a 5-pair sample, increase `--top_k_auto` substantially (20+, or
-all available pairs) and check variance across pairs, not just the mean.
 
 ---
 
@@ -220,10 +189,107 @@ clearly beat `random` is not explaining the model, whatever its heatmaps look
 like. Run this before quoting any attribution-derived result, including the
 E/D ratio.
 
+## Sample Results
+
+A sample run of all three tools on the current code (commit `16b910f` plus
+the pair-selection fix). These numbers show what the tools produce and how to
+read them. The samples are small, so treat them as a sanity check, not a
+benchmark.
+
+**Setup.**
+- Model: `proteogram_model_resnet18_lr0.001_bs8_e53_seed0_max_image_size300_input200_resize_min_class_size20_level-superfamily_lossce_acc93.9.pt`,
+  a plain CrossEntropy ResNet18 (superfamily level, 93.9% accuracy).
+- Proteograms: the SCOPe 2.08 eval set.
+- Pairs: chosen with `--auto` from the USalign results for the `queries-scope20840` set.
+- Pairs per category: `--top_k_auto 20` for `explain_energy_channels.py` (60 pairs in total) and
+  `--top_k_auto 10` for `validate_attribution_faithfulness.py` (30 pairs, 19
+  distinct queries, `--granularity residue`, 3 Shapley permutations).
+- Hardware: a single RTX 4060 Ti. Each run takes a few minutes.
+
+A later run on the coarse-grained `lj_fix` proteograms, with checkpoint-matched
+preprocessing, a method comparison and a conclusion, is in
+[`docs/results/attribution_lj_fix/`](results/attribution_lj_fix/README.md).
+
+The per-pair outputs are in
+[`docs/results/attribution/`](results/attribution/):
+- `channel_attribution_stats.csv` has one row per pair.
+- `faithfulness_summary.csv` has one row per method.
+
+### Example figure
+
+![Energy-decomposed Grad-CAM for d3pt9a1 → d1xova1](../assets/figures/attribution_decomposed_d3pt9a1_vs_d1xova1.png)
+
+The pair is `d3pt9a1` (167 residues) against `d1xova1`, from the
+`same_fold_low_sim` category: same SCOP fold, low TM-score, cosine similarity
+0.751.
+- The combined Grad-CAM panel is coarse. It covers 7×7 cells, so read it as a region, not as individual residue pairs.
+- The three Grad × Input panels resolve individual residue pairs. All three
+  concentrate along the diagonal band of short-range contacts.
+- The channel Shapley values for this pair are φ = (−0.025, +0.033, +0.051)
+  for VdW, electrostatics and distance. They sum to the explained 0.059.
+- So the distance channel carries most of this pair's similarity, and the
+  energy share is 13% against a no-preference baseline of 67%. The Grad × Input
+  panels alone do not show this, because each panel is rescaled to its own
+  maximum.
+
+### Channel attribution (20 pairs per category)
+
+The table reports means across pairs (± standard deviation where shown).
+
+| Category | cos(query, target) | cos(neutral, target) | Explained Δ | Gradient E/D ratio | Shapley energy share vs. 2/3 null | Pairs above null |
+|---|---|---|---|---|---|---|
+| diff_fold_low_sim | 0.778 | 0.728 | 0.050 | 4.04 ± 0.27 | −0.3 pts (median −0.2) | 50% |
+| same_fold_low_sim | 0.838 | 0.758 | 0.079 | 4.23 ± 0.48 | −6.0 ± 17.0 pts | 25% |
+| same_fold_high_sim | 0.963 | 0.818 | 0.145 | 4.56 ± 0.33 | +5.4 ± 9.5 pts | 75% |
+
+What the table shows:
+
+- **The Shapley computation is exact.** Across all 60 pairs the largest
+  |Σφ − explained Δ| is 2.8e-17.
+- **The gradient E/D ratio is a poor guide.**
+  - It sits at about 4 in every category and moves only a little (4.0 → 4.6).
+  - Grad × Input names electrostatics as the dominant channel in all 60 pairs.
+  - Shapley shows that the energy channels carry about their proportional share, not twice it.
+  - Report the Shapley numbers. Keep the gradient ratio only as a heuristic to compare against.
+- **Energy share follows structural similarity, but only weakly.**
+  - For high-TM same-fold pairs, the energy channels carry slightly more than their share (72% of the explained similarity, against a 67% null).
+  - For low-TM same-fold pairs they carry less (61%).
+  - Both effects are smaller than the spread between pairs, so neither is established at n = 20.
+- **The model's similarity has a high floor.** An all-neutral query already
+  scores 0.73–0.82 against the target, so the input explains only 0.05–0.15 of
+  cosine similarity. In `diff_fold_low_sim` the explained Δ is close to 0 for
+  some pairs. That makes the share unstable: its standard deviation is 146 pts,
+  so use the median for that row.
+- **The sample is narrow.**
+  - `--auto` takes the extreme pairs, so a few queries dominate each category. For example, `d3ryce1` is the query in 11 of the 20 `diff_fold_low_sim` pairs.
+  - The `same_fold_high_sim` queries are short, with a median of 38 residues.
+  - Before quoting any trend, sample pairs across the full TM-score range.
+
+### Faithfulness (30 pairs, residue granularity)
+
+![Deletion and insertion curves](../assets/figures/attribution_faithfulness_curves.png)
+
+| Method | Deletion AUC ↓ | Insertion AUC ↑ | Gap ↑ | Pairs where gap beats random |
+|---|---|---|---|---|
+| Grad-CAM | 0.813 | 0.866 | 0.053 | 83% |
+| Grad × Input | **0.804** | 0.864 | **0.060** | **87%** |
+| Residue Shapley (3 perms) | 0.816 | 0.854 | 0.038 | 80% |
+| Random | 0.826 | 0.845 | 0.019 | — |
+
+- **Every method beats the random ordering, and Grad × Input does best.** Its
+  advantage over random is 0.041 ± 0.008 (standard error over 30 pairs).
+- **The advantage comes almost entirely from `same_fold_high_sim`.** There the
+  Grad × Input gap is 0.117, against 0.032 for random. In `diff_fold_low_sim`
+  every method is close to random (0.017 against 0.009), which is expected
+  when the input explains so little.
+- **Residue Shapley with 3 permutations is too noisy** to beat the gradient
+  methods here. Raise `--shapley_permutations` before using it as the
+  reference.
+
 ## Recommended Next Steps
 
-1. **Increase `--top_k_auto`** (try 20+, or use all available auto-selected pairs) for more robust statistics — 5 pairs per category is a small sample and the table above should not be over-interpreted.
-2. **Report variance, not just the mean**, per category — `explain_energy_channels.py` already writes a per-pair CSV (`channel_attribution_stats.csv`); compute per-category std/CI from it rather than relying on the printed mean alone.
+1. **Sample beyond the extremes.** `--auto` takes the top-k pairs at each end of the TM-score range, so a few queries dominate each category (see the caveats above). Draw pairs at random within each band, with one pair per query, and use 50+ pairs per category.
+2. **Report variance, not just the mean**, per category. The per-pair CSV (`channel_attribution_stats.csv`) has what you need to compute a std or CI for each category, so don't rely on the printed mean alone.
 3. **Pick one case study pair** from `same_fold_high_sim` where VdW dominates and look up the known biology — if it is a membrane protein or a tightly-packed beta-barrel, the VdW dominance is physically expected and provides a compelling narrative example.
 
 ---

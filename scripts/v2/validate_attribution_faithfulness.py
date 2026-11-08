@@ -73,7 +73,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from proteogram.v2 import Img2Vec
-from proteogram.v2.gradcam import GradCAM
+from proteogram.v2.gradcam import GradCAM, configure_preprocessing_from_meta
 from proteogram.v2.masking import (
     apply_mask,
     cosine,
@@ -201,11 +201,15 @@ def main():
         if not args.usalign_results or not args.annotations_tsv:
             parser.error('--auto requires --usalign_results and --annotations_tsv')
         pairs_by_category = auto_select_pairs(
-            args.usalign_results, args.annotations_tsv, top_k=args.top_k_auto)
+            args.usalign_results, args.annotations_tsv, top_k=args.top_k_auto,
+            proteograms_dir=args.proteograms_dir)
     else:
         parser.error('Specify either --pairs_file or --auto')
 
     img2vec = Img2Vec(args.model_file, args.proteograms_dir, device=device)
+    # Attribute on the same grid / pad-vs-resize mode the model was trained on.
+    print(f'Attribution preprocessing: '
+          f'{configure_preprocessing_from_meta(img2vec.embedding_meta)}')
     gcam = GradCAM(embed_net=img2vec.embed, device=str(img2vec.device))
     rng = np.random.default_rng(args.seed)
 

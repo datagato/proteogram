@@ -52,6 +52,7 @@ import argparse
 import os
 import sys
 from collections import defaultdict
+from typing import Optional
 
 import matplotlib
 matplotlib.use('agg')
@@ -60,6 +61,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from proteogram.v2.image_similarity import Img2Vec
+from proteogram.v2.gradcam import configure_preprocessing_from_meta
 from proteogram.v2.masking import embed_array, load_padded_array
 from proteogram.v2.shapley import channel_shapley
 
@@ -79,6 +81,7 @@ def auto_select_pairs(
     usalign_tsv: str,
     annot_tsv: str,
     top_k: int = 5,
+    proteograms_dir: Optional[str] = None,
 ) -> dict:
     """Auto-select interesting protein pairs from USalign results.
 
@@ -86,7 +89,18 @@ def auto_select_pairs(
         'same_fold_high_sim':  same SCOP fold, high TM-score (true positives)
         'diff_fold_low_sim':   different fold, low TM-score (true negatives)
         'same_fold_low_sim':   same fold but low TM-score (hard negatives — interesting!)
+
+    If ``proteograms_dir`` is given, pairs whose query or target has no
+    proteogram there are dropped *before* the top-k cut.  Without this a single
+    missing structure that sorts to the extreme of a category (e.g. a tiny
+    fragment with very low TM-score against everything) can fill all k slots
+    and every selected pair is then skipped.
     """
+    available = None
+    if proteograms_dir is not None:
+        available = {os.path.splitext(f)[0].lower()
+                     for f in os.listdir(proteograms_dir) if f.endswith('.jpg')}
+
     # Load USalign TM-scores
     us = pd.read_csv(usalign_tsv, sep='\t')
     annot = pd.read_csv(annot_tsv, sep='\t')
@@ -105,6 +119,9 @@ def auto_select_pairs(
         fold1 = fold_lookup.get(id1, '')
         fold2 = fold_lookup.get(id2, '')
         if not fold1 or not fold2:
+            continue
+        if available is not None and (id1.lower() not in available
+                                      or id2.lower() not in available):
             continue
         same = fold1 == fold2
         if same and tm >= 0.7:
@@ -240,6 +257,7 @@ def main():
             args.usalign_results,
             args.annotations_tsv,
             top_k=args.top_k_auto,
+            proteograms_dir=args.proteograms_dir,
         )
     else:
         parser.error("Specify either --pairs_file or --auto")
@@ -251,6 +269,9 @@ def main():
     # Load model
     print(f"\nLoading model: {args.model_file}")
     img2vec = Img2Vec(args.model_file, args.proteograms_dir, device=device)
+    # Attribute on the same grid / pad-vs-resize mode the model was trained on.
+    print(f"Attribution preprocessing: "
+          f"{configure_preprocessing_from_meta(img2vec.embedding_meta)}")
 
     # Run per-category
     stats_rows = []
@@ -317,9 +338,9 @@ def main():
             grp = stats_df[stats_df['category'] == cat]
             ratio = grp['energy_distance_ratio'].mean()
             print(f"  {cat}:")
-            print(f"    VdW (R):                    {grp['ch0_mean'].mean():.4f}")
-            print(f"    Electrostatic (G):          {grp['ch1_mean'].mean():.4f}")
-            print(f"    Distance/Hydro (B):         {grp['ch2_mean'].mean():.4f}")
+            print(f"    VdW (R):                    {grp['ch0_mean'].mean():.3e}")
+            print(f"    Electrostatic (G):          {grp['ch1_mean'].mean():.3e}")
+            print(f"    Distance/Hydro (B):         {grp['ch2_mean'].mean():.3e}")
             print(f"    Energy/Distance ratio:      {ratio:.3f}  (gradient-based heuristic)")
             print(f"    Dominant channel:           {grp['dominant_channel'].mode().iloc[0]}")
             if 'energy_share' in grp.columns:
@@ -340,8 +361,9 @@ def main():
                       f"{grp['shap_energy_distance_ratio'].mean():.3f}"
                       f"   (no-preference baseline = 2.0)")
         print("-" * 70)
-        print("  Energy/Distance ratio increases with structural similarity →")
-        print("  physics channels carry more weight for genuinely similar proteins.")
+        print("  Compare 'energy share vs baseline' across categories; check")
+        print("  faithfulness (validate_attribution_faithfulness.py) before")
+        print("  reading the gradient-based E/D ratio as reliance on a channel.")
         if 'efficiency_residual' in stats_df.columns:
             worst = stats_df['efficiency_residual'].abs().max()
             print(f"  Shapley efficiency check: max |sum(phi) - explained| = {worst:.2e}"

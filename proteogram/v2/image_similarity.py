@@ -794,8 +794,7 @@ class Img2Vec:
         Returns:
             Float32 numpy array of shape (H, W), values in [0, 1].
         """
-        from .gradcam import GradCAM
-        from PIL import Image as _Image
+        from .gradcam import GradCAM, load_model_input_array
 
         gcam = GradCAM(embed_net=self.embed,
                        device=str(self.device))
@@ -805,7 +804,8 @@ class Img2Vec:
         query_name  = os.path.splitext(os.path.basename(query_image_path))[0]
         target_name = os.path.splitext(os.path.basename(target_image_path))[0]
 
-        query_img = np.array(_Image.open(query_image_path).convert("RGB"))
+        # Show the image the model saw so the heatmap overlays it pixel-for-pixel.
+        query_img = load_model_input_array(query_image_path)
         gcam.save_figure(
             heatmap=heatmap,
             query_img=query_img,
@@ -860,8 +860,7 @@ class Img2Vec:
             Energy/Distance ratio).  The figure is drawn from a separate,
             per-channel-rescaled copy that must not be used for aggregation.
         """
-        from .gradcam import GradCAM, _preprocess_image
-        from PIL import Image as _Image
+        from .gradcam import GradCAM, _preprocess_image, load_model_input_array
 
         gcam = GradCAM(embed_net=self.embed, device=str(self.device))
 
@@ -879,7 +878,7 @@ class Img2Vec:
 
         query_name  = os.path.splitext(os.path.basename(query_image_path))[0]
         target_name = os.path.splitext(os.path.basename(target_image_path))[0]
-        query_img   = np.array(_Image.open(query_image_path).convert("RGB"))
+        query_img   = load_model_input_array(query_image_path)
 
         gcam.save_decomposed_figure(
             attributions=attr_display,

@@ -49,7 +49,11 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from proteogram.v2 import Img2Vec
-from proteogram.v2.gradcam import GradCAM, _preprocess_image
+from proteogram.v2.gradcam import (
+    GradCAM,
+    configure_preprocessing_from_meta,
+    load_model_input_array,
+)
 from proteogram.common import read_yaml
 
 import numpy as np
@@ -66,6 +70,9 @@ def _load_img2vec(config: dict, device: str) -> Img2Vec:
     embed_file = config.get('embed_file')
 
     img_sim = Img2Vec(model_file, dataset_dir=[], device=device)
+    # Attribute on the same grid / pad-vs-resize mode the model was trained on.
+    print(f'Attribution preprocessing: '
+          f'{configure_preprocessing_from_meta(img_sim.embedding_meta)}')
 
     if embed_file and os.path.exists(embed_file):
         try:
@@ -105,7 +112,8 @@ def _explain_pair(gcam: GradCAM,
 
     heatmap, cos_sim = gcam.compute_from_paths(query_path, target_path)
 
-    query_img = np.array(Image.open(query_path).convert('RGB'))
+    # Show the image the model saw so the heatmap overlays it pixel-for-pixel.
+    query_img = load_model_input_array(query_path)
     fig_path = gcam.save_figure(
         heatmap=heatmap,
         query_img=query_img,

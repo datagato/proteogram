@@ -35,6 +35,7 @@ from .gradcam import (
     IMAGENET_STD,
     NEUTRAL_PIXEL_VALUE,
     _pad_to_size,
+    load_model_input_array,
 )
 
 
@@ -48,17 +49,21 @@ _TO_TENSOR = T.Compose([
 # Loading and embedding
 # ---------------------------------------------------------------------------
 
-def load_padded_array(path: str, size: int = 200) -> np.ndarray:
-    """Load a proteogram JPG as the padded ``uint8`` array the model sees.
+def load_padded_array(path: str, size: Optional[int] = None) -> np.ndarray:
+    """Load a proteogram as the ``uint8`` array the model sees.
 
     Args:
-        path: Path to the proteogram JPG.
-        size: Target square size (default 200, matching the training pipeline).
+        path: Path to the proteogram image.
+        size: Force pad-to-``size``.  ``None`` (default) uses the active
+              preprocessing from ``gradcam.configure_preprocessing``, so this
+              stays identical to what the gradient methods are computed on.
 
     Returns:
-        ``uint8`` array of shape ``(size, size, 3)``.
+        ``uint8`` array of shape ``(S, S, 3)``.
     """
-    return _pad_to_size(Image.open(path), target=size)
+    if size is not None:
+        return _pad_to_size(Image.open(path), target=size)
+    return load_model_input_array(path)
 
 
 def embed_array(embed_net, arr: np.ndarray, device) -> torch.Tensor:

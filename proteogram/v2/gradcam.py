@@ -137,21 +137,65 @@ def _pad_to_size(img: Image.Image, target: int = 200, fill: int = 128) -> np.nda
     return arr[:target, :target, :]
 
 
-def _preprocess_image(image_path: str) -> torch.Tensor:
-    """Load a proteogram JPG and return a normalised (1, 3, 200, 200) tensor.
+#: Grid size and pad-vs-resize mode the attribution tools feed the model.
+#: Must match how the model was trained, or attributions explain inputs the
+#: model never saw.  Defaults reproduce the legacy pad-to-200 behaviour; call
+#: :func:`configure_preprocessing_from_meta` with a checkpoint's ``meta`` (as
+#: ``measure_similarity_v2.py`` does for search) to follow the checkpoint.
+_PREPROCESS = {"size": 200, "resize": False}
 
-    Uses the same pad-to-200 + ImageNet normalisation as the training pipeline.
 
-    Args:
-        image_path: Absolute or relative path to a proteogram JPG.
+def configure_preprocessing(size: int = 200, resize: bool = False) -> None:
+    """Set the grid size and pad (default) vs. resize mode used for attribution."""
+    _PREPROCESS["size"] = int(size)
+    _PREPROCESS["resize"] = bool(resize)
+
+
+def configure_preprocessing_from_meta(meta: Optional[dict]) -> dict:
+    """Follow a self-describing checkpoint's ``meta`` (``input_size``/``resize``).
+
+    Mirrors the resolution in ``measure_similarity_v2.py``.  Legacy checkpoints
+    without meta leave the current setting unchanged.
 
     Returns:
-        Float tensor of shape ``(1, 3, 200, 200)`` ready for model inference.
+        The active preprocessing setting.
+    """
+    if meta:
+        size = meta.get("input_size") or meta.get("max_image_size")
+        if size:
+            configure_preprocessing(size, bool(meta.get("resize", False)))
+    return dict(_PREPROCESS)
+
+
+def load_model_input_array(image_path: str) -> np.ndarray:
+    """Load a proteogram as the ``uint8`` ``(S, S, 3)`` array the model sees.
+
+    Resize mode squashes the image to ``S × S`` exactly as training did
+    (``PIL.Image.resize``); pad mode centre-pads with the neutral value and
+    crops oversized images.
+    """
+    img = Image.open(image_path)
+    size = _PREPROCESS["size"]
+    if _PREPROCESS["resize"]:
+        return np.array(img.convert("RGB").resize((size, size)))
+    return _pad_to_size(img, target=size, fill=NEUTRAL_PIXEL_VALUE)
+
+
+def _preprocess_image(image_path: str) -> torch.Tensor:
+    """Load a proteogram and return a normalised ``(1, 3, S, S)`` tensor.
+
+    Uses the active preprocessing (see :func:`configure_preprocessing`) plus
+    ImageNet normalisation, matching the training pipeline.
+
+    Args:
+        image_path: Absolute or relative path to a proteogram image.
+
+    Returns:
+        Float tensor of shape ``(1, 3, S, S)`` ready for model inference.
     """
     from torchvision import transforms as T
 
-    img = Image.open(image_path)
-    arr = _pad_to_size(img, target=200)
+    arr = load_model_input_array(image_path)
     pil = Image.fromarray(arr)
 
     transform = T.Compose([

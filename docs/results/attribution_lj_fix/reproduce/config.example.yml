@@ -1,0 +1,8 @@
+# Explainability run: superfamily CG model on lj_fix test-set proteograms
+model_file: '../proteogram_model_resnet18_lr0.001_bs8_e53_seed0_max_image_size300_input200_resize_min_class_size20_level-superfamily_lossce_acc93.9.pt'
+proteograms_for_sim_dir: './corpus'
+embed_file: './corpus_embeddings.pkl'
+proteogram_sim_results: './proteogram_sim_results.tsv'
+search_images_dir: './search_images'
+scope_cla_file: '../dir.cla.scope.2.08-stable.txt'
+top_k: 5
