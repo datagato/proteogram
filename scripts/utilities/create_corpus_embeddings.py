@@ -28,7 +28,6 @@ Usage:
 """
 import argparse
 import functools
-import glob
 import os
 import pickle
 
@@ -38,6 +37,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 
 from proteogram.v2 import Img2Vec
+from proteogram.common import find_proteogram_images
 
 
 def pad_to_size(img, target=200, fill=128):
@@ -92,15 +92,15 @@ if __name__ == '__main__':
 
     # Collect all proteogram images recursively across all input directories.
     # png is create_v2_proteograms.py's default output format; jpg is still
-    # accepted so corpora built before the switch keep working.
+    # accepted so corpora built before the switch keep working. The shared
+    # helper is what training and similarity use too, so a dataset visible to
+    # one step is visible to all of them.
     all_files = []
     for d in args.dirs:
         if not os.path.isdir(d):
             print(f'WARNING: {d} is not a directory, skipping.')
             continue
-        found = []
-        for ext in ('png', 'PNG', 'jpg', 'JPG'):
-            found += glob.glob(os.path.join(d, '**', f'*.{ext}'), recursive=True)
+        found = find_proteogram_images(d, recursive=True)
         print(f'  {d}: {len(found)} images')
         all_files.extend(found)
 

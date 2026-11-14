@@ -71,21 +71,87 @@ def test_find_proteogram_images_is_sorted_not_grouped_by_extension(mixed_dir):
     assert found == sorted(found)
 
 
-def test_find_proteogram_images_is_not_recursive(mixed_dir):
-    """Contract check: this helper looks only directly under the directory.
-
-    create_corpus_embeddings.py deliberately globs recursively instead; the two
-    are not interchangeable.
-    """
-    nested = mixed_dir / 'subdir'
+def test_find_proteogram_images_is_flat_by_default(mixed_dir):
+    """Training and similarity read one flat directory, so recursion is opt-in."""
+    nested = mixed_dir / 'class_a'
     nested.mkdir()
     (nested / 'd5efga_.png').write_bytes(b'')
     found = [os.path.basename(p) for p in find_proteogram_images(mixed_dir)]
     assert 'd5efga_.png' not in found
 
 
+def test_find_proteogram_images_recursive_descends(mixed_dir):
+    """What create_corpus_embeddings.py asks for: corpora are often laid out
+    in per-class subfolders."""
+    nested = mixed_dir / 'class_a'
+    nested.mkdir()
+    (nested / 'd5efga_.png').write_bytes(b'')
+    (nested / 'd6fgha_.jpg').write_bytes(b'')
+    found = [os.path.basename(p)
+             for p in find_proteogram_images(mixed_dir, recursive=True)]
+    assert 'd5efga_.png' in found and 'd6fgha_.jpg' in found
+    assert 'd1abca_.png' in found  # top-level files still included
+
+
 def test_find_proteogram_images_empty_dir(tmp_path):
     assert find_proteogram_images(tmp_path) == []
+
+
+# --------------------------------------------------------------------------
+# Case handling: every caller must agree on which files exist
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize('name', ['d7ghia_.PNG', 'd8hija_.JPG', 'd9ijka_.Png'])
+def test_uppercase_extensions_are_found(tmp_path, name):
+    """glob wildcards are case-sensitive even on a case-insensitive filesystem
+    (os.path.normcase is a no-op on posix), so matching had to move off the
+    glob pattern and onto the lowercased extension. Without that, a .PNG
+    dataset is visible to the corpus embedder but invisible to training.
+    """
+    (tmp_path / name).write_bytes(b'')
+    found = [os.path.basename(p) for p in find_proteogram_images(tmp_path)]
+    assert found == [name]
+
+
+def test_jpeg_is_not_accepted_by_the_shared_finder(tmp_path):
+    """Documents a known asymmetry, not an endorsement of it.
+
+    PROTEOGRAM_IMAGE_EXTENSIONS is ('.png', '.jpg'), while
+    Img2Vec.validate_source also accepts '.jpeg'. create_v2_proteograms.py
+    only ever writes .png or .jpg, so this bites only a hand-converted
+    dataset. If '.jpeg' is ever added to the tuple, this test should flip.
+    """
+    (tmp_path / 'e1jkla_.jpeg').write_bytes(b'')
+    assert find_proteogram_images(tmp_path) == []
+
+
+def test_mixed_case_dataset_is_found_exactly_once(tmp_path):
+    """Regression guard for the previous per-case-variant globbing: on a
+    case-insensitive filesystem, globbing both *.png and *.PNG can return the
+    same file twice, double-counting it in the corpus and in progress output."""
+    for name in ('a.png', 'b.PNG', 'c.jpg', 'd.JPG'):
+        (tmp_path / name).write_bytes(b'')
+    found = [os.path.basename(p) for p in find_proteogram_images(tmp_path)]
+    assert len(found) == len(set(found)) == 4
+
+
+def test_directories_named_like_images_are_excluded(tmp_path):
+    """A per-class subfolder named e.g. 'a.png' must not enter the file list."""
+    (tmp_path / 'decoy.png').mkdir()
+    (tmp_path / 'real.png').write_bytes(b'')
+    found = [os.path.basename(p)
+             for p in find_proteogram_images(tmp_path, recursive=True)]
+    assert found == ['real.png']
+
+
+def test_corpus_embedder_and_training_see_the_same_files(tmp_path):
+    """The point of sharing one implementation: the recursive corpus walk and
+    the flat training walk must agree on a flat directory, whatever the case
+    of the extensions."""
+    for name in ('a.png', 'b.JPG', 'c.jpg', 'd.PNG'):
+        (tmp_path / name).write_bytes(b'')
+    assert (find_proteogram_images(tmp_path)
+            == find_proteogram_images(tmp_path, recursive=True))
 
 
 def test_png_is_listed_before_jpg_in_accepted_extensions():
@@ -200,8 +266,8 @@ def test_img2vec_validate_source_accepts_a_mixed_directory(mixed_dir):
 
 
 def test_img2vec_validate_source_finds_nested_images(mixed_dir):
-    """Unlike find_proteogram_images, this one recurses — corpora are often
-    laid out in per-class subdirectories."""
+    """Img2Vec always recurses, matching find_proteogram_images(recursive=True)
+    — corpora are often laid out in per-class subdirectories."""
     from proteogram.v2 import Img2Vec
 
     nested = mixed_dir / 'class_a'

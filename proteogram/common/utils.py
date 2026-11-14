@@ -15,16 +15,36 @@ PARSER = PDB.PDBParser(PERMISSIVE=1)
 PROTEOGRAM_IMAGE_EXTENSIONS = ('.png', '.jpg')
 
 
-def find_proteogram_images(directory):
-    """Return a sorted list of proteogram image paths directly under directory.
+def find_proteogram_images(directory, recursive=False):
+    """Return a sorted list of proteogram image paths under directory.
 
     Accepts both .png and .jpg so datasets generated before png became the
-    default are still consumed by the same training and similarity scripts.
+    default are still consumed by the same training, similarity and
+    corpus-embedding scripts.
+
+    Extensions are matched case-insensitively. Globbing a wildcard pattern is
+    case-sensitive even where the filesystem is not (os.path.normcase is a
+    no-op on posix), so a dataset written as .PNG would otherwise be visible
+    to some callers and invisible to others. Matching on the lowercased
+    extension instead keeps every caller agreeing, and cannot double-count a
+    file the way globbing each case variant separately could.
+
+    Args:
+        directory: Directory to search.
+        recursive: If True, descend into subdirectories. Corpora are often
+            laid out in per-class subfolders; training and similarity read a
+            single flat directory, so this defaults to False.
+
+    Returns:
+        Sorted list of paths. Empty if directory holds no proteogram images.
     """
+    pattern = os.path.join(directory, '**', '*') if recursive \
+        else os.path.join(directory, '*')
     return sorted(
         path
-        for ext in PROTEOGRAM_IMAGE_EXTENSIONS
-        for path in glob.glob(os.path.join(directory, f'*{ext}'))
+        for path in glob.glob(pattern, recursive=recursive)
+        if os.path.splitext(path)[1].lower() in PROTEOGRAM_IMAGE_EXTENSIONS
+        and os.path.isfile(path)
     )
 
 def get_3letter_res_name(res_code):
