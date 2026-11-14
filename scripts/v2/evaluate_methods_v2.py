@@ -52,6 +52,16 @@ def lookup(df, filter_col, filter_val, value_col):
     return match.iloc[0] if not match.empty else None
 
 
+def image_stem(filename):
+    """Basename without its extension.
+
+    Proteogram lookups key on this rather than the full filename so a label
+    table and a similarity-results file stay joinable across image formats:
+    png is the current default, jpg for datasets built before the switch.
+    """
+    return os.path.splitext(os.path.basename(str(filename)))[0]
+
+
 def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None, limit_to_ids=None):
     """Calculate Precision@K and MAP@K for a structural alignment results DataFrame.
 
@@ -417,7 +427,7 @@ if __name__ == '__main__':
                 sccs = scop_entry.sccs
                 sccs_spl = sccs.split('.')
                 pdb_id_chain = scop_entry.sid  # SCOPe domain SID, e.g. 'd1jjua4'
-                prot_file = f'{scop_entry.sid}.jpg'
+                prot_file = f'{scop_entry.sid}.png'
                 cls, fold, sfam, fam = sccs_spl[0], '.'.join(sccs_spl[:2]), '.'.join(sccs_spl[:3]), sccs
                 #print(f'from label file | scope entry: {scop_entry} | family: {fam}')
                 scope_prots.append([pdb_id_chain, prot_file, cls, fold, sfam, fam])
@@ -443,6 +453,12 @@ if __name__ == '__main__':
     label_df.to_csv(os.path.join(label_df_dir, 'scope_eval_set_labels.tsv'),
                     sep='\t', index=False)
 
+    # Extension-insensitive join key for the proteogram lookups below. Added
+    # after the write so the published TSV keeps its documented columns, and
+    # derived from proteogram_file so a label table written before the png
+    # switch still joins against png results.
+    label_df['proteogram_stem'] = label_df['proteogram_file'].apply(image_stem)
+
     # Calculate Precision@K's and MAP@K's
     proteogram_res_df = pd.read_csv(proteogram_sim_results, sep='\t')
     precision_at_ks_fams = []
@@ -461,15 +477,15 @@ if __name__ == '__main__':
     proteogram_evaluated_ids = set()
     proteogram_per_query = {}  # {query_id: {metric_level: value}} for bootstrap
     for i in range(proteogram_res_df.shape[0]):
-        prot_file = os.path.basename(proteogram_res_df.iloc[i,0])
-        query_fam   = lookup(label_df, 'proteogram_file', prot_file, 'family')
-        query_sfam  = lookup(label_df, 'proteogram_file', prot_file, 'superfamily')
-        query_fold  = lookup(label_df, 'proteogram_file', prot_file, 'fold')
-        query_class = lookup(label_df, 'proteogram_file', prot_file, 'class')
+        prot_file = image_stem(proteogram_res_df.iloc[i,0])
+        query_fam   = lookup(label_df, 'proteogram_stem', prot_file, 'family')
+        query_sfam  = lookup(label_df, 'proteogram_stem', prot_file, 'superfamily')
+        query_fold  = lookup(label_df, 'proteogram_stem', prot_file, 'fold')
+        query_class = lookup(label_df, 'proteogram_stem', prot_file, 'class')
         if any(v is None for v in (query_fam, query_sfam, query_fold, query_class)):
             n_queries_skipped += 1
             continue
-        proteogram_evaluated_ids.add(os.path.splitext(prot_file)[0])
+        proteogram_evaluated_ids.add(prot_file)  # already an extension-less stem
         
         # Relevant item counts in corpus (excluding self) for MAP@K normalisation
         r_fam   = max((label_df['family'] == query_fam).sum() - 1, 0)
@@ -496,13 +512,13 @@ if __name__ == '__main__':
         # fold and class SCOPe levels
         k = 0
         for target in proteogram_res_df.iloc[i,1:]:
-            target_file  = os.path.basename(target.split(',')[0])
+            target_file  = image_stem(target.split(',')[0])
             if target_file == prot_file:  # skip self-hit
                 continue
-            target_fam   = lookup(label_df, 'proteogram_file', target_file, 'family')
-            target_sfam  = lookup(label_df, 'proteogram_file', target_file, 'superfamily')
-            target_fold  = lookup(label_df, 'proteogram_file', target_file, 'fold')
-            target_class = lookup(label_df, 'proteogram_file', target_file, 'class')
+            target_fam   = lookup(label_df, 'proteogram_stem', target_file, 'family')
+            target_sfam  = lookup(label_df, 'proteogram_stem', target_file, 'superfamily')
+            target_fold  = lookup(label_df, 'proteogram_stem', target_file, 'fold')
+            target_class = lookup(label_df, 'proteogram_stem', target_file, 'class')
             if any(v is None for v in (target_fam, target_sfam, target_fold, target_class)):
                 continue
             k += 1

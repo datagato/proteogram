@@ -57,6 +57,16 @@ if __name__ == '__main__':
                         help="Maximum chain length (residues) accepted for a "
                              "structure. Chains longer than this are skipped. "
                              "Default: 200.")
+    parser.add_argument('--image-format',
+                        choices=['png', 'jpg'],
+                        default='png',
+                        help="Output image format. Default: png (lossless). "
+                             "JPEG chroma subsampling discards much of what "
+                             "distinguishes the channels from one another — it "
+                             "keeps only ~51%% of the R-vs-G contrast — so png "
+                             "is the right default for both training and the "
+                             "per-channel ablation study. Use jpg only to "
+                             "reproduce datasets generated before the switch.")
     args = parser.parse_args()
 
     start = time()
@@ -143,7 +153,7 @@ if __name__ == '__main__':
         chain_id = bname[1:5].upper()+':'+ bname[5].upper()
         
         image_file = os.path.join(proteograms_output_dir,
-                f'{bname_noext}.jpg')
+                f'{bname_noext}.{args.image_format}')
         if recreate == False:
             if image_file not in existing_image_files:
                 file_list.append((pdb_file, image_file))
