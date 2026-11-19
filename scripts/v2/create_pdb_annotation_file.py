@@ -2,6 +2,10 @@
 Annotate per-chain monomer PDB files ({PDBID}_{CHAIN}.pdb) with:
   - GO Molecular_function, Biological_process, Cellular_component (chain-specific)
   - GO slim annotations via goslim_generic (comparable high-level labels)
+  - GO with evidence codes from UniProt (chain -> accession via SIFTS):
+    UniProtAccessions, GOEvidence_MF/BP/CC (GO:0004672=IDA,IEA|...) and
+    GOTermsExp_MF/BP/CC (experimental-evidence terms only); PDBe's GO mappings
+    above carry no evidence codes (see proteogram/common/go_evidence.py)
   - RCSB entry-level metadata (deposit date, method, molecular weight, etc.)
   - UniProt transmembrane annotation (entry-level)
 
@@ -23,6 +27,7 @@ from goatools.mapslim import mapslim as _mapslim
 from goatools.obo_parser import GODag
 
 from proteogram.common import read_yaml
+from proteogram.common.go_evidence import add_go_evidence_columns
 
 
 warnings.filterwarnings("ignore", category=PDBConstructionWarning)
@@ -272,6 +277,10 @@ if __name__ == '__main__':
         'GOSlim_CC',
         'PDBSequence',
     ])
+
+    # GO with evidence codes (UniProt via SIFTS); keep PDBSequence as the last column.
+    annot_df = add_go_evidence_columns(annot_df, api_delay=_API_DELAY)
+    annot_df = annot_df[[c for c in annot_df.columns if c != 'PDBSequence'] + ['PDBSequence']]
 
     os.makedirs(os.path.dirname(os.path.abspath(annot_file)), exist_ok=True)
     try:

@@ -7,6 +7,13 @@ GO data is fetched once per PDB entry and cached across SCOPe domains from
 the same structure. Chain-specific GO terms (MF/BP/CC) are extracted by
 filtering the PDBe mappings list by chain_id. Specific GO terms are also
 mapped to goslim_generic for comparable high-level class labels.
+
+PDBe's GO mappings carry no evidence codes, so GO is also fetched with
+evidence codes from UniProt (chain -> accession via SIFTS; see
+proteogram/common/go_evidence.py), adding UniProtAccessions, GOEvidence_MF/BP/CC
+(GO:0004672=IDA,IEA|...) and GOTermsExp_MF/BP/CC (experimental-evidence terms
+only). Note GO is per chain, so every SCOPe domain on a chain gets the chain's
+terms.
 """
 import glob
 import os
@@ -22,6 +29,7 @@ from goatools.mapslim import mapslim as _mapslim
 from goatools.obo_parser import GODag
 
 from proteogram.common import read_yaml
+from proteogram.common.go_evidence import add_go_evidence_columns
 
 
 warnings.filterwarnings("ignore", category=PDBConstructionWarning)
@@ -288,6 +296,10 @@ if __name__ == '__main__':
         'GOSlim_CC',
         'PDBSequence',
     ])
+
+    # GO with evidence codes (UniProt via SIFTS); keep PDBSequence as the last column.
+    annot_df = add_go_evidence_columns(annot_df, api_delay=_API_DELAY)
+    annot_df = annot_df[[c for c in annot_df.columns if c != 'PDBSequence'] + ['PDBSequence']]
 
     try:
         annot_df.to_csv(annot_file, sep='\t', index=False)

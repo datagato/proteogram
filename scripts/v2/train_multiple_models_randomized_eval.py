@@ -23,6 +23,8 @@ classifier for one level. See proteogram/v2/losses.py for the loss implementatio
 
 Note on reproducibility and the use of --test_list (to skip the random split and repeat using the same test set from a previous run): because the test set is applied on top of the current eligibility filters, if you change min_family_size/max_image_size/min_class_size between runs, some listed proteins may get filtered out (you'll see the WARNING with the count) — so keep those filters consistent with the run that generated the list if you want the test set identical.
 
+Note on --val_list (fixed validation set) and held-out-family evaluation: scripts/utilities/create_heldout_family_list.py writes a test list and a val list of whole families held out from training (when training at --level superfamily), so the test set measures generalization to unseen families and early stopping selects for it too. Pass them as --test_list and --val_list with the same filters. With --loss triplet_hierarchy, note that the per-epoch val P@K searches the val set itself, so superfamily-level hits there come only from other held-out families of the same superfamily, not from training families.
+
  Usage example:
     python train_multiple_models_randomized_eval.py --model resnet18 --epochs 50 --batch_size 32 --lr 1e-4 --seed 42
     python train_multiple_models_randomized_eval.py --model vit --epochs 50 --batch_size 16 --lr 1e-4 --seed 42
@@ -987,7 +989,19 @@ if __name__ == '__main__':
                              "train/val are a random split of the remaining eligible proteograms "
                              "(--val_size is then the validation fraction of that remainder). "
                              "--test_size is ignored. Lets you repeat training against the same "
-                             "fixed test set across runs.")
+                             "fixed test set across runs. Combine with --val_list to fix both.")
+    parser.add_argument('--val_list',
+                        type=str,
+                        default=None,
+                        help="Path to a file of validation protein prefixes (one SCOPeID per "
+                             "line), e.g. the held-out-family val list written by "
+                             "scripts/utilities/create_heldout_family_list.py. When given, the "
+                             "validation set (used for early stopping and best-checkpoint "
+                             "selection) is exactly the eligible proteograms in this list "
+                             "instead of a random --val_size split. With --test_list as well, "
+                             "train is everything eligible in neither list; without it, the "
+                             "test set is a random split of the remainder (--test_size is then "
+                             "the test fraction of that remainder). Must not overlap --test_list.")
     parser.add_argument('--max_image_size',
                         type=int,
                         default=200,
@@ -1248,46 +1262,86 @@ if __name__ == '__main__':
     all_indices = list(range(len(full_dataset)))
     labels = full_dataset.labels
 
-    if args.test_list:
-        # Static test set: held-out = eligible proteograms whose prefix is in
-        # the list; train/val are a random split of the remainder. Prefixes are
-        # matched against each file's basename-without-extension, the same form
-        # --save_test_list writes. Lets a run reproduce an exact test set even
-        # though train/val still vary with --seed. --test_size is ignored here.
-        with open(args.test_list) as f:
-            wanted = {line.strip() for line in f if line.strip()}
+    def _split_off(indices, fraction, what):
+        """Stratified split of `indices`, returning (rest, split_off). Falls back to
+        an unstratified split if some label has < 2 members in `indices` (which
+        sklearn's stratify can't handle) -- e.g. after a held-out-family list has
+        taken most of a small label."""
+        pool_labels = [labels[i] for i in indices]
+        stratify = pool_labels
+        if min(np.bincount(pool_labels)[np.unique(pool_labels)]) < 2:
+            print(f'WARNING: some label has < 2 proteograms left for the {what} split; '
+                  f'splitting without stratification.')
+            stratify = None
+        return train_test_split(indices, test_size=fraction,
+                                random_state=args.seed, stratify=stratify)
 
+    if args.test_list or args.val_list:
+        # Static test and/or val sets: each is the eligible proteograms whose
+        # prefix is in its list, and whichever is not given is a random split of
+        # the remainder. Prefixes are matched against each file's
+        # basename-without-extension, the same form --save_test_list writes. Lets
+        # a run reproduce an exact test set (and, with --val_list, an exact
+        # validation set -- e.g. held-out families, so early stopping selects
+        # for generalization to unseen families rather than in-distribution fit).
         def _prefix(i):
             return os.path.splitext(os.path.basename(full_dataset.files[i]))[0]
 
-        test_indices = [i for i in all_indices if _prefix(i) in wanted]
-        pool_indices = [i for i in all_indices if _prefix(i) not in wanted]
+        def _indices_from_list(path, flag):
+            with open(path) as f:
+                wanted = {line.strip() for line in f if line.strip()}
+            found = [i for i in all_indices if _prefix(i) in wanted]
+            missing = wanted - {_prefix(i) for i in found}
+            if missing:
+                print(f'WARNING: {len(missing)} prefix(es) from {flag} not found among '
+                      f'eligible proteograms (excluded by the current filters, or absent from '
+                      f'--data_dir). Those proteins will NOT be used. '
+                      f'First few: {sorted(missing)[:5]}')
+            if not found:
+                raise RuntimeError(f'{flag} matched no eligible proteograms — check that its '
+                                   'prefixes correspond to files in --data_dir and survive the '
+                                   'active filters (min_class_size/min_family_size/max_image_size).')
+            return found
 
-        missing = wanted - {_prefix(i) for i in test_indices}
-        if missing:
-            print(f'WARNING: {len(missing)} prefix(es) from --test_list not found among '
-                  f'eligible proteograms (excluded by the current filters, or absent from '
-                  f'--data_dir). Those proteins will NOT be in the test set. '
-                  f'First few: {sorted(missing)[:5]}')
-        if not test_indices:
-            raise RuntimeError('--test_list matched no eligible proteograms — check that its '
-                               'prefixes correspond to files in --data_dir and survive the '
-                               'active filters (min_class_size/min_family_size/max_image_size).')
+        test_indices = _indices_from_list(args.test_list, '--test_list') if args.test_list else None
+        val_indices = _indices_from_list(args.val_list, '--val_list') if args.val_list else None
+        if test_indices is not None and val_indices is not None:
+            overlap = set(test_indices) & set(val_indices)
+            if overlap:
+                raise RuntimeError(f'--test_list and --val_list share {len(overlap)} eligible '
+                                   f'proteogram(s), e.g. {sorted(_prefix(i) for i in overlap)[:5]}.')
+        fixed = set(test_indices or []) | set(val_indices or [])
+        pool_indices = [i for i in all_indices if i not in fixed]
         if not pool_indices:
-            raise RuntimeError('--test_list covers every eligible proteogram — no data left '
-                               'for train/val.')
-        if not (0.0 < args.val_size < 1.0):
-            raise ValueError('--val_size must be in (0, 1) when using --test_list.')
+            raise RuntimeError('--test_list/--val_list cover every eligible proteogram — no '
+                               'data left for training.')
 
-        train_indices, val_indices = train_test_split(
-            pool_indices,
-            test_size=args.val_size,
-            random_state=args.seed,
-            stratify=[labels[i] for i in pool_indices])
-        print(f'Static test list ({os.path.basename(args.test_list)}): '
-              f'{len(test_indices)} test held-out; remaining {len(pool_indices)} split '
-              f'(seed={args.seed}) into {len(train_indices)} train / {len(val_indices)} val '
-              f'(val = {args.val_size:.0%} of remainder; --test_size ignored).')
+        if val_indices is None:
+            if not (0.0 < args.val_size < 1.0):
+                raise ValueError('--val_size must be in (0, 1) when using --test_list.')
+            train_indices, val_indices = _split_off(pool_indices, args.val_size, 'val')
+            note = f'val = {args.val_size:.0%} of remainder; --test_size ignored'
+        elif test_indices is None:
+            if not (0.0 < args.test_size < 1.0):
+                raise ValueError('--test_size must be in (0, 1) when using --val_list.')
+            train_indices, test_indices = _split_off(pool_indices, args.test_size, 'test')
+            note = f'test = {args.test_size:.0%} of remainder; --val_size ignored'
+        else:
+            train_indices = pool_indices
+            note = '--test_size/--val_size ignored'
+        sources = ', '.join(f'{name} from {os.path.basename(path)}'
+                            for name, path in (('test', args.test_list), ('val', args.val_list))
+                            if path)
+        print(f'Static split ({sources}; seed={args.seed}): {len(train_indices)} train / '
+              f'{len(val_indices)} val / {len(test_indices)} test (held-out) ({note}).')
+
+        # Labels missing from train can't be learned; with held-out lists built
+        # by create_heldout_family_list.py this shouldn't happen, so flag it.
+        train_label_set = {labels[i] for i in train_indices}
+        unseen = {labels[i] for i in val_indices + test_indices} - train_label_set
+        if unseen:
+            print(f'WARNING: {len(unseen)} label(s) in val/test have no training examples: '
+                  f'{sorted(full_dataset.labels_to_names[l] for l in unseen)[:5]}')
     else:
         train_val_indices, test_indices = train_test_split(
             all_indices,
