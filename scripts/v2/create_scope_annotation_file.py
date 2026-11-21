@@ -197,7 +197,7 @@ if __name__ == '__main__':
             pdb_id = bname[1:5].upper()
             chain = bname[5].upper()
             pdb_id_chain = f'{pdb_id}_{chain}'
-            prot_file = f'{pdb_id}_{chain}.png'
+            prot_file = f'{bname}.png'
         except Exception:
             print(f'Problem with filename {os.path.basename(pdb_file)}')
             continue

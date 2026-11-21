@@ -47,6 +47,29 @@ Precision@1 (a.k.a. Hit@1):
     exact McNemar test on the discordant pairs (queries where exactly one of the
     two methods' top hit is correct) instead of Wilcoxon.
 
+Remote Precision@1 and Remote Capped Precision@K (remote homology):
+    Score only relatives the query does NOT share its next-finer group with:
+        superfamily: same superfamily, different family
+        fold:        same fold, different superfamily
+        class:       same class, different fold
+        family:      n/a (no finer level)
+    Hits from the query's own finer group (e.g. its own family, at superfamily
+    level) are removed from the ranked list -- counted neither right nor wrong
+    -- and the list closes up, so the next K remaining hits are scored.
+        rP@1  = 1 if the first remaining hit is in the query's group, else 0
+        rcP@K = tp_remote / min(R_remote, K)
+    where R_remote = corpus members in the query's group but outside its finer
+    group. Queries with R_remote = 0 are left out (NaN), as for capped P@K.
+
+    Explanation: with whole families held out, every test query still has its
+    own family in the corpus, so plain superfamily scores are mostly family
+    matching. These scores ask whether a method finds superfamily (or fold)
+    relatives it can't get by near-duplicate family similarity -- the standard
+    SCOP remote-homology setup. It needs ranked lists deeper than K, so all
+    methods are scored over the same depth D (the shallowest method's list
+    depth, or --remote_depth); a query whose list runs out before K remaining
+    hits scores the hits it has and is counted as a short list.
+
 Pertinent metric calculation info can be found at
 https://weaviate.io/blog/retrieval-evaluation-metrics
 """
@@ -117,7 +140,92 @@ METRICS = [('p1', 'Precision@1', 'McNemar exact test on discordant pairs'),
            ('patk', 'Precision@K', 'Wilcoxon signed-rank'),
            ('cpatk', 'Capped Precision@K', 'Wilcoxon signed-rank'),
            ('map', 'MAP@K', 'Wilcoxon signed-rank'),
-           ('ratk', 'Recall@K', 'Wilcoxon signed-rank')]
+           ('ratk', 'Recall@K', 'Wilcoxon signed-rank'),
+           ('rp1', 'Remote Precision@1', 'McNemar exact test on discordant pairs'),
+           ('rcpatk', 'Remote Capped Precision@K', 'Wilcoxon signed-rank')]
+# Binary per-query metrics (McNemar) and metrics that are NaN for some queries.
+BINARY_METRICS = ('p1', 'rp1')
+NAN_METRICS = ('cpatk', 'rp1', 'rcpatk')
+# Remote metrics at a level ignore hits that share the query's next-finer label.
+REMOTE_FINER = {'class': 'fold', 'fold': 'superfamily', 'superfamily': 'family'}
+
+
+def label_table(label_df, key):
+    """{id: {level: label}} for fast per-hit lookups (key = pdb_id_chain or
+    proteogram_stem)."""
+    return (label_df.drop_duplicates(key).set_index(key)[list(LEVELS)]
+            .to_dict('index'))
+
+
+def label_counts(label_df):
+    """{level: {label: corpus count}}, used for R and R_remote."""
+    return {lv: label_df[lv].value_counts().to_dict() for lv in LEVELS}
+
+
+def remote_r(q, counts, lv):
+    """R_remote: corpus members in the query's group at lv but outside its
+    next-finer group (the query itself is in its finer group, so it's excluded)."""
+    fin = REMOTE_FINER[lv]
+    return max(counts[lv].get(q[lv], 0) - counts[fin].get(q[fin], 0), 0)
+
+
+def score_query(q, ranked, counts, top_k, remote_depth, remote_short):
+    """Every per-query metric from one ranked hit list.
+
+    q: the query's {level: label}. ranked: [(target_id, {level: label}), ...]
+    in rank order, self and unlabeled targets already removed. The standard
+    metrics use the first top_k hits; the remote metrics use the first
+    remote_depth hits (None = all). remote_short[lv] is incremented when the
+    list runs out before top_k remaining (non-excluded) hits.
+    """
+    top = ranked[:top_k]
+    pq = {'top_hits': ','.join(t for t, _ in top)}
+    for lv in LEVELS:
+        r = max(counts[lv].get(q[lv], 0) - 1, 0)
+        tp, prec = 0, 0.0
+        for k, (_, t) in enumerate(top, 1):
+            if t[lv] == q[lv]:
+                tp += 1
+                prec += tp / k
+        pq[f'p1_{lv}'] = float(bool(top) and top[0][1][lv] == q[lv])
+        pq[f'patk_{lv}'] = tp / top_k
+        pq[f'cpatk_{lv}'] = capped_precision(tp, r, top_k)
+        pq[f'map_{lv}'] = prec / min(r, top_k) if r > 0 else 0.0
+        pq[f'ratk_{lv}'] = tp / r if r > 0 else 0.0
+
+    pool = ranked if remote_depth is None else ranked[:remote_depth]
+    for lv in LEVELS:
+        pq[f'rp1_{lv}'] = pq[f'rcpatk_{lv}'] = float('nan')
+        fin = REMOTE_FINER.get(lv)
+        if fin is None:
+            continue
+        r_rem = remote_r(q, counts, lv)
+        if r_rem == 0:
+            continue
+        tp, k, first = 0, 0, 0.0
+        for _, t in pool:
+            if t[fin] == q[fin]:      # own finer group: removed, list closes up
+                continue
+            k += 1
+            if t[lv] == q[lv]:
+                tp += 1
+                if k == 1:
+                    first = 1.0
+            if k >= top_k:
+                break
+        if k < top_k:
+            remote_short[lv] += 1
+        pq[f'rp1_{lv}'] = first
+        pq[f'rcpatk_{lv}'] = capped_precision(tp, r_rem, top_k)
+    return pq
+
+
+def list_depth(results_df):
+    """Deepest ranked list in a results table (non-empty cells after column 0)."""
+    if results_df.shape[0] == 0 or results_df.shape[1] < 2:
+        return 0
+    cells = results_df.iloc[:, 1:]
+    return int((cells.notna() & (cells.astype(str) != '')).sum(axis=1).max())
 
 
 def summarize_per_query(per_query, n_queries=None):
@@ -136,7 +244,8 @@ def summarize_per_query(per_query, n_queries=None):
     return out
 
 
-def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None, limit_to_ids=None):
+def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None, limit_to_ids=None,
+                   remote_depth=None):
     """Calculate Precision@K and MAP@K for a structural alignment results DataFrame.
 
     Column 0 is the query identifier; columns 1+ are retrieved target identifiers.
@@ -150,66 +259,54 @@ def calc_patk_mapk(results_df, label_df, top_k, query_id_fn=None, limit_to_ids=N
             pdb_id_chain key (e.g. stripping a filename suffix). Defaults to identity.
         limit_to_ids: Optional set of pdb_id_chain strings. If provided, only rows
             whose transformed query ID is in this set are evaluated.
+        remote_depth: how deep into each ranked list the remote metrics may
+            look (None = the whole list). Pass the same value for every method.
 
     Returns:
-        summarize_per_query() output: p1_*, patk_*, cpatk_*, map_* and ratk_*
-        means for each level, plus n_queries and per_query (which also holds
-        each query's top hits). cpatk (capped P@K) is NaN per query when R = 0
-        and its mean ignores those.
+        summarize_per_query() output: means of every METRICS entry for each
+        level, plus n_queries, per_query (which also holds each query's top
+        hits) and remote_short ({level: queries whose list ran out before K
+        remaining hits}). NaN per-query values (capped P@K with R = 0, remote
+        metrics with R_remote = 0 or at family level) are left out of the means.
     """
     if query_id_fn is None:
         query_id_fn = lambda x: x
 
-    levels = LEVELS
+    labels_by_id = label_table(label_df, 'pdb_id_chain')
+    counts = label_counts(label_df)
+    max_depth = top_k if remote_depth is None else max(top_k, remote_depth)
+    collect_all = remote_depth is None
     # Per-query metrics keyed by query_id (pdb_id_chain), for paired bootstrap.
     per_query = {}
+    remote_short = {lv: 0 for lv in LEVELS}
     n_queries = 0
     n_skipped = 0
 
-    for i in range(results_df.shape[0]):
-        query_id = query_id_fn(results_df.iloc[i, 0])
+    for row in results_df.itertuples(index=False):
+        query_id = query_id_fn(row[0])
         if limit_to_ids is not None and query_id not in limit_to_ids:
             continue
-        query_labels = {lv: lookup(label_df, 'pdb_id_chain', query_id, lv) for lv in levels}
-        if any(v is None for v in query_labels.values()):
+        q = labels_by_id.get(query_id)
+        if q is None:
             n_skipped += 1
             continue
         n_queries += 1
 
-        r = {lv: max((label_df[lv] == query_labels[lv]).sum() - 1, 0) for lv in levels}
-        tp   = {lv: 0   for lv in levels}
-        prec = {lv: 0.0 for lv in levels}
-        hit1 = {lv: 0.0 for lv in levels}  # top valid hit matches the query
-        hits = []
-
-        k = 0
-        for target in results_df.iloc[i, 1:]:
-            target_labels = {lv: lookup(label_df, 'pdb_id_chain', target, lv) for lv in levels}
-            if any(v is None for v in target_labels.values()):
+        ranked = []
+        for target in row[1:]:
+            t = labels_by_id.get(target) if isinstance(target, str) else None
+            if t is None or target == query_id:
                 continue
-            k += 1
-            hits.append(target)
-            if k == 1:
-                hit1 = {lv: float(query_labels[lv] == target_labels[lv]) for lv in levels}
-            for lv in levels:
-                if query_labels[lv] == target_labels[lv]:
-                    tp[lv] += 1
-                    prec[lv] += tp[lv] / k
-            if k >= top_k:
+            ranked.append((target, t))
+            if not collect_all and len(ranked) >= max_depth:
                 break
-
-        per_query[query_id] = {'top_hits': ','.join(map(str, hits))}
-        for lv in levels:
-            per_query[query_id][f'p1_{lv}'] = hit1[lv]
-            per_query[query_id][f'patk_{lv}'] = tp[lv] / top_k
-            per_query[query_id][f'cpatk_{lv}'] = capped_precision(tp[lv], r[lv], top_k)
-            per_query[query_id][f'map_{lv}'] = (
-                prec[lv] / min(r[lv], top_k) if r[lv] > 0 else 0.0)
-            per_query[query_id][f'ratk_{lv}'] = tp[lv] / r[lv] if r[lv] > 0 else 0.0
+        per_query[query_id] = score_query(q, ranked, counts, top_k, remote_depth, remote_short)
 
     if n_skipped:
         print(f'WARNING: {n_skipped} queries skipped (not found in label_df).')
-    return summarize_per_query(per_query, n_queries=n_queries)
+    out = summarize_per_query(per_query, n_queries=n_queries)
+    out['remote_short'] = remote_short
+    return out
 
 
 def paired_bootstrap_delta(prot_vals, algn_vals, n_boot=10000, seed=0, ci=0.95):
@@ -306,10 +403,12 @@ def report_bootstrap(proteogram_per_query, method_per_query, top_k, n_boot, seed
     print('=' * 78)
 
     for mkey, mlabel, test_name in METRICS:
-        if mkey != 'p1':
+        if mkey not in BINARY_METRICS:
             mlabel += f' (K={top_k})'
         if mkey == 'cpatk':
             mlabel += ', R = 0 queries excluded'
+        elif mkey in ('rp1', 'rcpatk'):
+            mlabel += ', own finer group ignored, R_remote = 0 queries excluded'
         print(f'\n{mlabel}  [{test_name}]')
         hdr = f'{"vs Method":<12} | ' + ' | '.join(f'{lv:>22}' for lv in levels)
         print(hdr)
@@ -323,8 +422,9 @@ def report_bootstrap(proteogram_per_query, method_per_query, top_k, n_boot, seed
                 key = f'{mkey}_{lv}'
                 prot = np.array([proteogram_per_query[q][key] for q in common], dtype=float)
                 algn = np.array([mpq[q][key] for q in common], dtype=float)
-                # Capped P@K is NaN where R = 0; R comes from the shared label
-                # table, so both methods have NaN at the same queries.
+                # Capped P@K / remote metrics are NaN where R (R_remote) = 0; R
+                # comes from the shared label table, so both methods have NaN
+                # at the same queries.
                 defined = ~(np.isnan(prot) | np.isnan(algn))
                 prot, algn = prot[defined], algn[defined]
                 row = {'method': mname, 'metric': mkey, 'level': lv, 'test': test_name,
@@ -336,7 +436,7 @@ def report_bootstrap(proteogram_per_query, method_per_query, top_k, n_boot, seed
                     cells.append('n/a')
                     continue
                 d, lo, hi = paired_bootstrap_delta(prot, algn, n_boot=n_boot, seed=seed)
-                if mkey == 'p1':
+                if mkey in BINARY_METRICS:
                     p, b, c = mcnemar_pvalue(prot, algn)
                     counts.append(f'{lv} {b}/{c}')
                     row.update(proteogram_only_correct=b, method_only_correct=c)
@@ -348,11 +448,12 @@ def report_bootstrap(proteogram_per_query, method_per_query, top_k, n_boot, seed
             print(f'{mname:<12} | ' + ' | '.join(f'{c:>22}' for c in cells))
             if counts:
                 discordant.append(f'  {mname}: ' + ', '.join(counts))
-        if mkey == 'cpatk':
+        if mkey in NAN_METRICS:
             n_by_level = ', '.join(
-                f'{lv} {sum(1 for q in common if not np.isnan(proteogram_per_query[q][f"cpatk_{lv}"]))}'
+                f'{lv} {sum(1 for q in common if not np.isnan(proteogram_per_query[q][f"{mkey}_{lv}"]))}'
                 for lv in levels)
-            print(f'(paired on shared queries with R > 0: {n_by_level})')
+            r_name = 'R' if mkey == 'cpatk' else 'R_remote'
+            print(f'(paired on shared queries with {r_name} > 0: {n_by_level})')
         else:
             print(f'(paired on {len(common)} shared queries)')
         if discordant:
@@ -390,31 +491,50 @@ def make_run_dir(base_dir, scope_level, top_k, prefix='eval'):
     return path
 
 
-def print_metric_tables(methods, top_k):
+def print_metric_tables(methods, top_k, remote_depth=None):
     """Print one table per metric (rows = methods, columns = SCOPe levels).
 
     methods: OrderedDict {method name: summarize_per_query() output}.
+    remote_depth: ranked-list depth the remote metrics used (for the title).
     """
     hdr = f'{"Method":<15} | {"Class":>8} | {"Fold":>8} | {"Superfamily":>11} | {"Family":>8}'
     sep = '-' * len(hdr)
+    ref = methods.get('Proteogram') or next(reversed(methods.values()))
+    depth_txt = 'full lists' if remote_depth is None else f'lists to depth {remote_depth}'
     for mkey, title, _ in METRICS:
         if mkey == 'p1':
             title += ' (top non-self hit correct)'
         elif mkey == 'cpatk':
             title += f' (K={top_k}; tp / min(R, K), queries with R = 0 excluded)'
+        elif mkey == 'rp1':
+            title += (f' (first hit outside the query\'s own family / superfamily / fold is in '
+                      f'its superfamily / fold / class; {depth_txt})')
+        elif mkey == 'rcpatk':
+            title += (f' (K={top_k}; own finer group removed from the ranking, '
+                      f'tp / min(R_remote, K); {depth_txt})')
         else:
             title += f' (K={top_k})'
         print(f'\n{title}')
         print(hdr)
         print(sep)
         for name, m in methods.items():
-            print(f'{name:<15} | {m[f"{mkey}_class"]:>8.4f} | {m[f"{mkey}_fold"]:>8.4f} | '
-                  f'{m[f"{mkey}_superfamily"]:>11.4f} | {m[f"{mkey}_family"]:>8.4f}')
+            cells = [f'{m[f"{mkey}_{lv}"]:.4f}' if not np.isnan(m[f'{mkey}_{lv}']) else 'n/a'
+                     for lv in LEVELS]
+            print(f'{name:<15} | {cells[0]:>8} | {cells[1]:>8} | {cells[2]:>11} | {cells[3]:>8}')
+        if mkey in NAN_METRICS:
+            label = '(n with R > 0)' if mkey == 'cpatk' else '(n, R_remote>0)'
+            print(f'{label:<15} | {ref[f"{mkey}_n_class"]:>8d} | '
+                  f'{ref[f"{mkey}_n_fold"]:>8d} | {ref[f"{mkey}_n_superfamily"]:>11d} | '
+                  f'{ref[f"{mkey}_n_family"]:>8d}')
+        if mkey == 'rcpatk':
+            short = [f'{name}: ' + ', '.join(f'{lv} {m["remote_short"][lv]}'
+                                             for lv in REMOTE_FINER)
+                     for name, m in methods.items()
+                     if any(m.get('remote_short', {}).values())]
+            if short:
+                print(f'Short lists (ran out before K={top_k} hits outside the query\'s finer '
+                      f'group, scored on the hits available): ' + '; '.join(short))
         if mkey == 'cpatk':
-            ref = methods.get('Proteogram') or next(reversed(methods.values()))
-            print(f'{"(n with R > 0)":<15} | {ref["cpatk_n_class"]:>8d} | '
-                  f'{ref["cpatk_n_fold"]:>8d} | {ref["cpatk_n_superfamily"]:>11d} | '
-                  f'{ref["cpatk_n_family"]:>8d}')
             if CAPPED_OVERFLOW[0]:
                 print(f'WARNING: {CAPPED_OVERFLOW[0]} query/level score(s) had more hits than '
                       f'R, so R was counted over a smaller set than was searched '
@@ -480,8 +600,11 @@ def write_run_files(run_dir, methods, query_info, triage_rows, bootstrap_rows, s
 
     if not per_query_df.empty and level in per_query_df.columns:
         # Per-label breakdown at scope_level: which labels each method struggles with.
+        label_metrics = [f'p1_{level}', f'cpatk_{level}', f'map_{level}']
+        if level in REMOTE_FINER:
+            label_metrics += [f'rp1_{level}', f'rcpatk_{level}']
         stats = (per_query_df.groupby([level, 'method'])
-                 [[f'p1_{level}', f'cpatk_{level}', f'map_{level}']].mean().unstack('method'))
+                 [label_metrics].mean().unstack('method'))
         stats.columns = [f'{method}_{metric.rsplit("_", 1)[0]}' for metric, method in stats.columns]
         first = per_query_df[per_query_df['method'] == next(reversed(methods))]
         counts = first.groupby(level).agg(n_queries=('query_id', 'size'),
@@ -524,18 +647,27 @@ def git_commit():
         return None
 
 
-def read_gtalign_results(gtalign_results_dir, top_k):
+def read_gtalign_results(gtalign_results_dir, top_k=None):
     """Read gtalign results into a pandas dataframe (single-pass per file).
+    Keeps the top_k hits per query after the self-hit, or every hit if top_k
+    is None.
 
     Result lines are identified by a leading rank integer, e.g.:
         '     1 eval_structures/d1yl4r1.ent Chn:R  ...'
     The SCOPe domain ID is extracted from the path token (e.g. 'd1yl4r1').
     """
     files = glob.glob(os.path.join(gtalign_results_dir, '*.out'))
-    rank_re = re.compile(r'^\s+(\d+)\s+\S')   # rank integer at line start
-    path_re = re.compile(r'/(d\w+?)\.ent')     # SCOPe domain id in path
+    # A hit row is rank, structure path, then 'Chn:'. Requiring 'Chn:' skips
+    # header lines that also start with a number ('  1575 structure(s)',
+    # '  324887 total residues').
+    rank_re = re.compile(r'^\s+(\d+)\s+\S+\s+Chn:')
+    # SCOPe domain id in the path. Multi-chain domain ids contain a dot
+    # (d1bom.1), so '.' is allowed; the lazy match stops at the final '.ent'.
+    path_re = re.compile(r'/(d[\w.]+?)\.ent\b')
 
     results = []
+    n_unparsed = 0
+    unparsed_example = None
     for file in files:
         tmp = [os.path.basename(file)]
         collected = 0
@@ -545,17 +677,23 @@ def read_gtalign_results(gtalign_results_dir, top_k):
                 if not m:
                     continue
                 rank = int(m.group(1))
-                if rank == 1 or rank > top_k+1:  # skip self-hit (rank 1) and anything beyond top_k
+                # skip self-hit (rank 1) and anything beyond top_k
+                if rank == 1 or (top_k is not None and rank > top_k + 1):
                     continue
                 path_m = path_re.search(line)
                 if not path_m:
-                    print(f'WARNING: no SCOPe domain ID found at rank {rank} in {os.path.basename(file)} — empty string appended.')
+                    n_unparsed += 1
+                    if unparsed_example is None:
+                        unparsed_example = f'{os.path.basename(file)} rank {rank}: {line.strip()}'
                 tmp.append(path_m.group(1) if path_m else '')
                 collected += 1
-                if collected >= top_k:
+                if top_k is not None and collected >= top_k:
                     break
         results.append(tmp)
 
+    if n_unparsed:
+        print(f'WARNING: {n_unparsed} GTalign hit row(s) had no SCOPe domain ID in the '
+              f'path and were left blank (not scored). First: {unparsed_example}')
     return pd.DataFrame(results)
 
 def _foldseek_id(raw):
@@ -571,8 +709,9 @@ def _foldseek_id(raw):
     return stem[:7]
 
 
-def read_foldseek_results(foldseek_results, top_k):
-    """Read Foldseek easy-search results into a pandas DataFrame.
+def read_foldseek_results(foldseek_results, top_k=None):
+    """Read Foldseek easy-search results into a pandas DataFrame, keeping the
+    top_k hits per query (every hit if top_k is None).
 
     Expects output produced with:
         --format-output "query,target,alntmscore"
@@ -595,13 +734,14 @@ def read_foldseek_results(foldseek_results, top_k):
     for query_id, targets in data.items():
         sorted_targets = sorted(targets.items(), key=lambda x: x[1], reverse=True)
         filtered = [t for t, _ in sorted_targets if t != query_id]
-        ordered_data.append([query_id] + filtered[:top_k])
+        ordered_data.append([query_id] + (filtered if top_k is None else filtered[:top_k]))
     return pd.DataFrame(ordered_data)
 
 
-def read_usalign_results(usalign_results, top_k):
+def read_usalign_results(usalign_results, top_k=None):
     """
-    Read USalign results into a pandas dataframe.
+    Read USalign results into a pandas dataframe, keeping the top_k hits per
+    query (every hit if top_k is None).
     Making assumption that the top hit is itself since
     USalign does not return this data/score (self to self).
     """
@@ -643,7 +783,7 @@ def read_usalign_results(usalign_results, top_k):
     for key, inner_dict in data.items():
         sorted_inner_dict = sorted(inner_dict.items(), key=lambda item: item[1],
                                    reverse=True)
-        tmp1 = sorted_inner_dict[:top_k]
+        tmp1 = sorted_inner_dict if top_k is None else sorted_inner_dict[:top_k]
         tmp2 = [key]
         tmp2.extend([prot for (prot,_) in tmp1])
         ordered_data.append(tmp2)
@@ -676,6 +816,12 @@ if __name__ == '__main__':
                         help='Number of bootstrap resamples for --bootstrap. Default: 10000.')
     parser.add_argument('--boot_seed', type=int, default=0,
                         help='RNG seed for --bootstrap resampling. Default: 0.')
+    parser.add_argument('--remote_depth', type=int, default=None,
+                        help='How deep into each ranked list the remote metrics (hits '
+                             'outside the query\'s own family/superfamily/fold) may look. '
+                             'Default: the shallowest method\'s list depth, so every method is '
+                             'scored over the same depth. Lower it to compare at a fixed '
+                             'depth; it is never raised above the shallowest list.')
     args = parser.parse_args()
 
     # Files and folders
@@ -771,102 +917,88 @@ if __name__ == '__main__':
     # switch still joins against png results.
     label_df['proteogram_stem'] = label_df['proteogram_file'].apply(image_stem)
 
-    # Calculate Precision@K's and MAP@K's
+    # Read every method's ranked lists in full first: the remote metrics look
+    # past K (after removing the query's own family etc.), and every method is
+    # scored over the same depth -- the shallowest method's list.
     proteogram_res_df = pd.read_csv(proteogram_sim_results, sep='\t')
+    gtalign_res_df = read_gtalign_results(gtalign_results_dir)
+    print(f'GTalign DataFrame rows: {gtalign_res_df.shape[0]}')
+    usalign_res_df = read_usalign_results(usalign_results)
+    foldseek_res_df = None
+    if foldseek_results:
+        fs_raw = pd.read_csv(foldseek_results, sep='\t', header=None,
+                             names=['query', 'target', 'score'])
+        scores = pd.to_numeric(fs_raw['score'], errors='coerce').dropna()
+        print(f'Foldseek score column — n: {len(scores)}, '
+              f'min: {scores.min():.4f}, max: {scores.max():.4f}, '
+              f'mean: {scores.mean():.4f}, '
+              f'n_zero: {(scores == 0).sum()}')
+        print(f'Foldseek file columns: {fs_raw.shape[1]}  '
+              f'sample row: {list(fs_raw.iloc[0])}')
+        foldseek_res_df = read_foldseek_results(foldseek_results)
+
+    # Proteogram lists include the self-hit, the aligners' don't.
+    depths = {'Proteogram': max(list_depth(proteogram_res_df) - 1, 0),
+              'GTalign': list_depth(gtalign_res_df), 'USalign': list_depth(usalign_res_df)}
+    if foldseek_res_df is not None:
+        depths['Foldseek'] = list_depth(foldseek_res_df)
+    remote_depth = min(depths.values())
+    if args.remote_depth is not None:
+        remote_depth = min(remote_depth, args.remote_depth)
+    print('Ranked-list depth per method: '
+          + ', '.join(f'{name} {d}' for name, d in depths.items())
+          + f'. Remote metrics use the first {remote_depth} hits of every method.')
+    if remote_depth <= top_k:
+        print(f'WARNING: remote metrics need ranked lists deeper than K={top_k}, but the '
+              f'shallowest is {remote_depth}. Hits from the query\'s own family (or '
+              f'superfamily) use up the list, so remote scores will be low for every method. '
+              f'Rerun the shallowest search with more hits per query.')
+
+    labels_by_stem = label_table(label_df, 'proteogram_stem')
+    counts = label_counts(label_df)
+    proteogram_remote_short = {lv: 0 for lv in LEVELS}
+    max_depth = max(top_k, remote_depth)
+
     n_queries_skipped = 0
     proteogram_evaluated_ids = set()
     proteogram_per_query = {}  # {query_id: {metric_level: value}} for bootstrap
-    for i in range(proteogram_res_df.shape[0]):
-        prot_file = image_stem(proteogram_res_df.iloc[i,0])
-        query_fam   = lookup(label_df, 'proteogram_stem', prot_file, 'family')
-        query_sfam  = lookup(label_df, 'proteogram_stem', prot_file, 'superfamily')
-        query_fold  = lookup(label_df, 'proteogram_stem', prot_file, 'fold')
-        query_class = lookup(label_df, 'proteogram_stem', prot_file, 'class')
-        if any(v is None for v in (query_fam, query_sfam, query_fold, query_class)):
+    for row in proteogram_res_df.itertuples(index=False):
+        prot_file = image_stem(row[0])
+        _q = labels_by_stem.get(prot_file)
+        if _q is None:
             n_queries_skipped += 1
             continue
         proteogram_evaluated_ids.add(prot_file)  # already an extension-less stem
-        
-        # Relevant item counts in corpus (excluding self) for MAP@K normalisation
-        r_fam   = max((label_df['family'] == query_fam).sum() - 1, 0)
-        r_sfam  = max((label_df['superfamily'] == query_sfam).sum() - 1, 0)
-        r_fold  = max((label_df['fold'] == query_fold).sum() - 1, 0)
-        r_class = max((label_df['class'] == query_class).sum() - 1, 0)
 
-        # For Precision calculation
-        tp_fam = 0
-        tp_sfam = 0
-        tp_fold = 0
-        tp_class = 0
-
-        # For MAP@K calculation
-        prec_at_k_fam = 0
-        prec_at_k_sfam = 0
-        prec_at_k_fold = 0
-        prec_at_k_class = 0
-
-        # Track number of valid results processed
-        valid_results = 0
-        # Labels of the top valid (non-self) hit, for Precision@1
-        first_hit = None
-        hits = []  # (target id, {level: label}) for the valid top-K hits
-
-        # Iterate through results and find matches for family, superfamily,
-        # fold and class SCOPe levels
-        k = 0
-        for target in proteogram_res_df.iloc[i,1:]:
-            target_file  = image_stem(target.split(',')[0])
+        # Ranked (target, labels) hits, self and unlabeled targets removed.
+        ranked = []
+        for target in row[1:]:
+            if not isinstance(target, str):
+                continue
+            target_file = image_stem(target.split(',')[0])
             if target_file == prot_file:  # skip self-hit
                 continue
-            target_fam   = lookup(label_df, 'proteogram_stem', target_file, 'family')
-            target_sfam  = lookup(label_df, 'proteogram_stem', target_file, 'superfamily')
-            target_fold  = lookup(label_df, 'proteogram_stem', target_file, 'fold')
-            target_class = lookup(label_df, 'proteogram_stem', target_file, 'class')
-            if any(v is None for v in (target_fam, target_sfam, target_fold, target_class)):
+            t = labels_by_stem.get(target_file)
+            if t is None:
                 continue
-            k += 1
-            valid_results += 1
-            hits.append((target_file, {'family': target_fam, 'superfamily': target_sfam,
-                                       'fold': target_fold, 'class': target_class}))
-            if k == 1:
-                first_hit = hits[0][1]
-            if query_fam == target_fam:
-                tp_fam += 1
-                prec_at_k_fam += (tp_fam / k)
-            if query_sfam == target_sfam:
-                tp_sfam += 1
-                prec_at_k_sfam += (tp_sfam / k)
-            if query_fold == target_fold:
-                tp_fold += 1
-                prec_at_k_fold += (tp_fold / k)
-            if query_class == target_class:
-                tp_class += 1
-                prec_at_k_class += (tp_class / k)
-            if k >= top_k:
+            ranked.append((target_file, t))
+            if len(ranked) >= max_depth:
                 break
+        hits = ranked[:top_k]
+        valid_results = len(hits)
 
         # Per-query metrics keyed by SCOPeID (== pdb_id_chain, so it pairs with
         # the alignment methods' per_query dicts). MAP@K and capped P@K
         # normalise by min(R, K), R = relevant items in the corpus; Recall@K by R.
-        _qid = os.path.splitext(prot_file)[0]
-        _tp = {'family': tp_fam, 'superfamily': tp_sfam, 'fold': tp_fold, 'class': tp_class}
-        _prec = {'family': prec_at_k_fam, 'superfamily': prec_at_k_sfam,
-                 'fold': prec_at_k_fold, 'class': prec_at_k_class}
-        _r = {'family': r_fam, 'superfamily': r_sfam, 'fold': r_fold, 'class': r_class}
-        _q = {'family': query_fam, 'superfamily': query_sfam,
-              'fold': query_fold, 'class': query_class}
+        _qid = prot_file
+        _r = {lv: max(counts[lv].get(_q[lv], 0) - 1, 0) for lv in LEVELS}
+        _tp = {lv: sum(t[lv] == _q[lv] for _, t in hits) for lv in LEVELS}
         query_info[_qid] = {**{lv: _q[lv] for lv in LEVELS},
-                            **{f'R_{lv}': int(_r[lv]) for lv in LEVELS}}
-        proteogram_per_query[_qid] = {'top_hits': ','.join(t for t, _ in hits)}
-        for lv in LEVELS:
-            proteogram_per_query[_qid][f'p1_{lv}'] = float(
-                first_hit is not None and first_hit[lv] == _q[lv])
-            proteogram_per_query[_qid][f'patk_{lv}'] = _tp[lv] / top_k
-            proteogram_per_query[_qid][f'cpatk_{lv}'] = capped_precision(_tp[lv], _r[lv], top_k)
-            proteogram_per_query[_qid][f'map_{lv}'] = (
-                _prec[lv] / min(_r[lv], top_k) if _r[lv] > 0 else 0.0)
-            proteogram_per_query[_qid][f'ratk_{lv}'] = (
-                _tp[lv] / _r[lv] if _r[lv] > 0 else 0.0)
+                            **{f'R_{lv}': int(_r[lv]) for lv in LEVELS},
+                            **{f'R_remote_{lv}': remote_r(_q, counts, lv)
+                               for lv in REMOTE_FINER}}
+        proteogram_per_query[_qid] = score_query(_q, ranked, counts, top_k, remote_depth,
+                                                 proteogram_remote_short)
 
         # Save search images sorted by capped precision at the configured
         # scope_level: tp / min(R, K), i.e. relative to what was findable, so a
@@ -919,32 +1051,22 @@ if __name__ == '__main__':
           f'no relative in the corpus (R = 0).')
 
     proteogram_metrics = summarize_per_query(proteogram_per_query)
+    proteogram_metrics['remote_short'] = proteogram_remote_short
 
     # Calculate Precision@K's and MAP@K's
-    gtalign_res_df = read_gtalign_results(gtalign_results_dir, top_k)
-    print(f'GTalign DataFrame rows: {gtalign_res_df.shape[0]}')
-    gtalign_res_df.to_csv(os.path.join(gtalign_results_dir, 'combined_gtalign_results.tsv'),
-                          sep='\t', index=False)
+    gtalign_res_df.iloc[:, :top_k + 1].to_csv(
+        os.path.join(gtalign_results_dir, 'combined_gtalign_results.tsv'),
+        sep='\t', index=False)
     gtalign_metrics = calc_patk_mapk(
         gtalign_res_df, label_df, top_k,
         query_id_fn=lambda x: x.replace('.ent.out', '').replace('.out', '')[:7],
-        limit_to_ids=proteogram_evaluated_ids)
+        limit_to_ids=proteogram_evaluated_ids, remote_depth=remote_depth)
 
-    usalign_res_df = read_usalign_results(usalign_results, top_k)
     usalign_metrics = calc_patk_mapk(usalign_res_df, label_df, top_k,
-                                     limit_to_ids=proteogram_evaluated_ids)
+                                     limit_to_ids=proteogram_evaluated_ids,
+                                     remote_depth=remote_depth)
 
-    if foldseek_results:
-        fs_raw = pd.read_csv(foldseek_results, sep='\t', header=None,
-                             names=['query', 'target', 'score'])
-        scores = pd.to_numeric(fs_raw['score'], errors='coerce').dropna()
-        print(f'Foldseek score column — n: {len(scores)}, '
-              f'min: {scores.min():.4f}, max: {scores.max():.4f}, '
-              f'mean: {scores.mean():.4f}, '
-              f'n_zero: {(scores == 0).sum()}')
-        print(f'Foldseek file columns: {fs_raw.shape[1]}  '
-              f'sample row: {list(fs_raw.iloc[0])}')
-        foldseek_res_df = read_foldseek_results(foldseek_results, top_k)
+    if foldseek_res_df is not None:
         label_ids = set(label_df['pdb_id_chain'])
         fs_targets = [t for t in pd.unique(foldseek_res_df.iloc[:, 1:].values.ravel())
                       if isinstance(t, str)]
@@ -952,7 +1074,8 @@ if __name__ == '__main__':
         print(f'Foldseek unique targets: {len(fs_targets)}, '
               f'found in label_df: {n_matched} ({100*n_matched/max(len(fs_targets),1):.1f}%)')
         foldseek_metrics = calc_patk_mapk(foldseek_res_df, label_df, top_k,
-                                          limit_to_ids=proteogram_evaluated_ids)
+                                          limit_to_ids=proteogram_evaluated_ids,
+                                          remote_depth=remote_depth)
     else:
         foldseek_metrics = None
 
@@ -964,7 +1087,7 @@ if __name__ == '__main__':
         f'{name}: {m["n_queries"]}' for name, m in methods.items())
           + ('' if foldseek_metrics else ' | Foldseek: N/A'))
 
-    print_metric_tables(methods, top_k)
+    print_metric_tables(methods, top_k, remote_depth)
 
     bootstrap_rows = None
     if args.bootstrap:
@@ -985,6 +1108,9 @@ if __name__ == '__main__':
         'git_commit': git_commit(),
         'top_k': top_k,
         'scope_level': scope_level,
+        'ranked_list_depth': depths,
+        'remote_depth': remote_depth,
+        'remote_short_lists': {name: m.get('remote_short') for name, m in methods.items()},
         'inputs': {'config': os.path.abspath('config.yml'),
                    'scope_eval_set': scope_eval_set,
                    'proteogram_sim_results': proteogram_sim_results,
