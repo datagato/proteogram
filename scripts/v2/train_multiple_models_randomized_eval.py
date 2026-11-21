@@ -5,7 +5,7 @@ Requires a GPU for reasonable training time, especially for ResNet18 and ViT-B/1
 
 Data location and other parameters can be configured via command-line arguments or a config.yml file.  Command-line arguments take precedence over config.yml. The Proteogram dataset should be prepared in advance using the create_v2_proteograms.py script. The root directory ("training_data_dir" in config.yml) should contain all proteogram images in a flat layout (no train/eval subdirectories). A random seed (--seed) is used to reproducibly split images into train, validation, and held-out test sets. An annotation TSV file is also required, which should be specified via the --tsv_file argument or included in config.yml as "tsv_file".  The model weights will be saved to the path specified by "cnn_model_file_prefix" in config.yml, with a suffix indicating the architecture and hyperparameters.
 
-Note on --model vit: ViT-B/16 uses fixed, learned positional embeddings sized for a 224x224 input split into 16x16 patches, unlike the CNN/ResNet18 paths which can train on padded, variable-size proteograms. Selecting --model vit therefore always forces --resize (never pad) and overrides --max_image_size to 224, regardless of what was passed on the command line.
+Note on --model vit: ViT-B/16 uses fixed, learned positional embeddings sized for a 224x224 input split into 16x16 patches, unlike the CNN/ResNet18 paths which can train on padded, variable-size proteograms. Selecting --model vit therefore always forces --resize (never pad) and a 224x224 input grid (overriding --input_size), regardless of what was passed on the command line. --max_image_size is not changed: it still sets which proteins are included, and every included proteogram is resized to 224x224.
 
 Here is more information about the SCOPe dataset: https://scop.berkeley.edu
 
@@ -351,7 +351,8 @@ def build_vit(num_classes, num_unfrozen_blocks=2):
     input split into 16x16 patches, so it cannot accept the variable-size
     padded inputs the CNN/ResNet18 paths use -- the caller must resize
     proteograms to exactly 224x224 (see the --model == 'vit' handling in
-    __main__, which forces --resize and overrides --max_image_size to 224).
+    __main__, which forces --resize and a 224x224 input grid; --max_image_size
+    still only sets the size cutoff for which proteins are included).
 
     Only the last `num_unfrozen_blocks` of the 12 transformer encoder blocks
     are trainable (along with the final encoder LayerNorm and the new head);
@@ -911,7 +912,8 @@ if __name__ == '__main__':
                         help="Model architecture: 'cnn' (from-scratch 4-block ConvNet), "
                              "'resnet18' (pretrained ResNet18 fine-tuning), or 'vit' "
                              "(pretrained ViT-B/16 fine-tuning). Note: 'vit' forces --resize "
-                             "and a fixed 224x224 input size (overriding --max_image_size), "
+                             "and a fixed 224x224 input grid (overriding --input_size; "
+                             "--max_image_size still sets which proteins are included), "
                              "since ViT-B/16's positional embeddings require a fixed input "
                              "shape and cannot use the padded/variable-size inputs the other "
                              "two architectures accept. Default: cnn.")
