@@ -30,6 +30,44 @@ from torch.utils.data import Sampler
 SCOPE_LEVELS = ('class', 'fold', 'superfamily', 'family')
 
 
+class MultiLevelCELoss(nn.Module):
+    """Weighted sum of per-level classification losses for a multi-head model.
+
+    Used by train_multiple_models_randomized_eval.py --aux_heads: the main
+    level (e.g. superfamily) keeps weight 1.0 and coarser auxiliary levels
+    (fold, class) add smaller terms, so the shared feature -- which is also the
+    retrieval embedding -- keeps same-fold superfamilies closer together than
+    superfamily-only cross-entropy does.
+
+        L = sum_level weight[level] * base_loss(outputs[level], targets[:, col(level)])
+
+    Args:
+        level_weights: {level: weight}, e.g. {'superfamily': 1.0, 'fold': 0.5,
+            'class': 0.25}. Keys must be in SCOPE_LEVELS.
+        base_loss: per-level criterion taking (logits, int targets), e.g.
+            nn.CrossEntropyLoss(label_smoothing=0.1) or FocalLoss.
+
+    forward(outputs, targets):
+        outputs: {level: (B, n_classes_at_level) logits}.
+        targets: (B, 4) int64 hierarchy labels, columns ordered per SCOPE_LEVELS.
+    """
+
+    def __init__(self, level_weights, base_loss):
+        super().__init__()
+        unknown = set(level_weights) - set(SCOPE_LEVELS)
+        if unknown:
+            raise ValueError(f'Unknown SCOPe level(s) {sorted(unknown)}; expected {SCOPE_LEVELS}.')
+        self.level_weights = dict(level_weights)
+        self.columns = {lvl: SCOPE_LEVELS.index(lvl) for lvl in self.level_weights}
+        self.base_loss = base_loss
+
+    def forward(self, outputs, targets):
+        total = 0.0
+        for lvl, weight in self.level_weights.items():
+            total = total + weight * self.base_loss(outputs[lvl], targets[:, self.columns[lvl]])
+        return total
+
+
 class HierarchicalTripletLoss(nn.Module):
     """Batch-hard triplet loss with margins scaled by SCOPe hierarchy distance.
 

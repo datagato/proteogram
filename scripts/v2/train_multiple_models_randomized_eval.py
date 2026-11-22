@@ -25,8 +25,11 @@ Note on reproducibility and the use of --test_list (to skip the random split and
 
 Note on --val_list (fixed validation set) and held-out-family evaluation: scripts/utilities/create_heldout_family_list.py writes a test list and a val list of whole families held out from training (when training at --level superfamily), so the test set measures generalization to unseen families and early stopping selects for it too. Pass them as --test_list and --val_list with the same filters. With --loss triplet_hierarchy, note that the per-epoch val P@K searches the val set itself, so superfamily-level hits there come only from other held-out families of the same superfamily, not from training families.
 
+Note on --aux_heads (multi-level cross-entropy): with --model resnet18 and --loss ce/focal, '--aux_heads fold,class' adds fold and class classification heads that read the same pooled feature as the main --level head. The loss is the main CE plus --aux_weights times each auxiliary CE (default 0.5, 0.25). Superfamily-only CE gets no reward for keeping superfamilies of the same fold close, so remote fold retrieval suffers; the fold head adds that pull while superfamily stays the main objective. Test accuracy is printed for every head. Only the backbone and main head are saved, in the usual checkpoint format, so search and evaluation need no changes.
+
  Usage example:
     python train_multiple_models_randomized_eval.py --model resnet18 --epochs 50 --batch_size 32 --lr 1e-4 --seed 42
+    python train_multiple_models_randomized_eval.py --model resnet18 --level superfamily --aux_heads fold,class --aux_weights 0.5,0.25 --epochs 50 --seed 0
     python train_multiple_models_randomized_eval.py --model vit --epochs 50 --batch_size 16 --lr 1e-4 --seed 42
 """
 import copy
@@ -52,7 +55,7 @@ import torchvision.models as tv_models
 import torchvision.transforms as transforms
 
 from proteogram.common import read_yaml, find_proteogram_images
-from proteogram.v2 import HierarchicalTripletLoss, HierarchicalPKSampler, SCOPE_LEVELS
+from proteogram.v2 import HierarchicalTripletLoss, HierarchicalPKSampler, MultiLevelCELoss, SCOPE_LEVELS
 
 
 matplotlib.use('agg')
@@ -410,6 +413,43 @@ def build_resnet18(num_classes, pretrained=True, freeze_layers=('layer1',)):
     return model
 
 
+class MultiHeadResNet18(nn.Module):
+    """ResNet18 with the main classification head plus auxiliary heads for
+    coarser SCOPe levels, all reading the same 512-d pooled feature (--aux_heads).
+
+    The main head is the wrapped ResNet's own fc, so `self.base` is exactly the
+    model build_resnet18() returns: saving `self.base.state_dict()` gives a
+    checkpoint with the usual keys that search (Img2Vec) loads unchanged. The
+    auxiliary heads only shape the shared feature during training and are not
+    saved.
+
+    forward(x) returns {level: logits} for the main level and each aux level.
+    """
+
+    def __init__(self, base, main_level, aux_sizes):
+        super().__init__()
+        self.base = base
+        self.main_level = main_level
+        in_features = base.fc[1].in_features
+        self.aux = nn.ModuleDict({
+            lvl: nn.Sequential(nn.Dropout(0.5), nn.Linear(in_features, n))
+            for lvl, n in aux_sizes.items()
+        })
+
+    def features(self, x):
+        b = self.base
+        x = b.maxpool(b.relu(b.bn1(b.conv1(x))))
+        x = b.layer4(b.layer3(b.layer2(b.layer1(x))))
+        return torch.flatten(b.avgpool(x), 1)
+
+    def forward(self, x):
+        f = self.features(x)
+        out = {self.main_level: self.base.fc(f)}
+        for lvl, head in self.aux.items():
+            out[lvl] = head(f)
+        return out
+
+
 def build_resnet18_embedding(embed_dim, pretrained=True, freeze_layers=('layer1',)):
     """ResNet18 with the classification head replaced by an embedding projection,
     for hierarchy-aware triplet training (see
@@ -699,8 +739,37 @@ def split_train_test(full_dataset, generator):
     )
     return train_dataset, test_dataset
 
-def get_accuracies(model, test_loader, class_names, labels_to_names, device=torch.device('cpu')):
-    """Accuracies per class, classification report, and AUC-ROC."""
+def select_head(outputs, targets, output_key=None, target_col=None):
+    """For multi-head models (--aux_heads): pick one head's logits from the
+    {level: logits} output and the matching column of the (B, 4) hierarchy
+    labels. Single-head models pass through unchanged."""
+    if output_key is not None:
+        outputs = outputs[output_key]
+    if target_col is not None:
+        targets = targets[:, target_col]
+    return outputs, targets
+
+
+def head_accuracy(model, loader, output_key, target_col, device=torch.device('cpu')):
+    """Top-1 accuracy (%) and sample count of one head of a multi-head model."""
+    correct, total = 0, 0
+    model.eval()
+    model.to(device)
+    with torch.no_grad():
+        for data, targets in loader:
+            data, targets = data.to(device), targets.to(device)
+            outputs, targets = select_head(model(data), targets, output_key, target_col)
+            correct += int((outputs.argmax(dim=1) == targets).sum())
+            total += int(targets.numel())
+    return (100.0 * correct / total if total else float('nan')), total
+
+
+def get_accuracies(model, test_loader, class_names, labels_to_names, device=torch.device('cpu'),
+                   output_key=None, target_col=None):
+    """Accuracies per class, classification report, and AUC-ROC.
+
+    output_key/target_col: for multi-head models (--aux_heads), which head to
+    score and which hierarchy-label column holds its targets (see select_head)."""
     correct_pred = {classname: 0 for classname in class_names}
     total_pred = {classname: 0 for classname in class_names}
     total_correct = 0
@@ -713,7 +782,7 @@ def get_accuracies(model, test_loader, class_names, labels_to_names, device=torc
     with torch.no_grad():
         for (data, targets) in test_loader:
             data, targets = data.to(device), targets.to(device)
-            outputs = model(data)
+            outputs, targets = select_head(model(data), targets, output_key, target_col)
             probs = torch.softmax(outputs, dim=1)
             _, predictions = torch.max(outputs, 1)
             y_scores.append(probs.cpu().numpy())
@@ -787,8 +856,10 @@ def get_accuracies(model, test_loader, class_names, labels_to_names, device=torc
     return overall_accuracy_str
 
 
-def view_pred_set(model, test_loader, num_preds, labels_to_names, fig_path):
-    """Graph a set of predictions with labels and save plot."""
+def view_pred_set(model, test_loader, num_preds, labels_to_names, fig_path,
+                  output_key=None, target_col=None):
+    """Graph a set of predictions with labels and save plot. output_key/
+    target_col select one head of a multi-head model (see select_head)."""
     predictions = []
     images = []
     labels = []
@@ -796,8 +867,8 @@ def view_pred_set(model, test_loader, num_preds, labels_to_names, fig_path):
         cnt = 1
         for (data, target) in test_loader:
             images.append(data)
+            outputs, target = select_head(model(data), target, output_key, target_col)
             labels.append(target[0])
-            outputs = model(data)
             _, predicted = torch.max(outputs, 1)
             predictions.append(predicted[0])
 
@@ -1056,6 +1127,23 @@ if __name__ == '__main__':
                         help="Focusing parameter gamma for focal loss (ignored when --loss=ce). "
                              "gamma=0 reduces to cross-entropy; gamma=2 is the RetinaNet default. "
                              "Default: 2.0.")
+    parser.add_argument('--aux_heads',
+                        type=str,
+                        default=None,
+                        help="Comma-separated coarser SCOPe levels to add auxiliary classification "
+                             "heads for, e.g. 'fold,class' when training at --level superfamily. "
+                             "Each head reads the same pooled feature as the main head (the "
+                             "retrieval embedding), and its loss is added with --aux_weights, so "
+                             "same-fold superfamilies stay closer together in the embedding. "
+                             "Test accuracy is reported per head. The heads are training-only: the "
+                             "saved checkpoint holds the backbone and main head in the usual "
+                             "format. Only with --model resnet18 and --loss ce/focal. Default: off.")
+    parser.add_argument('--aux_weights',
+                        type=str,
+                        default=None,
+                        help="Comma-separated loss weights for --aux_heads, in the same order "
+                             "(the main level's weight is 1.0). Default: 0.5 for the first aux "
+                             "head, halving for each further one (e.g. 'fold,class' -> 0.5,0.25).")
     parser.add_argument('--embed_dim',
                         type=int,
                         default=128,
@@ -1158,6 +1246,34 @@ if __name__ == '__main__':
     # Get level from command line or config, with command line taking precedence. Default to 'class' if neither is provided.
     level = args.level or config.get('scope_level', 'class')
 
+    # Auxiliary heads (--aux_heads): {level: loss weight}, main level excluded.
+    aux_weights = {}
+    if args.aux_heads:
+        aux_levels = [l.strip() for l in args.aux_heads.split(',') if l.strip()]
+        if args.model != 'resnet18':
+            raise ValueError('--aux_heads currently only supports --model resnet18.')
+        if args.loss == 'triplet_hierarchy':
+            raise ValueError('--aux_heads is for --loss ce/focal; triplet_hierarchy already '
+                             'uses every SCOPe level.')
+        bad = [l for l in aux_levels if l not in SCOPE_LEVELS or l == 'family']
+        if bad:
+            raise ValueError(f'--aux_heads levels must be class, fold or superfamily; got {bad}.')
+        if level in aux_levels:
+            raise ValueError(f'--aux_heads includes the main --level ({level}); list only the '
+                             f'extra levels.')
+        if len(set(aux_levels)) != len(aux_levels):
+            raise ValueError(f'--aux_heads lists a level twice: {aux_levels}.')
+        if args.aux_weights:
+            weights = [float(w) for w in args.aux_weights.split(',')]
+            if len(weights) != len(aux_levels):
+                raise ValueError(f'--aux_weights has {len(weights)} value(s) for '
+                                 f'{len(aux_levels)} --aux_heads level(s).')
+        else:
+            weights = [0.5 / 2 ** i for i in range(len(aux_levels))]
+        aux_weights = dict(zip(aux_levels, weights))
+    elif args.aux_weights:
+        raise ValueError('--aux_weights needs --aux_heads.')
+
     if args.epochs:
         epochs = args.epochs
     elif 'num_epochs' in config:
@@ -1258,8 +1374,17 @@ if __name__ == '__main__':
         min_image_size=20,
         max_image_size=args.max_image_size,
         exclude_classes=exclude_classes,
-        emit_hierarchy=(args.loss == 'triplet_hierarchy'),
+        # Hierarchy labels (B, 4) also feed the --aux_heads losses.
+        emit_hierarchy=(args.loss == 'triplet_hierarchy' or bool(aux_weights)),
         min_family_size=(args.min_family_size if args.loss == 'triplet_hierarchy' else 0))
+
+    if aux_weights:
+        # The main head's targets come from the hierarchy column for `level`,
+        # while accuracy reporting names them via labels_to_names -- the two
+        # numberings must agree (both are sorted label names over the same files).
+        if full_dataset.hierarchy_names_to_labels[level] != full_dataset.names_to_labels:
+            raise RuntimeError(f'Hierarchy label numbering for {level} does not match the '
+                               f'main label numbering; cannot train --aux_heads.')
 
     all_indices = list(range(len(full_dataset)))
     labels = full_dataset.labels
@@ -1526,8 +1651,23 @@ if __name__ == '__main__':
             # gently, train the new head fast). From scratch, train everything at
             # a uniform rate.
             backbone_lr = args.lr * 0.1 if args.pretrained else args.lr
-            backbone_params = [p for n, p in model.named_parameters() if 'fc' not in n and p.requires_grad]
-            head_params = list(model.fc.parameters())
+            if aux_weights:
+                aux_sizes = {lvl: len(full_dataset.hierarchy_names_to_labels[lvl])
+                             for lvl in aux_weights}
+                model = MultiHeadResNet18(model, level, aux_sizes)
+                print('Auxiliary heads: ' + ', '.join(
+                    f'{lvl} ({n} classes, loss weight {aux_weights[lvl]})'
+                    for lvl, n in aux_sizes.items())
+                      + f'; main head: {level} ({num_classes} classes, weight 1.0)')
+                for lvl, n in aux_sizes.items():
+                    if n < 2:
+                        print(f'WARNING: the {lvl} head has only {n} class in this data, so '
+                              f'it is always right and adds no training signal.')
+            # Heads (main fc + any aux heads) train at the full LR, the backbone gently.
+            backbone_params = [p for n, p in model.named_parameters()
+                               if 'fc' not in n and not n.startswith('aux.') and p.requires_grad]
+            head_params = [p for n, p in model.named_parameters()
+                           if 'fc' in n or n.startswith('aux.')]
             optimizer = optim.AdamW([
                 {'params': backbone_params, 'lr': backbone_lr},
                 {'params': head_params,     'lr': args.lr},
@@ -1559,6 +1699,17 @@ if __name__ == '__main__':
         else:
             loss_criteria = nn.CrossEntropyLoss(label_smoothing=0.1)
             print('Loss: CrossEntropyLoss(label_smoothing=0.1)')
+        if aux_weights:
+            # train_model() reads the module-level loss_criteria, so wrapping it
+            # here is all the training loop needs.
+            loss_criteria = MultiLevelCELoss({level: 1.0, **aux_weights}, loss_criteria)
+            print('Total loss = ' + ' + '.join(
+                f'{w}*{lvl}' for lvl, w in {level: 1.0, **aux_weights}.items())
+                  + ' (val loss for LR schedule/early stopping is this total)')
+        # Multi-head models return {level: logits}; score the main head against
+        # its column of the (B, 4) hierarchy labels.
+        main_key = level if aux_weights else None
+        main_col = SCOPE_LEVELS.index(level) if aux_weights else None
         model, training_loss, val_loss, epochs_trained = train_model(model,
                             train_loader=train_loader,
                             val_loader=val_loader,
@@ -1570,9 +1721,23 @@ if __name__ == '__main__':
         overall_accuracy = get_accuracies(model,
                        test_loader,
                        class_names,
-                       full_dataset.labels_to_names)
+                       full_dataset.labels_to_names,
+                       output_key=main_key, target_col=main_col)
+
+        aux_test_accuracy = {}
+        if aux_weights:
+            print('\nTest accuracy per head:')
+            for lvl in [level] + list(aux_weights):
+                acc, n = head_accuracy(model, test_loader, lvl, SCOPE_LEVELS.index(lvl))
+                n_cls = len(full_dataset.hierarchy_names_to_labels[lvl])
+                role = 'main' if lvl == level else f'aux, weight {aux_weights[lvl]}'
+                print(f'  {lvl:<12} ({role}; {n_cls} classes): {acc:.1f} % of {n} test proteins')
+                if lvl != level:
+                    aux_test_accuracy[lvl] = round(acc, 2)
 
         loss_tag = f'focal_g{args.focal_gamma}' if args.loss == 'focal' else 'ce'
+        if aux_weights:
+            loss_tag += '_aux-' + '-'.join(f'{lvl}{w:g}' for lvl, w in aux_weights.items())
         model_tag = f'{args.model}_unfrozen{args.vit_unfrozen_blocks}' if args.model == 'vit' else args.model
         if args.model == 'resnet18' and not args.pretrained:
             model_tag += '_scratch'
@@ -1597,15 +1762,22 @@ if __name__ == '__main__':
             # (penultimate features are the retrieval embedding), rather than
             # keeping fc as an embedding projection. Older bare-state_dict CE
             # checkpoints still load via Img2Vec's key-signature fallback.
+            # With --aux_heads only the wrapped ResNet (backbone + main head) is
+            # saved: the aux heads are training-only, and this keeps the usual
+            # keys so Img2Vec loads it like any other classifier checkpoint.
+            meta = {'kind': 'classifier', 'architecture': args.model,
+                    'input_size': image_resize,
+                    'max_image_size': args.max_image_size,
+                    'resize': args.resize,
+                    'pretrained': args.pretrained}
+            if aux_weights:
+                meta.update(aux_heads=aux_weights, aux_test_accuracy=aux_test_accuracy)
             torch.save({
-                'state_dict': model.state_dict(),
-                'meta': {'kind': 'classifier', 'architecture': args.model,
-                         'input_size': image_resize,
-                         'max_image_size': args.max_image_size,
-                         'resize': args.resize,
-                         'pretrained': args.pretrained},
+                'state_dict': (model.base if aux_weights else model).state_dict(),
+                'meta': meta,
             }, model_path)
-            print(f'Saved model to {model_path}')
+            print(f'Saved model to {model_path}'
+                  + (' (backbone + main head; aux heads not saved)' if aux_weights else ''))
 
         if args.save_test_list:
             write_prefix_list(test_indices, full_dataset,
@@ -1618,5 +1790,6 @@ if __name__ == '__main__':
                       test_loader,
                       num_preds=10,
                       labels_to_names=full_dataset.labels_to_names,
-                      fig_path=os.path.join(output_dir, f'sample_preds{suffix}.png'))
+                      fig_path=os.path.join(output_dir, f'sample_preds{suffix}.png'),
+                      output_key=main_key, target_col=main_col)
 
