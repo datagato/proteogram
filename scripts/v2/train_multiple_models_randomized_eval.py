@@ -23,6 +23,8 @@ classifier for one level. See proteogram/v2/losses.py for the loss implementatio
 
 Note on reproducibility and the use of --test_list (to skip the random split and repeat using the same test set from a previous run): because the test set is applied on top of the current eligibility filters, if you change min_family_size/max_image_size/min_class_size between runs, some listed proteins may get filtered out (you'll see the WARNING with the count) — so keep those filters consistent with the run that generated the list if you want the test set identical.
 
+Note on --train_list (fully explicit split): with --test_list and --val_list, --train_list makes all three splits exact, e.g. the leakage-screened lists from scripts/utilities/create_heldout_family_list.py --clean_split. Only proteins in the three lists are loaded, the lists define the label set (--min_class_size is ignored), and model files are tagged min_train<N> with the smallest per-label training count.
+
 Note on --val_list (fixed validation set) and held-out-family evaluation: scripts/utilities/create_heldout_family_list.py writes a test list and a val list of whole families held out from training (when training at --level superfamily), so the test set measures generalization to unseen families and early stopping selects for it too. Pass them as --test_list and --val_list with the same filters. With --loss triplet_hierarchy, note that the per-epoch val P@K searches the val set itself, so superfamily-level hits there come only from other held-out families of the same superfamily, not from training families.
 
 Note on --aux_heads (multi-level cross-entropy): with --model resnet18 and --loss ce/focal, '--aux_heads fold,class' adds fold and class classification heads that read the same pooled feature as the main --level head. The loss is the main CE plus --aux_weights times each auxiliary CE (default 0.5, 0.25). Superfamily-only CE gets no reward for keeping superfamilies of the same fold close, so remote fold retrieval suffers; the fold head adds that pull while superfamily stays the main objective. Test accuracy is printed for every head. Only the backbone and main head are saved, in the usual checkpoint format, so search and evaluation need no changes.
@@ -36,6 +38,7 @@ import copy
 from sched import scheduler
 import pandas as pd
 import numpy as np
+from collections import Counter
 import os
 import random
 import matplotlib
@@ -65,7 +68,8 @@ class ProteogramDataset(Dataset):
 
     def __init__(self, tsv_file, root_dir, pad=True, level='class', new_size=128, transform=None,
                  names_to_labels=None, min_class_size=0, min_image_size=0, max_image_size=0,
-                 exclude_classes=None, emit_hierarchy=False, min_family_size=0):
+                 exclude_classes=None, emit_hierarchy=False, min_family_size=0,
+                 include_ids=None):
         """
         Arguments
         ---------
@@ -112,10 +116,16 @@ class ProteogramDataset(Dataset):
             rather than distinct examples, giving the loss a trivial
             "identical to itself" positive instead of a real one. Default: 0
             (keep all).
+        include_ids : set of str, optional
+            If given, only images whose basename without extension is in this
+            set are loaded (used by --train_list). Default: None (all images).
         """
         self.annot_frame = pd.read_csv(tsv_file, sep='\t')
         self.root_dir = root_dir
         self.files = find_proteogram_images(self.root_dir)
+        if include_ids is not None:
+            self.files = [f for f in self.files
+                          if os.path.splitext(os.path.basename(f))[0] in include_ids]
 
         if min_image_size > 0:
             small = []
@@ -1075,6 +1085,14 @@ if __name__ == '__main__':
                              "train is everything eligible in neither list; without it, the "
                              "test set is a random split of the remainder (--test_size is then "
                              "the test fraction of that remainder). Must not overlap --test_list.")
+    parser.add_argument('--train_list',
+                        type=str,
+                        default=None,
+                        help="Path to a file of training protein prefixes (one SCOPeID per "
+                             "line), e.g. from create_heldout_family_list.py --clean_split. "
+                             "Requires --test_list and --val_list. Only the listed proteins "
+                             "are loaded, the lists define the label set, and --min_class_size "
+                             "is ignored. Every val/test label must have training proteins.")
     parser.add_argument('--max_image_size',
                         type=int,
                         default=200,
@@ -1362,6 +1380,17 @@ if __name__ == '__main__':
     g = torch.Generator()
     g.manual_seed(args.seed)
 
+    include_ids = None
+    if args.train_list:
+        if not (args.test_list and args.val_list):
+            raise ValueError('--train_list requires both --test_list and --val_list.')
+        include_ids = set()
+        for path in (args.train_list, args.test_list, args.val_list):
+            with open(path) as f:
+                include_ids |= {line.strip() for line in f if line.strip()}
+        print(f'--train_list: loading only the {len(include_ids)} listed proteins; '
+              f'--min_class_size is ignored.')
+
     full_dataset = ProteogramDataset(
         tsv_file=tsv_file,
         root_dir=root_dir,
@@ -1370,7 +1399,8 @@ if __name__ == '__main__':
         pad=not args.resize,
         transform=None,
         # exclude classes with fewer than this many samples to avoid extreme class imbalance
-        min_class_size=args.min_class_size,
+        min_class_size=0 if args.train_list else args.min_class_size,
+        include_ids=include_ids,
         min_image_size=20,
         max_image_size=args.max_image_size,
         exclude_classes=exclude_classes,
@@ -1438,7 +1468,15 @@ if __name__ == '__main__':
                 raise RuntimeError(f'--test_list and --val_list share {len(overlap)} eligible '
                                    f'proteogram(s), e.g. {sorted(_prefix(i) for i in overlap)[:5]}.')
         fixed = set(test_indices or []) | set(val_indices or [])
-        pool_indices = [i for i in all_indices if i not in fixed]
+        if args.train_list:
+            pool_indices = _indices_from_list(args.train_list, '--train_list')
+            overlap = set(pool_indices) & fixed
+            if overlap:
+                raise RuntimeError(f'--train_list shares {len(overlap)} proteogram(s) with '
+                                   f'--test_list/--val_list, e.g. '
+                                   f'{sorted(_prefix(i) for i in overlap)[:5]}.')
+        else:
+            pool_indices = [i for i in all_indices if i not in fixed]
         if not pool_indices:
             raise RuntimeError('--test_list/--val_list cover every eligible proteogram — no '
                                'data left for training.')
@@ -1457,7 +1495,8 @@ if __name__ == '__main__':
             train_indices = pool_indices
             note = '--test_size/--val_size ignored'
         sources = ', '.join(f'{name} from {os.path.basename(path)}'
-                            for name, path in (('test', args.test_list), ('val', args.val_list))
+                            for name, path in (('train', args.train_list),
+                                               ('test', args.test_list), ('val', args.val_list))
                             if path)
         print(f'Static split ({sources}; seed={args.seed}): {len(train_indices)} train / '
               f'{len(val_indices)} val / {len(test_indices)} test (held-out) ({note}).')
@@ -1467,8 +1506,11 @@ if __name__ == '__main__':
         train_label_set = {labels[i] for i in train_indices}
         unseen = {labels[i] for i in val_indices + test_indices} - train_label_set
         if unseen:
-            print(f'WARNING: {len(unseen)} label(s) in val/test have no training examples: '
-                  f'{sorted(full_dataset.labels_to_names[l] for l in unseen)[:5]}')
+            names = sorted(full_dataset.labels_to_names[l] for l in unseen)[:5]
+            if args.train_list:
+                raise RuntimeError(f'{len(unseen)} label(s) in val/test have no proteins in '
+                                   f'--train_list, e.g. {names}.')
+            print(f'WARNING: {len(unseen)} label(s) in val/test have no training examples: {names}')
     else:
         train_val_indices, test_indices = train_test_split(
             all_indices,
@@ -1485,6 +1527,11 @@ if __name__ == '__main__':
             stratify=[labels[i] for i in train_val_indices])
         print(f'Stratified split (seed={args.seed}): '
               f'{len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test (held-out)')
+
+    # File-name tag for the class-size rule actually applied.
+    size_tag = f'min_class_size{args.min_class_size}'
+    if args.train_list:
+        size_tag = f'min_train{min(Counter(labels[i] for i in train_indices).values())}'
 
     train_split = TransformedSubset(Subset(full_dataset, train_indices), transform_train)
     val_split   = TransformedSubset(Subset(full_dataset, val_indices),   transform_eval)
@@ -1591,7 +1638,7 @@ if __name__ == '__main__':
         _scratch_tag = '' if args.pretrained else '_scratch'
         suffix = (f'_{args.model}{_scratch_tag}_lr{lr}_bs{args.triplet_p * args.triplet_k}_e{epochs_trained}_'
                   f'seed{args.seed}_max_image_size{args.max_image_size}_{_grid_tag}_'
-                  f'min_class_size{args.min_class_size}_loss-triplet_hierarchy_'
+                  f'{size_tag}_loss-triplet_hierarchy_'
                   f'embeddim{args.embed_dim}_famPatK{test_patk["family"]:.3f}')
 
         # 'mean' isn't a per-epoch dict key (val_patk_history entries are keyed
@@ -1742,7 +1789,7 @@ if __name__ == '__main__':
         if args.model == 'resnet18' and not args.pretrained:
             model_tag += '_scratch'
         _grid_tag = f'input{image_resize}_{"resize" if args.resize else "pad"}'
-        suffix = f'_{model_tag}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_{_grid_tag}_min_class_size{args.min_class_size}_level-{level}_loss{loss_tag}_acc{overall_accuracy}'
+        suffix = f'_{model_tag}_lr{lr}_bs{batch_size}_e{epochs_trained}_seed{args.seed}_max_image_size{args.max_image_size}_{_grid_tag}_{size_tag}_level-{level}_loss{loss_tag}_acc{overall_accuracy}'
 
         plot_losses(training_loss, val_loss,
                     fig_path=os.path.join(output_dir, f'loss_curves{suffix}.png'))

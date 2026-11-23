@@ -70,6 +70,22 @@ Remote Precision@1 and Remote Capped Precision@K (remote homology):
     depth, or --remote_depth); a query whose list runs out before K remaining
     hits scores the hits it has and is counted as a short list.
 
+Per-superfamily reporting:
+    Pooled means weight every query equally, so one large superfamily can decide
+    a comparison. The macro average first takes each metric's mean within each
+    query superfamily, then averages those means with equal weight. Paired tests
+    and (with --bootstrap) CIs use one value per superfamily. The report also
+    shows the pooled margin after removing the superfamily that contributes most
+    to it. With --train_list, results are also broken down by how many training
+    proteins each query's superfamily had.
+
+Query types (--query_types):
+    A corpus from create_heldout_family_list.py --ood_level mixes novel-family
+    queries (superfamily seen in training) with novel-superfamily or novel-fold
+    queries (never seen). Every query searches the same corpus, and with
+    --query_types each type also gets its own pooled and per-superfamily results.
+    Pooled tables over the whole corpus mix the two settings.
+
 Pertinent metric calculation info can be found at
 https://weaviate.io/blog/retrieval-evaluation-metrics
 """
@@ -462,6 +478,200 @@ def report_bootstrap(proteogram_per_query, method_per_query, top_k, n_boot, seed
     return rows
 
 
+SUPERFAMILY_REPORT_METRICS = [
+    ('rcpatk_superfamily', 'Remote capped P@K, superfamily'),
+    ('rp1_superfamily', 'Remote P@1, superfamily'),
+    ('map_superfamily', 'MAP@K, superfamily'),
+    ('p1_superfamily', 'P@1, superfamily'),
+    ('map_family', 'MAP@K, family'),
+    ('p1_family', 'P@1, family'),
+    ('rcpatk_fold', 'Remote capped P@K, fold'),
+    ('rp1_fold', 'Remote P@1, fold'),
+]
+TRAIN_SIZE_BINS = [(1, 10), (11, 20), (21, 50), (51, 100), (101, None)]
+
+
+def per_query_frame(methods, query_info):
+    """Long table of the reported metrics: method, query_id, superfamily, metrics."""
+    cols = [k for k, _ in SUPERFAMILY_REPORT_METRICS]
+    rows = [{'method': name, 'query_id': q, 'superfamily': query_info[q]['superfamily'],
+             **{c: pq[c] for c in cols}}
+            for name, m in methods.items() for q, pq in m['per_query'].items()
+            if q in query_info]
+    return pd.DataFrame(rows)
+
+
+def report_per_superfamily(methods, query_info, top_k, run_dir, n_boot=None, seed=0,
+                           train_counts=None, prefix='', heading='PER-SUPERFAMILY (MACRO) RESULTS'):
+    """Print and save macro-averaged (per-superfamily) comparisons.
+
+    train_counts: optional {superfamily: training proteins} for the size breakdown.
+    prefix: file-name prefix, used for the per-query-type reports.
+    Returns {file name: description} for the files written.
+    """
+    frame = per_query_frame(methods, query_info)
+    if frame.empty or 'Proteogram' not in set(frame['method']):
+        return {}
+    cols = [k for k, _ in SUPERFAMILY_REPORT_METRICS]
+    by_sf = frame.groupby(['method', 'superfamily'])[cols].mean()
+    table = by_sf.reset_index()
+    n_q = frame[frame['method'] == 'Proteogram'].groupby('superfamily').size()
+    table.insert(2, 'n_queries', table['superfamily'].map(n_q))
+    if train_counts is not None:
+        table.insert(3, 'n_train', table['superfamily'].map(train_counts).fillna(0).astype(int))
+    written = {}
+    table.to_csv(os.path.join(run_dir, f'{prefix}per_superfamily_metrics.tsv'), sep='\t',
+                 index=False)
+    written[f'{prefix}per_superfamily_metrics.tsv'] = ('each method\'s mean metrics per query superfamily, '
+                                              'with query and training counts')
+
+    print('\n' + '=' * 78)
+    print(f'{heading}, K={top_k}: each superfamily has equal weight')
+    print('delta = Proteogram - method; Wilcoxon on paired superfamily means'
+          + ('; 95% bootstrap CI over superfamilies' if n_boot else ''))
+    print('=' * 78)
+    aligners = [n for n in methods if n != 'Proteogram']
+    prot = by_sf.loc['Proteogram']
+    prot_q = frame[frame['method'] == 'Proteogram'].set_index('query_id')
+    rows = []
+    for key, title in SUPERFAMILY_REPORT_METRICS:
+        n_sf = int(prot[key].notna().sum())
+        if n_sf == 0:
+            continue
+        means = ' | '.join(f'{n} {by_sf.loc[n][key].mean():.3f}' for n in methods)
+        print(f'\n{title} ({n_sf} superfamilies): {means}')
+        for name in aligners:
+            other = by_sf.loc[name][key].reindex(prot.index)
+            ok = prot[key].notna() & other.notna()
+            a, b = prot.loc[ok, key].to_numpy(), other[ok].to_numpy()
+            if len(a) == 0:
+                continue
+            p = wilcoxon_pvalue(a, b)
+            lo = hi = np.nan
+            if n_boot:
+                _, lo, hi = paired_bootstrap_delta(a, b, n_boot=n_boot, seed=seed)
+            macro = float((a - b).mean())
+            # Pooled margin, and the same margin without its largest contributor.
+            other_q = frame[frame['method'] == name].set_index('query_id')[key]
+            diff = (prot_q[key] - other_q.reindex(prot_q.index)).dropna()
+            pooled = float(diff.mean())
+            by_group = diff.groupby(prot_q.loc[diff.index, 'superfamily']).sum()
+            top = (by_group if pooled >= 0 else -by_group).idxmax()
+            rest = diff[prot_q.loc[diff.index, 'superfamily'] != top]
+            without = float(rest.mean()) if len(rest) else np.nan
+            ci = f' [{lo:+.3f},{hi:+.3f}]' if n_boot else ''
+            print(f'  vs {name:<9} macro {macro:+.3f}{ci} {_sig_stars(p):>3} | pooled {pooled:+.3f} | '
+                  f'pooled without {top} ({int((prot_q.loc[diff.index, "superfamily"] == top).sum())} '
+                  f'queries) {without:+.3f}')
+            rows.append({'metric': key, 'method': name, 'n_superfamilies': int(len(a)),
+                         'macro_proteogram': float(a.mean()), 'macro_method': float(b.mean()),
+                         'macro_delta': macro, 'ci_low': lo, 'ci_high': hi,
+                         'p_value': np.nan if p is None else p, 'sig': _sig_stars(p),
+                         'pooled_delta': pooled, 'top_contributor': top,
+                         'pooled_delta_without_top': without})
+    pd.DataFrame(rows).to_csv(os.path.join(run_dir, f'{prefix}per_superfamily_tests.tsv'),
+                              sep='\t', index=False)
+    written[f'{prefix}per_superfamily_tests.tsv'] = ('macro delta, CI and Wilcoxon p per metric and method, '
+                                            'plus the pooled delta without its top contributor')
+
+    if train_counts is not None:
+        size_rows = []
+        print('\nMacro results by training proteins in the query\'s superfamily:')
+        sf_train = pd.Series({sf: train_counts.get(sf, 0) for sf in prot.index})
+        for lo_n, hi_n in TRAIN_SIZE_BINS:
+            mask = sf_train >= lo_n if hi_n is None else sf_train.between(lo_n, hi_n)
+            sfs = sf_train.index[mask]
+            if len(sfs) == 0:
+                continue
+            label = f'>{lo_n - 1}' if hi_n is None else f'{lo_n}-{hi_n}'
+            row = {'train_size': label, 'n_superfamilies': len(sfs),
+                   'n_queries': int(n_q.reindex(sfs).sum())}
+            for key in ('rcpatk_superfamily', 'map_superfamily', 'map_family'):
+                for name in methods:
+                    row[f'{name}_{key}'] = by_sf.loc[name].reindex(sfs)[key].mean()
+            size_rows.append(row)
+            print(f'  train {label:>7}: {len(sfs):3d} superfamilies, {row["n_queries"]:4d} queries | '
+                  'remote capped P@K ' + ', '.join(
+                      f'{n} {row[f"{n}_rcpatk_superfamily"]:.3f}' for n in methods))
+        pd.DataFrame(size_rows).to_csv(os.path.join(run_dir, f'{prefix}per_train_size_metrics.tsv'),
+                                       sep='\t', index=False)
+        written[f'{prefix}per_train_size_metrics.tsv'] = ('macro metrics binned by superfamily '
+                                                          'training size')
+    return written
+
+
+def report_by_query_type(methods, query_info, query_types, top_k, run_dir, n_boot=None, seed=0,
+                         train_counts=None):
+    """Pooled and per-superfamily results for each query type in one shared corpus.
+
+    query_types: {query_id: 'novel_family' | 'novel_superfamily' | 'novel_fold'}.
+    Training-size breakdowns apply only to novel_family, the type with training
+    proteins in its superfamily. Returns {file name: description}.
+    """
+    missing = [q for q in query_info if q not in query_types]
+    if missing:
+        print(f'WARNING: {len(missing)} evaluated queries have no entry in --query_types and '
+              f'are left out of the per-type results, e.g. {missing[:3]}.')
+    written = {}
+    rows = []
+    order = ['novel_family', 'novel_superfamily', 'novel_fold']
+    present = set(query_types.values())
+    for qtype in order + sorted(present - set(order)):
+        ids = {q for q, t in query_types.items() if t == qtype and q in query_info}
+        if not ids:
+            continue
+        subset = OrderedDict()
+        for name, m in methods.items():
+            kept = {q: v for q, v in m['per_query'].items() if q in ids}
+            if kept:
+                subset[name] = {'per_query': kept}
+        print('\n' + '#' * 78)
+        print(f'QUERY TYPE: {qtype} ({len(ids)} queries, searched against the full corpus)')
+        print('#' * 78)
+        if 'Proteogram' not in subset:
+            print('No Proteogram results for this query type.')
+            continue
+        prot = subset['Proteogram']['per_query']
+        for key, title in SUPERFAMILY_REPORT_METRICS:
+            shared = sorted(prot)
+            values = np.array([prot[q][key] for q in shared], dtype=float)
+            n = int((~np.isnan(values)).sum())
+            if n == 0:
+                continue
+            means = ' | '.join(
+                f'{name} {nanmean_or_nan([v["per_query"][q][key] for q in v["per_query"]]):.3f}'
+                for name, v in subset.items())
+            print(f'{title} (pooled, n={n}): {means}')
+            for name, v in subset.items():
+                if name == 'Proteogram':
+                    continue
+                common = sorted(set(prot) & set(v['per_query']))
+                a = np.array([prot[q][key] for q in common], dtype=float)
+                b = np.array([v['per_query'][q][key] for q in common], dtype=float)
+                ok = ~(np.isnan(a) | np.isnan(b))
+                a, b = a[ok], b[ok]
+                if len(a) == 0:
+                    continue
+                if key.startswith(('p1_', 'rp1_')):
+                    p, _, _ = mcnemar_pvalue(a, b)
+                else:
+                    p = wilcoxon_pvalue(a, b)
+                rows.append({'query_type': qtype, 'metric': key, 'method': name,
+                             'n_queries': int(len(a)), 'proteogram': float(a.mean()),
+                             'method_value': float(b.mean()), 'delta': float((a - b).mean()),
+                             'p_value': np.nan if p is None else p, 'sig': _sig_stars(p)})
+                print(f'  vs {name:<9} {float((a - b).mean()):+.3f} {_sig_stars(p):>3}')
+        written.update(report_per_superfamily(
+            subset, query_info, top_k, run_dir, n_boot=n_boot, seed=seed,
+            train_counts=train_counts if qtype == 'novel_family' else None,
+            prefix=f'{qtype}_', heading=f'{qtype}: PER-SUPERFAMILY (MACRO) RESULTS'))
+    pd.DataFrame(rows).to_csv(os.path.join(run_dir, 'query_type_summary.tsv'), sep='\t',
+                              index=False)
+    written['query_type_summary.tsv'] = ('pooled metrics and paired tests (McNemar for P@1, '
+                                         'Wilcoxon otherwise) for each query type and method')
+    return written
+
+
 class Tee:
     """Write to several streams at once (console + report.txt)."""
     def __init__(self, *streams):
@@ -822,6 +1032,13 @@ if __name__ == '__main__':
                              'Default: the shallowest method\'s list depth, so every method is '
                              'scored over the same depth. Lower it to compare at a fixed '
                              'depth; it is never raised above the shallowest list.')
+    parser.add_argument('--train_list', default=None,
+                        help='Training list for the model being evaluated. Adds a breakdown of '
+                             'per-superfamily results by number of training proteins.')
+    parser.add_argument('--query_types', default=None,
+                        help='query_types TSV from create_heldout_family_list.py --ood_level. '
+                             'Reports each query type (novel family, novel superfamily or fold) '
+                             'separately. Set scope_eval_set to the matching eval_corpus list.')
     args = parser.parse_args()
 
     # Files and folders
@@ -1096,8 +1313,34 @@ if __name__ == '__main__':
         bootstrap_rows = report_bootstrap(proteogram_per_query, method_per_query, top_k,
                                           n_boot=args.n_boot, seed=args.boot_seed)
 
+    train_counts = None
+    if args.train_list:
+        train_counts = {}
+        n_unknown = 0
+        with open(args.train_list) as f:
+            for line in f:
+                sid = line.strip()
+                if not sid:
+                    continue
+                try:
+                    sfam = '.'.join(scop.getDomainBySid(sid).sccs.split('.')[:3])
+                    train_counts[sfam] = train_counts.get(sfam, 0) + 1
+                except Exception:
+                    n_unknown += 1
+        if n_unknown:
+            print(f'WARNING: {n_unknown} --train_list ID(s) not found in SCOPe.')
+
     written = write_run_files(run_dir, methods, query_info, triage_rows, bootstrap_rows,
                               scope_level)
+    written.update(report_per_superfamily(methods, query_info, top_k, run_dir,
+                                          n_boot=args.n_boot if args.bootstrap else None,
+                                          seed=args.boot_seed, train_counts=train_counts))
+    if args.query_types:
+        qt = pd.read_csv(args.query_types, sep='\t')
+        written.update(report_by_query_type(
+            methods, query_info, dict(zip(qt['SCOPeID'], qt['query_type'])), top_k, run_dir,
+            n_boot=args.n_boot if args.bootstrap else None, seed=args.boot_seed,
+            train_counts=train_counts))
 
     finished = datetime.datetime.now()
     run_info = {
@@ -1113,6 +1356,8 @@ if __name__ == '__main__':
         'remote_short_lists': {name: m.get('remote_short') for name, m in methods.items()},
         'inputs': {'config': os.path.abspath('config.yml'),
                    'scope_eval_set': scope_eval_set,
+                   'train_list': args.train_list,
+                   'query_types': args.query_types,
                    'proteogram_sim_results': proteogram_sim_results,
                    'gtalign_results_dir': gtalign_results_dir,
                    'usalign_results': usalign_results,
