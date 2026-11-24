@@ -1,40 +1,124 @@
 """
-This script trains a CNN on the Proteogram dataset, with options for architecture (from-scratch ConvNet, pretrained ResNet18, or pretrained ViT-B/16), hyperparameters (epochs, batch size, learning rate), and logging.  It includes early stopping based on validation loss, and saves the best model weights to disk.  The training and validation loss curves are plotted and saved to a file.  After training, the model is evaluated on a held-out test set, with per-class accuracies and a classification report printed to the console.
+Train a model on SCOPe proteograms whose features are used for structure search.
 
-Requires a GPU for reasonable training time, especially for ResNet18 and ViT-B/16.  For reproducibility, a random seed controls the train/val/test split and all stochastic operations.
+The network is a pretrained ResNet18 (recommended), a from-scratch ConvNet, or a
+pretrained ViT-B/16. It is trained either to classify one SCOPe --level with
+cross-entropy (optionally with auxiliary heads for coarser levels), or directly as a
+retrieval embedding with a hierarchy-aware triplet loss. For CE models, search uses
+the 512-d pooled feature before the classification head (see
+proteogram/v2/image_similarity.py), compared by cosine similarity.
 
-Data location and other parameters can be configured via command-line arguments or a config.yml file.  Command-line arguments take precedence over config.yml. The Proteogram dataset should be prepared in advance using the create_v2_proteograms.py script. The root directory ("training_data_dir" in config.yml) should contain all proteogram images in a flat layout (no train/eval subdirectories). A random seed (--seed) is used to reproducibly split images into train, validation, and held-out test sets. An annotation TSV file is also required, which should be specified via the --tsv_file argument or included in config.yml as "tsv_file".  The model weights will be saved to the path specified by "cnn_model_file_prefix" in config.yml, with a suffix indicating the architecture and hyperparameters.
+Requires a GPU for reasonable training time. --seed controls the split (when not
+given by lists) and all stochastic operations. Command-line arguments take
+precedence over config.yml (training_data_dir, num_epochs, learning_rate,
+batch_size, model_file_prefix). Proteograms come from create_v2_proteograms.py, in
+a flat directory (--data_dir); labels come from the annotation TSV (--tsv_file).
+SCOPe: https://scop.berkeley.edu
 
-Note on --model vit: ViT-B/16 uses fixed, learned positional embeddings sized for a 224x224 input split into 16x16 patches, unlike the CNN/ResNet18 paths which can train on padded, variable-size proteograms. Selecting --model vit therefore always forces --resize (never pad) and a 224x224 input grid (overriding --input_size), regardless of what was passed on the command line. --max_image_size is not changed: it still sets which proteins are included, and every included proteogram is resized to 224x224.
+Recommended workflow (leakage-screened, held-out families)
+----------------------------------------------------------
+1. Build the split with scripts/utilities/create_heldout_family_list.py
+   --clean_split [--ood_level superfamily]. It writes whole-family val and test
+   lists, train lists per minimum training count (..._min_train<N>.lst), and, with
+   --ood_level, a novel-superfamily list and a combined evaluation corpus. No
+   protein pair with BLAST E <= 1e-3 crosses the split.
+2. Train with all three lists: --train_list, --val_list and --test_list (the
+   novel-family test list, not the evaluation corpus: every val/test label must
+   have training proteins). Only listed proteins are loaded, the lists define the
+   label set, --min_class_size is ignored, and file names carry min_train<N>.
+3. Choose settings on validation only (scripts/v2/tune_min_train20.sh runs a grid
+   and ranks it), then evaluate the chosen model once on the test corpus with
+   evaluate_methods_v2.py.
 
-Here is more information about the SCOPe dataset: https://scop.berkeley.edu
+Without --train_list the script splits the eligible proteograms itself: a
+stratified random split by --test_size/--val_size, or the remainder after a fixed
+--test_list and/or --val_list. Listed proteins removed by the current filters
+(--max_image_size, --min_class_size, ...) are reported and dropped, so keep the
+filters of the run that wrote a list to reproduce it exactly.
 
-Note on --loss: three loss functions are available. 'ce' (default) is cross-entropy
-with label smoothing, trained against a single --level (class/fold/superfamily/family).
-'focal' is focal loss (--focal_gamma controls the focusing strength; gamma=0 reduces to
-plain cross-entropy), useful when classes at the chosen --level are imbalanced or
-dominated by easy examples. 'triplet_hierarchy' abandons single-level classification
-entirely and trains a --model resnet18 embedding model with HierarchicalTripletLoss, a
-batch-hard triplet loss whose margins (--triplet_margins) scale with SCOPe hierarchy
-distance (same family/superfamily/fold/class/different class); batches are built by
-HierarchicalPKSampler using P-K sampling (--triplet_p, --triplet_k) so the model learns
-an embedding space for retrieval across the whole hierarchy at once rather than a
-classifier for one level. See proteogram/v2/losses.py for the loss implementations.
+Losses (--loss)
+---------------
+ce (default)       cross-entropy at --level, with --label_smoothing (default 0.1;
+                   smoothing can raise accuracy but make features worse for
+                   retrieval, so 0 is worth trying).
+focal              focal loss (--focal_gamma; 0 reduces to CE), same smoothing.
+triplet_hierarchy  ResNet18 embedding trained with HierarchicalTripletLoss, whose
+                   margins (--triplet_margins) grow with SCOPe hierarchy distance;
+                   batches come from HierarchicalPKSampler (--triplet_p families x
+                   --triplet_k proteins). Early stopping uses val P@K at
+                   --triplet_early_stop_level. See proteogram/v2/losses.py.
 
-Note on reproducibility and the use of --test_list (to skip the random split and repeat using the same test set from a previous run): because the test set is applied on top of the current eligibility filters, if you change min_family_size/max_image_size/min_class_size between runs, some listed proteins may get filtered out (you'll see the WARNING with the count) — so keep those filters consistent with the run that generated the list if you want the test set identical.
+Auxiliary heads (--aux_heads, ResNet18 with ce/focal)
+-----------------------------------------------------
+'--aux_heads fold,class' adds fold and class heads on the same pooled feature as
+the main head; the loss is main CE + --aux_weights x each auxiliary CE (default
+0.5, 0.25; a weight of 0 is allowed). Superfamily-only CE gives no reward for
+keeping superfamilies of one fold together, which hurts remote fold retrieval; the
+fold head adds that pull. Test accuracy is printed per head. Only the backbone and
+main head are saved, so search loads the checkpoint like any other.
 
-Note on --train_list (fully explicit split): with --test_list and --val_list, --train_list makes all three splits exact, e.g. the leakage-screened lists from scripts/utilities/create_heldout_family_list.py --clean_split. Only proteins in the three lists are loaded, the lists define the label set (--min_class_size is ignored), and model files are tagged min_train<N> with the smallest per-label training count.
+Early stopping and validation retrieval (ce/focal)
+--------------------------------------------------
+With --patience, training stops after that many epochs without improvement and
+restores the best epoch; the LR halves after 5 flat epochs (ReduceLROnPlateau) on
+the same metric. --early_stop_metric chooses it:
+  val_loss            the training loss on the val set (default).
+  remote_superfamily  retrieval: remote capped Precision@K at superfamily level
+                      (K = --early_stop_k, default 10) on the val set searched
+                      against itself, with each query's own family removed, averaged
+                      per superfamily. It matches evaluate_methods_v2.py's
+                      rcpatk_superfamily on the same corpus (see
+                      val_remote_superfamily). Needs ResNet18 and val superfamilies
+                      with more than one family, as held-out-family val lists have.
+For ResNet18 CE/focal runs, validation retrieval is logged every epoch whichever
+metric stops training, and a final 'VAL_SUMMARY epoch=... val_loss=...
+val_retrieval=... val_retrieval_pooled=...' line reports the kept epoch for batch
+summaries. Selecting the epoch on validation retrieval makes that score optimistic:
+use it to compare settings, not as a result.
 
-Note on --val_list (fixed validation set) and held-out-family evaluation: scripts/utilities/create_heldout_family_list.py writes a test list and a val list of whole families held out from training (when training at --level superfamily), so the test set measures generalization to unseen families and early stopping selects for it too. Pass them as --test_list and --val_list with the same filters. With --loss triplet_hierarchy, note that the per-epoch val P@K searches the val set itself, so superfamily-level hits there come only from other held-out families of the same superfamily, not from training families.
+Other training choices
+----------------------
+- ResNet18 is fully trainable (earlier models froze layer1); the backbone learns at
+  0.1x the head LR when pretrained. ViT trains only its last --vit_unfrozen_blocks.
+- Training augmentation is off (color and sharpness changes have no clear physical
+  meaning for proteograms); the transforms are commented out in __main__.
+- --sampling natural (default) shuffles the training set; 'balanced' oversamples so
+  every --level label is drawn equally often.
+- --model vit forces --resize and a 224x224 grid (fixed positional embeddings);
+  --max_image_size still sets which proteins are included.
+- --input_size sets the grid the network sees (default --max_image_size). Pad mode
+  (default) keeps one pixel per residue pair and needs --input_size >=
+  --max_image_size; --resize scales every proteogram to the grid.
 
-Note on --aux_heads (multi-level cross-entropy): with --model resnet18 and --loss ce/focal, '--aux_heads fold,class' adds fold and class classification heads that read the same pooled feature as the main --level head. The loss is the main CE plus --aux_weights times each auxiliary CE (default 0.5, 0.25). Superfamily-only CE gets no reward for keeping superfamilies of the same fold close, so remote fold retrieval suffers; the fold head adds that pull while superfamily stays the main objective. Test accuracy is printed for every head. Only the backbone and main head are saved, in the usual checkpoint format, so search and evaluation need no changes.
+Outputs (written next to --data_dir, i.e. in its parent directory)
+-----------------------------------------------------------------
+- <model_file_prefix>_<settings>.pt: {'state_dict', 'meta'}. The meta records the
+  grid (input_size, max_image_size, resize) so search preprocesses queries the same
+  way, plus training settings for provenance: label_smoothing, sampling,
+  augmentation, frozen_layers, early_stop_metric, early_stop_k, val_summary and,
+  with --aux_heads, the aux weights and per-head test accuracy. The file name lists
+  the model, lr, batch size, kept epoch, seed, sizes, min_train<N> or
+  min_class_size<N>, level and loss, then _aux-..., and only for non-default
+  values _ls<x>, _es-rsf<K> and _balanced, then _acc<test accuracy>.
+- loss_curves<settings>.png and, for classifiers, sample_preds<settings>.png.
+- test_list_for_model_<settings>.lst (default; --no-save_test_list to skip) and,
+  with --save_train_list, the train list.
+Test accuracy and the per-class report are printed at the end. When the test list
+is a final held-out set, do not choose settings by it.
 
-Note on training choices for --loss ce/focal: the ResNet18 backbone is fully trainable (no frozen layers) and training augmentation is off. --label_smoothing sets the CE/focal smoothing (default 0.1). --sampling chooses natural shuffling (default) or label-balanced oversampling. --early_stop_metric remote_superfamily selects the best epoch, and drives the LR schedule, by remote superfamily retrieval on the val set (see val_remote_superfamily) instead of val loss; use it with --patience. Non-default values add _ls<x>, _es-rsf<K> and _balanced to the model file name, and the checkpoint meta records all of them.
-
- Usage example:
+Usage examples (run from scripts/v2):
+    # Recommended: explicit leakage-screened split, multi-head CE, retrieval early stopping
+    python train_multiple_models_randomized_eval.py --model resnet18 --loss ce --level superfamily \\
+        --train_list <split>_min_train20.lst --val_list <val list> --test_list <test list> \\
+        --aux_heads fold,class --aux_weights 1.0,0.25 --label_smoothing 0 \\
+        --early_stop_metric remote_superfamily --patience 10 --epochs 200 \\
+        --batch_size 8 --lr 3e-4 --max_image_size 500 --input_size 500 --resize \\
+        --data_dir <proteograms_v2 dir> --tsv_file <annotation TSV>
+    # Random stratified split
     python train_multiple_models_randomized_eval.py --model resnet18 --epochs 50 --batch_size 32 --lr 1e-4 --seed 42
-    python train_multiple_models_randomized_eval.py --model resnet18 --level superfamily --aux_heads fold,class --aux_weights 0.5,0.25 --epochs 50 --seed 0
-    python train_multiple_models_randomized_eval.py --model vit --epochs 50 --batch_size 16 --lr 1e-4 --seed 42
+    # Hierarchy-aware triplet embedding
+    python train_multiple_models_randomized_eval.py --model resnet18 --loss triplet_hierarchy --level family \\
+        --triplet_stratify --epochs 100 --patience 15 --lr 1e-3
 """
 import copy
 from sched import scheduler
