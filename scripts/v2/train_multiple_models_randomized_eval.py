@@ -29,6 +29,8 @@ Note on --val_list (fixed validation set) and held-out-family evaluation: script
 
 Note on --aux_heads (multi-level cross-entropy): with --model resnet18 and --loss ce/focal, '--aux_heads fold,class' adds fold and class classification heads that read the same pooled feature as the main --level head. The loss is the main CE plus --aux_weights times each auxiliary CE (default 0.5, 0.25). Superfamily-only CE gets no reward for keeping superfamilies of the same fold close, so remote fold retrieval suffers; the fold head adds that pull while superfamily stays the main objective. Test accuracy is printed for every head. Only the backbone and main head are saved, in the usual checkpoint format, so search and evaluation need no changes.
 
+Note on training choices for --loss ce/focal: the ResNet18 backbone is fully trainable (no frozen layers) and training augmentation is off. --label_smoothing sets the CE/focal smoothing (default 0.1). --sampling chooses natural shuffling (default) or label-balanced oversampling. --early_stop_metric remote_superfamily selects the best epoch, and drives the LR schedule, by remote superfamily retrieval on the val set (see val_remote_superfamily) instead of val loss; use it with --patience. Non-default values add _ls<x>, _es-rsf<K> and _balanced to the model file name, and the checkpoint meta records all of them.
+
  Usage example:
     python train_multiple_models_randomized_eval.py --model resnet18 --epochs 50 --batch_size 32 --lr 1e-4 --seed 42
     python train_multiple_models_randomized_eval.py --model resnet18 --level superfamily --aux_heads fold,class --aux_weights 0.5,0.25 --epochs 50 --seed 0
@@ -397,13 +399,14 @@ def build_vit(num_classes, num_unfrozen_blocks=2):
     return model
 
 
-def build_resnet18(num_classes, pretrained=True, freeze_layers=('layer1',)):
+def build_resnet18(num_classes, pretrained=True, freeze_layers=()):
     """ResNet18 with the classification head replaced.
 
-    pretrained=True (default): ImageNet-initialised, with only the first residual
-    block (layer1) frozen — proteograms encode distance-matrix geometry that looks
-    nothing like ImageNet, so the backbone needs freedom to adapt. Regularisation
-    comes from AdamW weight decay rather than aggressive freezing.
+    pretrained=True (default): ImageNet-initialised with every layer trainable
+    (freeze_layers=() by default; earlier models froze layer1). Proteograms encode
+    distance-matrix geometry that looks nothing like ImageNet, so even the first
+    filters may need to adapt. The backbone still trains at 0.1x the head LR, and
+    regularisation comes from AdamW weight decay rather than freezing.
     pretrained=False: random init (weights=None) with NO freezing — freezing
     random weights makes no sense; the whole network must train. Used as the
     from-scratch control that isolates the proteogram signal from ImageNet
@@ -460,7 +463,7 @@ class MultiHeadResNet18(nn.Module):
         return out
 
 
-def build_resnet18_embedding(embed_dim, pretrained=True, freeze_layers=('layer1',)):
+def build_resnet18_embedding(embed_dim, pretrained=True, freeze_layers=()):
     """ResNet18 with the classification head replaced by an embedding projection,
     for hierarchy-aware triplet training (see
     proteogram.v2.losses.HierarchicalTripletLoss). Same pretrained/freezing
@@ -515,6 +518,60 @@ def compute_val_patk(model, val_loader, device, k=5):
         matches = (neighbor_vals == query_vals).float().mean(dim=1)
         results[level] = matches.mean().item()
     return results
+
+
+def resnet18_features(model, x):
+    """The 512-d pooled feature search uses as the embedding (Img2Vec strips the
+    classification head), for a plain ResNet18 or a MultiHeadResNet18."""
+    if isinstance(model, MultiHeadResNet18):
+        return model.features(x)
+    x = model.maxpool(model.relu(model.bn1(model.conv1(x))))
+    x = model.layer4(model.layer3(model.layer2(model.layer1(x))))
+    return torch.flatten(model.avgpool(x), 1)
+
+
+def val_remote_superfamily(model, val_loader, superfamilies, families, device, k=10):
+    """Remote capped Precision@K at superfamily level on the validation set,
+    searched against itself, as in evaluate_methods_v2.py: each query's own
+    family (itself included) is removed from the ranking, and its score is
+    tp / min(R_remote, K), where R_remote = val proteins in the query's
+    superfamily but another family. Queries with R_remote = 0 are skipped.
+    Similarity is cosine on the pooled feature, as in search.
+
+    `superfamilies` and `families` are label lists in val_loader order (it
+    must not shuffle). Returns (macro, pooled, n_queries): macro averages
+    within each superfamily first, so every superfamily counts equally.
+    """
+    model.eval()
+    embeddings = []
+    with torch.no_grad():
+        for data, _ in val_loader:
+            embeddings.append(F.normalize(resnet18_features(model, data.to(device)), dim=1).cpu())
+    emb = torch.cat(embeddings)
+    sf_codes = {s: i for i, s in enumerate(sorted(set(superfamilies)))}
+    fam_codes = {f: i for i, f in enumerate(sorted(set(families)))}
+    sf = torch.tensor([sf_codes[s] for s in superfamilies])
+    fam = torch.tensor([fam_codes[f] for f in families])
+    if emb.size(0) != len(sf):
+        raise RuntimeError(f'Validation retrieval got {emb.size(0)} embeddings for '
+                           f'{len(sf)} labels.')
+
+    same_sf = sf[:, None] == sf[None, :]
+    same_fam = fam[:, None] == fam[None, :]
+    r_remote = (same_sf & ~same_fam).sum(dim=1)
+    sim = (emb @ emb.T).masked_fill(same_fam, float('-inf'))
+    kk = min(k, sim.size(1))
+    top_sim, top_idx = sim.topk(kk, dim=1)
+    # Masked (own-family) entries can fill the top K when few candidates
+    # remain; they are not remote hits, so drop them.
+    tp = ((sf[top_idx] == sf[:, None]) & torch.isfinite(top_sim)).sum(dim=1)
+    keep = r_remote > 0
+    if not keep.any():
+        raise RuntimeError('No validation protein has a same-superfamily protein from another '
+                           'family, so remote superfamily retrieval cannot be scored.')
+    scores = tp[keep].double() / torch.clamp(r_remote[keep], max=k).double()
+    per_sf = pd.Series(scores.numpy()).groupby(sf[keep].numpy()).mean()
+    return float(per_sf.mean()), float(scores.mean()), int(keep.sum())
 
 
 def plot_triplet_curves(training_loss, val_patk_history, fig_path, level='family'):
@@ -652,25 +709,38 @@ def train_model_triplet(model, train_loader, val_loader, optimizer, criterion, e
 
 
 def train_model(model, train_loader, val_loader, optimizer, epochs,
-                patience=None, device=torch.device('cpu')):
-    """Train the ConvNet, tracking train and val loss each epoch.
+                patience=None, device=torch.device('cpu'), retrieval_fn=None,
+                retrieval_name='val retrieval', stop_on_retrieval=False):
+    """Train a classifier, tracking train and val loss each epoch.
 
-    If `patience` is set, applies early stopping: training halts when val loss
-    has not improved for that many consecutive epochs, and the best weights are
-    restored. If `patience` is None, all epochs run and no weight restoration
-    is performed.
+    When `retrieval_fn` is given, its val retrieval score (higher is better;
+    see val_remote_superfamily) is also computed and logged every epoch. The
+    early-stopping metric is val loss, or that score when `stop_on_retrieval`
+    is set; the LR schedule follows the same metric. If `patience` is set,
+    training halts when the metric has not improved for that many consecutive
+    epochs, and the best weights are restored. If `patience` is None, all
+    epochs run and no weight restoration is performed.
+
+    Returns (model, training_loss, val_loss_history, epochs_trained, summary),
+    where summary holds the kept epoch's val loss and retrieval scores.
     """
     model.to(device)
     training_loss = []
     val_loss_history = []
+    summary = {}
 
-    best_val_loss = float('inf')
+    if stop_on_retrieval and retrieval_fn is None:
+        raise ValueError('stop_on_retrieval needs a retrieval_fn.')
+    use_retrieval = stop_on_retrieval
+    metric_name = retrieval_name if use_retrieval else 'val loss'
+    best_score =-float('inf') if use_retrieval else float('inf')
     best_weights = None
     best_epoch = -1
     epochs_no_improve = 0
 
     # LR scheduler uses its own patience (independent of early stopping patience)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=5, factor=0.5, mode='max' if use_retrieval else 'min')
 
     loaders = {'train': train_loader, 'val': val_loader}
 
@@ -692,23 +762,38 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
                     running_loss += loss.item()
                     n_batches += 1
             epoch_losses[phase] = running_loss / n_batches
-        lr_before = optimizer.param_groups[0]['lr']
-        scheduler.step(epoch_losses['val'])
-        lr_after = optimizer.param_groups[0]['lr']
 
+        retrieval_str = ''
+        epoch_stats = {'epoch': epoch + 1, 'val_loss': epoch_losses['val']}
+        if retrieval_fn is not None:
+            r_macro, r_pooled, n_scored = retrieval_fn(model)
+            retrieval_str = f'  {retrieval_name}: {r_macro:.4f} (pooled {r_pooled:.4f}, n={n_scored})'
+            epoch_stats.update(val_retrieval=r_macro, val_retrieval_pooled=r_pooled)
+        if use_retrieval:
+            score = r_macro
+            improved = score > best_score
+        else:
+            score = epoch_losses['val']
+            improved = score < best_score
+
+        lr_before = optimizer.param_groups[0]['lr']
+        scheduler.step(score)
+        lr_after = optimizer.param_groups[0]['lr']
 
         training_loss.append(epoch_losses['train'])
         val_loss_history.append(epoch_losses['val'])
 
-        improved = epoch_losses['val'] < best_val_loss
         if improved:
-            best_val_loss = epoch_losses['val']
+            best_score = score
             if patience is not None:
                 best_weights = copy.deepcopy(model.state_dict())
                 best_epoch = epoch
+                summary = epoch_stats
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
+        if patience is None:
+            summary = epoch_stats  # no restoration: the last epoch is kept
 
         suffix = ''
         if patience is not None:
@@ -716,16 +801,16 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
         if lr_after < lr_before:
             suffix += f' | LR reduced: {lr_before:.2e} → {lr_after:.2e}'
         print(f'Epoch {epoch:>4d}: train loss: {epoch_losses["train"]:.6f}  '
-              f'val loss: {epoch_losses["val"]:.6f}' + suffix)
+              f'val loss: {epoch_losses["val"]:.6f}' + retrieval_str + suffix)
 
         if patience is not None and epochs_no_improve >= patience:
-            print(f'Early stopping at epoch {epoch} — no val loss improvement for {patience} epochs.')
+            print(f'Early stopping at epoch {epoch} — no {metric_name} improvement for {patience} epochs.')
             break
 
     if patience is not None and best_weights is not None:
-        print(f'Restoring best weights (val loss: {best_val_loss:.6f})')
+        print(f'Restoring best weights ({metric_name}: {best_score:.6f})')
         model.load_state_dict(best_weights)
-    return model, training_loss, val_loss_history, best_epoch + 1
+    return model, training_loss, val_loss_history, best_epoch + 1, summary
 
 def write_prefix_list(indices, full_dataset, path, label):
     """Write the file-name prefixes (SCOPeIDs) for the given dataset indices,
@@ -1036,7 +1121,38 @@ if __name__ == '__main__':
                         type=int,
                         default=None,
                         help="Early stopping patience: stop after this many epochs "
-                             "with no improvement in val loss. Omit to disable early stopping.")
+                             "with no improvement in the --early_stop_metric (val loss by "
+                             "default) and restore the best weights. Omit to disable early "
+                             "stopping.")
+    parser.add_argument('--early_stop_metric',
+                        choices=['val_loss', 'remote_superfamily'],
+                        default='val_loss',
+                        help="For --loss ce/focal: what selects the best epoch and drives the "
+                             "LR schedule. 'val_loss' (default) is the classification loss. "
+                             "'remote_superfamily' is retrieval: remote capped Precision@K at "
+                             "superfamily level on the validation set searched against itself "
+                             "(own family removed; K = --early_stop_k), averaged per superfamily "
+                             "as in evaluate_methods_v2.py, using the pooled feature and cosine "
+                             "similarity that search uses. Needs --model resnet18 and val "
+                             "superfamilies with more than one family, e.g. the held-out-family "
+                             "val list.")
+    parser.add_argument('--early_stop_k',
+                        type=int,
+                        default=10,
+                        help="K for --early_stop_metric remote_superfamily. Default: 10.")
+    parser.add_argument('--label_smoothing',
+                        type=float,
+                        default=0.1,
+                        help="Label smoothing for --loss ce/focal (main and auxiliary heads). "
+                             "Smoothing tends to raise accuracy but can make the features worse "
+                             "for retrieval; 0 turns it off. Default: 0.1.")
+    parser.add_argument('--sampling',
+                        choices=['natural', 'balanced'],
+                        default='natural',
+                        help="How training batches are drawn for --loss ce/focal. 'natural' "
+                             "(default) shuffles the training set, so large labels are seen "
+                             "more often. 'balanced' oversamples with replacement so every "
+                             "--level label is drawn equally often.")
     parser.add_argument('--seed',
                         type=int,
                         default=0,
@@ -1292,6 +1408,20 @@ if __name__ == '__main__':
     elif args.aux_weights:
         raise ValueError('--aux_weights needs --aux_heads.')
 
+    if args.early_stop_metric != 'val_loss':
+        if args.loss == 'triplet_hierarchy':
+            raise ValueError('--early_stop_metric is for --loss ce/focal; triplet_hierarchy '
+                             'already stops on retrieval (--triplet_early_stop_level).')
+        if args.model != 'resnet18':
+            raise ValueError('--early_stop_metric remote_superfamily needs --model resnet18.')
+        if args.early_stop_k < 1:
+            raise ValueError('--early_stop_k must be at least 1.')
+        if args.patience is None:
+            print('NOTE: without --patience, all epochs run and the last epoch is kept; '
+                  '--early_stop_metric then only drives the LR schedule.')
+    if not 0.0 <= args.label_smoothing < 1.0:
+        raise ValueError('--label_smoothing must be in [0, 1).')
+
     if args.epochs:
         epochs = args.epochs
     elif 'num_epochs' in config:
@@ -1357,9 +1487,11 @@ if __name__ == '__main__':
     # so the pretrained feature detectors remain valid. The ConvNet was not pretrained, so it doesn't strictly require ImageNet normalisation, but applying the same normalisation to both models allows for a more controlled comparison.
     _imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                           std=[0.229, 0.224, 0.225])
+    # Augmentation is off: color and sharpness changes have no clear physical
+    # meaning for proteograms. Uncomment to restore it for older-run comparisons.
     _augment = [
-        transforms.RandomApply([transforms.ColorJitter(brightness=0.1, contrast=0.1)], p=0.1),
-        transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2)], p=0.1),
+        # transforms.RandomApply([transforms.ColorJitter(brightness=0.1, contrast=0.1)], p=0.1),
+        # transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2)], p=0.1),
     ]
 
     if args.model == 'resnet18':
@@ -1537,15 +1669,47 @@ if __name__ == '__main__':
     val_split   = TransformedSubset(Subset(full_dataset, val_indices),   transform_eval)
     test_split  = TransformedSubset(Subset(full_dataset, test_indices),  transform_eval)
 
-    # WeightedRandomSampler: oversample minority classes so each epoch sees
-    # a balanced class distribution regardless of raw class frequencies.
-    train_labels = [full_dataset.labels[i] for i in train_indices]
-    label_counts = torch.bincount(torch.tensor(train_labels))
-    class_weights = torch.where(
-        label_counts > 0, 1.0 / label_counts.float(), torch.zeros_like(label_counts.float()))
-    sample_weights = [class_weights[lbl].item() for lbl in train_labels]
-    sampler = torch.utils.data.WeightedRandomSampler(
-        weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    # --sampling balanced: WeightedRandomSampler oversamples small labels so each
+    # epoch sees a balanced label distribution. 'natural' just shuffles.
+    sampler = None
+    if args.sampling == 'balanced' and args.loss != 'triplet_hierarchy':
+        train_labels = [full_dataset.labels[i] for i in train_indices]
+        label_counts = torch.bincount(torch.tensor(train_labels))
+        class_weights = torch.where(
+            label_counts > 0, 1.0 / label_counts.float(), torch.zeros_like(label_counts.float()))
+        sample_weights = [class_weights[lbl].item() for lbl in train_labels]
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(sample_weights), replacement=True,
+            generator=g)
+    print(f'Training sampling: {args.sampling}' if args.loss != 'triplet_hierarchy'
+          else 'Training sampling: HierarchicalPKSampler (--sampling ignored)')
+
+    # Val retrieval (remote superfamily capped P@K) is logged every epoch for
+    # ResNet18 CE/focal runs whenever the val set can score it, and is the
+    # early-stopping metric with --early_stop_metric remote_superfamily. It
+    # needs each val protein's superfamily and family in val_loader order.
+    track_retrieval = False
+    if args.model == 'resnet18' and args.loss != 'triplet_hierarchy':
+        annot = full_dataset.annot_frame.drop_duplicates('SCOPeID').set_index('SCOPeID')
+        val_ids = [os.path.splitext(os.path.basename(full_dataset.files[i]))[0]
+                   for i in val_indices]
+        val_sf = annot.loc[val_ids, 'SCOPeSuperfamily'].astype(str).tolist()
+        val_fam = annot.loc[val_ids, 'SCOPeFamily'].astype(str).tolist()
+        fams_per_sf = {}
+        for s, f in zip(val_sf, val_fam):
+            fams_per_sf.setdefault(s, set()).add(f)
+        n_sf_scorable = sum(len(fs) > 1 for fs in fams_per_sf.values())
+        track_retrieval = n_sf_scorable > 0
+        if args.early_stop_metric == 'remote_superfamily':
+            if not track_retrieval:
+                raise RuntimeError('--early_stop_metric remote_superfamily: no val superfamily '
+                                   'has more than one family, so there is nothing to score.')
+            print(f'Early stopping on remote superfamily capped P@{args.early_stop_k} over '
+                  f'{len(val_ids)} val proteins ({n_sf_scorable} superfamilies with more than '
+                  f'one family in val).')
+        elif track_retrieval:
+            print(f'Logging val remote superfamily capped P@{args.early_stop_k} each epoch '
+                  f'({n_sf_scorable} scorable superfamilies); early stopping uses val loss.')
 
     class_names = full_dataset.label_names_unique
 
@@ -1576,15 +1740,21 @@ if __name__ == '__main__':
     else:
         train_loader = DataLoader(train_split,
                                   batch_size=args.batch_size,
-                                  # Note, shuffle is mutually exclusive with sampler
-                                  shuffle=True,
-                                #   sampler=sampler,
+                                  # shuffle and sampler are mutually exclusive
+                                  shuffle=sampler is None,
+                                  sampler=sampler,
                                   worker_init_fn=seed_worker)
+    # Must not shuffle: val_remote_superfamily pairs embeddings with labels by order.
     val_loader = DataLoader(val_split,
                             batch_size=args.batch_size,
                             shuffle=False,
                             worker_init_fn=seed_worker,
                             generator=g)
+    retrieval_fn = None
+    if track_retrieval:
+        def retrieval_fn(m):
+            return val_remote_superfamily(m, val_loader, val_sf, val_fam, device,
+                                          k=args.early_stop_k)
     test_loader = DataLoader(test_split,
                              batch_size=1 if args.loss != 'triplet_hierarchy' else args.batch_size,
                              shuffle=False,
@@ -1741,11 +1911,11 @@ if __name__ == '__main__':
             print(f'ConvNet (from scratch): LR={args.lr:.2e}')
 
         if args.loss == 'focal':
-            loss_criteria = FocalLoss(gamma=args.focal_gamma, label_smoothing=0.1)
-            print(f'Loss: FocalLoss(gamma={args.focal_gamma}, label_smoothing=0.1)')
+            loss_criteria = FocalLoss(gamma=args.focal_gamma, label_smoothing=args.label_smoothing)
+            print(f'Loss: FocalLoss(gamma={args.focal_gamma}, label_smoothing={args.label_smoothing})')
         else:
-            loss_criteria = nn.CrossEntropyLoss(label_smoothing=0.1)
-            print('Loss: CrossEntropyLoss(label_smoothing=0.1)')
+            loss_criteria = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+            print(f'Loss: CrossEntropyLoss(label_smoothing={args.label_smoothing})')
         if aux_weights:
             # train_model() reads the module-level loss_criteria, so wrapping it
             # here is all the training loop needs.
@@ -1757,13 +1927,21 @@ if __name__ == '__main__':
         # its column of the (B, 4) hierarchy labels.
         main_key = level if aux_weights else None
         main_col = SCOPE_LEVELS.index(level) if aux_weights else None
-        model, training_loss, val_loss, epochs_trained = train_model(model,
+        stop_on_retrieval = args.early_stop_metric == 'remote_superfamily'
+        model, training_loss, val_loss, epochs_trained, val_summary = train_model(model,
                             train_loader=train_loader,
                             val_loader=val_loader,
                             optimizer=optimizer,
                             epochs=args.epochs,
                             patience=args.patience,
-                            device=device)
+                            device=device,
+                            retrieval_fn=retrieval_fn,
+                            retrieval_name=f'val remote sf cP@{args.early_stop_k}',
+                            stop_on_retrieval=stop_on_retrieval)
+        # One parseable line for batch summaries (e.g. scripts/v2/tune_min_train20.sh).
+        print('VAL_SUMMARY ' + ' '.join(
+            f'{k}={v:.6f}' if isinstance(v, float) else f'{k}={v}'
+            for k, v in val_summary.items()))
 
         overall_accuracy = get_accuracies(model,
                        test_loader,
@@ -1785,6 +1963,13 @@ if __name__ == '__main__':
         loss_tag = f'focal_g{args.focal_gamma}' if args.loss == 'focal' else 'ce'
         if aux_weights:
             loss_tag += '_aux-' + '-'.join(f'{lvl}{w:g}' for lvl, w in aux_weights.items())
+        # Non-default settings only, so earlier file names keep their form.
+        if args.label_smoothing != 0.1:
+            loss_tag += f'_ls{args.label_smoothing:g}'
+        if stop_on_retrieval:
+            loss_tag += f'_es-rsf{args.early_stop_k}'
+        if args.sampling != 'natural':
+            loss_tag += f'_{args.sampling}'
         model_tag = f'{args.model}_unfrozen{args.vit_unfrozen_blocks}' if args.model == 'vit' else args.model
         if args.model == 'resnet18' and not args.pretrained:
             model_tag += '_scratch'
@@ -1816,7 +2001,15 @@ if __name__ == '__main__':
                     'input_size': image_resize,
                     'max_image_size': args.max_image_size,
                     'resize': args.resize,
-                    'pretrained': args.pretrained}
+                    'pretrained': args.pretrained,
+                    # Training settings, for provenance (search ignores them).
+                    'label_smoothing': args.label_smoothing,
+                    'sampling': args.sampling,
+                    'augmentation': bool(_augment),
+                    'frozen_layers': [] if args.model == 'resnet18' else None,
+                    'early_stop_metric': args.early_stop_metric,
+                    'early_stop_k': args.early_stop_k,
+                    'val_summary': val_summary}
             if aux_weights:
                 meta.update(aux_heads=aux_weights, aux_test_accuracy=aux_test_accuracy)
             torch.save({
