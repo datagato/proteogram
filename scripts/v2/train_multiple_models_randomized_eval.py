@@ -71,9 +71,11 @@ the same metric. --early_stop_metric chooses it:
                       val_remote_superfamily). Needs ResNet18 and val superfamilies
                       with more than one family, as held-out-family val lists have.
 For ResNet18 CE/focal runs, validation retrieval is logged every epoch whichever
-metric stops training, and a final 'VAL_SUMMARY epoch=... val_loss=...
-val_retrieval=... val_retrieval_pooled=...' line reports the kept epoch for batch
-summaries. Selecting the epoch on validation retrieval makes that score optimistic:
+metric stops training. Val accuracy of the main head (val_acc), its balanced
+accuracy (val_bacc, mean per-label recall, so large superfamilies do not dominate)
+and each aux head's accuracy (val_acc_<level>) are logged every epoch too. A final
+'VAL_SUMMARY epoch=... val_loss=... val_acc=... val_bacc=... val_retrieval=...
+val_retrieval_pooled=...' line reports the kept epoch for batch summaries. Selecting the epoch on validation retrieval makes that score optimistic:
 use it to compare settings, not as a result.
 
 Other training choices
@@ -794,8 +796,16 @@ def train_model_triplet(model, train_loader, val_loader, optimizer, criterion, e
 
 def train_model(model, train_loader, val_loader, optimizer, epochs,
                 patience=None, device=torch.device('cpu'), retrieval_fn=None,
-                retrieval_name='val retrieval', stop_on_retrieval=False):
+                retrieval_name='val retrieval', stop_on_retrieval=False,
+                acc_heads=None):
     """Train a classifier, tracking train and val loss each epoch.
+
+    Val accuracy is also logged every epoch from the val-phase forward pass
+    (no extra pass). `acc_heads` lists (name, output_key, target_col) for each
+    head to score, as in select_head; the first entry is the main head, which
+    also gets a balanced accuracy (mean per-label recall over the labels present
+    in val, so large superfamilies do not dominate). Default: one single-head
+    entry. Val labels the model never trained on count as misses.
 
     When `retrieval_fn` is given, its val retrieval score (higher is better;
     see val_remote_superfamily) is also computed and logged every epoch. The
@@ -827,9 +837,14 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
         optimizer, patience=5, factor=0.5, mode='max' if use_retrieval else 'min')
 
     loaders = {'train': train_loader, 'val': val_loader}
+    if acc_heads is None:
+        acc_heads = [('val_acc', None, None)]
 
     for epoch in range(epochs):
         epoch_losses = {}
+        correct = {name: 0 for name, _, _ in acc_heads}
+        n_val = 0
+        main_pred, main_true = [], []
         for phase in ['train', 'val']:
             model.train() if phase == 'train' else model.eval()
             running_loss = 0.0
@@ -843,12 +858,34 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
                     if phase == 'train':
                         loss.backward()
                         optimizer.step()
+                    else:
+                        for i, (name, key, col) in enumerate(acc_heads):
+                            logits, labels = select_head(output, target, key, col)
+                            pred = logits.argmax(dim=1)
+                            correct[name] += int((pred == labels).sum())
+                            if i == 0:
+                                n_val += int(labels.numel())
+                                main_pred.append(pred.cpu())
+                                main_true.append(labels.cpu())
                     running_loss += loss.item()
                     n_batches += 1
             epoch_losses[phase] = running_loss / n_batches
 
+        acc_stats = {name: correct[name] / n_val for name, _, _ in acc_heads} if n_val else {}
+        if main_true:
+            yp, yt = torch.cat(main_pred), torch.cat(main_true)
+            recalls = [float((yp[yt == c] == c).float().mean()) for c in torch.unique(yt)]
+            acc_stats['val_bacc'] = sum(recalls) / len(recalls)
+        acc_str = ''
+        if acc_stats:
+            main_name = acc_heads[0][0]
+            acc_str = f'  val acc: {acc_stats[main_name]:.4f} (balanced {acc_stats["val_bacc"]:.4f}'
+            acc_str += ''.join(f', {name[len("val_acc_"):]} {acc_stats[name]:.4f}'
+                               for name, _, _ in acc_heads[1:])
+            acc_str += ')'
+
         retrieval_str = ''
-        epoch_stats = {'epoch': epoch + 1, 'val_loss': epoch_losses['val']}
+        epoch_stats = {'epoch': epoch + 1, 'val_loss': epoch_losses['val'], **acc_stats}
         if retrieval_fn is not None:
             r_macro, r_pooled, n_scored = retrieval_fn(model)
             retrieval_str = f'  {retrieval_name}: {r_macro:.4f} (pooled {r_pooled:.4f}, n={n_scored})'
@@ -885,7 +922,7 @@ def train_model(model, train_loader, val_loader, optimizer, epochs,
         if lr_after < lr_before:
             suffix += f' | LR reduced: {lr_before:.2e} → {lr_after:.2e}'
         print(f'Epoch {epoch:>4d}: train loss: {epoch_losses["train"]:.6f}  '
-              f'val loss: {epoch_losses["val"]:.6f}' + retrieval_str + suffix)
+              f'val loss: {epoch_losses["val"]:.6f}' + acc_str + retrieval_str + suffix)
 
         if patience is not None and epochs_no_improve >= patience:
             print(f'Early stopping at epoch {epoch} — no {metric_name} improvement for {patience} epochs.')
@@ -2012,6 +2049,8 @@ if __name__ == '__main__':
         main_key = level if aux_weights else None
         main_col = SCOPE_LEVELS.index(level) if aux_weights else None
         stop_on_retrieval = args.early_stop_metric == 'remote_superfamily'
+        acc_heads = [('val_acc', main_key, main_col)] + [
+            (f'val_acc_{lvl}', lvl, SCOPE_LEVELS.index(lvl)) for lvl in aux_weights]
         model, training_loss, val_loss, epochs_trained, val_summary = train_model(model,
                             train_loader=train_loader,
                             val_loader=val_loader,
@@ -2021,7 +2060,8 @@ if __name__ == '__main__':
                             device=device,
                             retrieval_fn=retrieval_fn,
                             retrieval_name=f'val remote sf cP@{args.early_stop_k}',
-                            stop_on_retrieval=stop_on_retrieval)
+                            stop_on_retrieval=stop_on_retrieval,
+                            acc_heads=acc_heads)
         # One parseable line for batch summaries (e.g. scripts/v2/tune_min_train20.sh).
         print('VAL_SUMMARY ' + ' '.join(
             f'{k}={v:.6f}' if isinstance(v, float) else f'{k}={v}'

@@ -18,12 +18,17 @@
 # but comparable with each other. Rank and select on validation only: test
 # accuracy is shown for reference, not for choosing.
 #
+# The summary also records val accuracy (main head, balanced per superfamily,
+# and each aux head) at the kept epoch, for reference; ranking stays on val
+# retrieval. Logs written before val accuracy was logged leave those blank.
+#
 # Run from anywhere; paths are relative to scripts/v2. Options (environment):
 #   RUNS="1-16"     run only these run numbers (e.g. "1-32" on one GPU and
 #                   "33-64" on another, with CUDA_VISIBLE_DEVICES set per shell)
 #   DRY_RUN=1       print the commands without running them
 #   FORCE=1         rerun runs whose log already shows a saved model
 #   SUMMARY_ONLY=1  skip training and just rebuild the table from the logs
+#   LOG_DIR=dir     where the logs are (default train_logs)
 #   TOP_N=5         how many models go on the priority list
 #   PYTHON=python   interpreter to use
 #
@@ -39,7 +44,7 @@ cd "$(dirname "$0")" || exit 1
 
 PYTHON=${PYTHON:-python}
 TOP_N=${TOP_N:-5}
-LOG_DIR=train_logs
+LOG_DIR=${LOG_DIR:-train_logs}
 LOG_PREFIX=cg_resnet_ce-loss_aux-heads_seed0--tune
 SUMMARY=$LOG_DIR/tune_min_train20_summary.tsv
 
@@ -161,6 +166,7 @@ fi
 import glob, os, re, sys
 
 log_dir, prefix, out, top_n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+NUM = r'[-+]?(?:\d+(?:\.\d*)?(?:[eE][-+]?\d+)?|nan|inf)'
 rows = []
 for path in sorted(glob.glob(os.path.join(log_dir, prefix + '-*.log'))):
     text = open(path, errors='replace').read()
@@ -177,9 +183,10 @@ for path in sorted(glob.glob(os.path.join(log_dir, prefix + '-*.log'))):
         # buffered, so a stderr warning can start on this same line (e.g.
         # "val_retrieval_pooled=0.792199/home/.../UndefinedMetricWarning ...").
         line = vs.group(1)
-        num_re = r'[-+]?(?:\d+(?:\.\d*)?(?:[eE][-+]?\d+)?|nan|inf)|None'
-        fields = dict(re.findall(r'\b(epoch|val_loss|val_retrieval_pooled|val_retrieval)='
-                                 rf'({num_re})', line))
+        num_re = NUM + '|None'
+        fields = dict(re.findall(r'\b(epoch|val_loss|val_retrieval_pooled|val_retrieval|'
+                                 r'val_bacc|val_acc(?:_\w+?)?)='
+                                 rf'({num_re})(?=\s|$|/)', line))
         r.update(fields)
         if len(fields) < 4 or re.sub(rf'\b\w+=(?:{num_re})', '', line).strip():
             print(f'Note: extra text on the VAL_SUMMARY line of {r["log"]} was ignored; '
@@ -214,15 +221,19 @@ ranked = sorted(rows, key=lambda r: (r['status'] != 'done', -num(r, 'val_retriev
 cols = [('rank', 4), ('run', 3), ('label_smoothing', 6), ('aux_weights', 9), ('early_stop', 18),
         ('batch_size', 4), ('lr', 6), ('sampling', 8), ('input_size', 5), ('mode', 6), ('seed', 4),
         ('epoch', 5), ('val_retrieval', 8),
-        ('val_retrieval_pooled', 8), ('val_loss', 8), ('test_acc', 6), ('test_acc_fold', 6),
-        ('test_acc_class', 6), ('status', 8)]
+        ('val_retrieval_pooled', 8), ('val_loss', 8), ('val_acc', 7), ('val_bacc', 7),
+        ('test_acc', 6), ('test_acc_fold', 6), ('test_acc_class', 6), ('status', 8)]
 heads = {'label_smoothing': 'ls', 'aux_weights': 'fold,cls', 'early_stop': 'early stop',
          'batch_size': 'bs', 'input_size': 'input', 'epoch': 'epoch', 'val_retrieval': 'val_rsf', 'val_retrieval_pooled': 'pooled',
-         'val_loss': 'val_loss', 'test_acc': 'test%', 'test_acc_fold': 'fold%', 'test_acc_class': 'class%'}
+         'val_loss': 'val_loss', 'val_acc': 'val_acc', 'val_bacc': 'val_bacc',
+         'test_acc': 'test%', 'test_acc_fold': 'fold%', 'test_acc_class': 'class%'}
+# Kept-epoch val accuracy of the aux heads (val_acc_fold, ...) goes in the TSV only.
+extra_keys = sorted({k for r in rows for k in r if k.startswith('val_acc_')})
 
 def fmt(r, k):
     v = r.get(k, '')
-    if k in ('val_retrieval', 'val_retrieval_pooled', 'val_loss') and v:
+    if (k in ('val_retrieval', 'val_retrieval_pooled', 'val_loss', 'val_acc', 'val_bacc')
+            or k.startswith('val_acc_')) and v:
         try:
             return f'{float(v):.4f}'
         except ValueError:
@@ -233,7 +244,7 @@ for i, r in enumerate(ranked, 1):
     r['rank'] = str(i) if r['status'] == 'done' and r.get('val_retrieval') else '-'
 
 with open(out, 'w') as f:
-    keys = [k for k, _ in cols] + ['model', 'log']
+    keys = [k for k, _ in cols] + extra_keys + ['model', 'log']
     f.write('\t'.join(keys) + '\n')
     for r in ranked:
         f.write('\t'.join(fmt(r, k) for k in keys) + '\n')
@@ -292,4 +303,5 @@ if done:
               'absolute terms (do not quote them as results) but comparable with each other.')
     print('Differences under ~0.03 are within noise for 44 scorable superfamilies; rerun the top '
           'two or three with 2 more seeds before choosing.')
+
 PY
