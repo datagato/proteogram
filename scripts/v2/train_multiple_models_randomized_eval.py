@@ -147,6 +147,7 @@ import torchvision.transforms as transforms
 
 from proteogram.common import read_yaml, find_proteogram_images
 from proteogram.v2 import HierarchicalTripletLoss, HierarchicalPKSampler, MultiLevelCELoss, SCOPE_LEVELS
+from proteogram.v2.similarity_maps import CHANNEL_NAMES, channels_present, mask_channels
 
 
 matplotlib.use('agg')
@@ -157,7 +158,7 @@ class ProteogramDataset(Dataset):
     def __init__(self, tsv_file, root_dir, pad=True, level='class', new_size=128, transform=None,
                  names_to_labels=None, min_class_size=0, min_image_size=0, max_image_size=0,
                  exclude_classes=None, emit_hierarchy=False, min_family_size=0,
-                 include_ids=None):
+                 include_ids=None, drop_channels=None):
         """
         Arguments
         ---------
@@ -246,6 +247,10 @@ class ProteogramDataset(Dataset):
                       f'First few: {large[:5]}')
         self.transform = transform
         self.pad = pad
+        # --drop_channels: these channels are blanked (set to 0, "no
+        # interaction") in their half of every image before pad/resize, exactly
+        # as search does it for a checkpoint whose meta lists them.
+        self.channels_present = channels_present(drop_channels)
         self.level = level # class, fold, superfamily or family
         self.new_size = new_size
 
@@ -395,12 +400,16 @@ class ProteogramDataset(Dataset):
             # would pass it straight through. convert('RGB') also drops any alpha
             # channel and matches pad_to_size() in measure_similarity_v2.py.
             image = np.array(Image.open(img_name).convert('RGB'))
+            if not all(self.channels_present):
+                image = mask_channels(image, self.channels_present)
             H, W = image.shape[0], image.shape[1]
             DH, DW = self.new_size, self.new_size # desired height / width
             padding = (self.get_pad(H, DH), self.get_pad(W, DW), (0, 0))
             image = np.pad(image, padding, constant_values=128) # pad with gray
         else:
             image = Image.open(img_name).convert('RGB')
+            if not all(self.channels_present):
+                image = Image.fromarray(mask_channels(np.array(image), self.channels_present))
             image = image.resize((self.new_size, self.new_size))
             image = np.array(image)
         if self.transform:
@@ -1350,6 +1359,15 @@ if __name__ == '__main__':
                              "up to 750 residues but resizes them down to an efficient 256x256. "
                              "In pad mode --input_size must be >= --max_image_size (padding cannot "
                              "shrink an image larger than the grid).")
+    parser.add_argument('--drop_channels',
+                        type=str,
+                        default=None,
+                        help="Comma-separated proteogram channels to blank (set to 0) in every "
+                             "train/val/test image, for channel ablation: "
+                             f"{', '.join(CHANNEL_NAMES)}. Upper half: VdW attractive (R), VdW "
+                             "repulsive (G), C-alpha distance (B); lower half: electrostatic "
+                             "attractive (R), electrostatic repulsive (G), hydrophobicity (B). "
+                             "Recorded in the checkpoint meta so search blanks the same channels.")
     parser.add_argument('--exclude_classes', '-x',
                         type=str,
                         default=None,
@@ -1482,6 +1500,14 @@ if __name__ == '__main__':
                              "which would otherwise select a checkpoint that isn't actually best "
                              "for the levels you care about. Ignored otherwise. Default: family.")
     args = parser.parse_args()
+
+    # Validated channel names, in CHANNELS order (raises on a typo).
+    _present = channels_present(args.drop_channels)
+    drop_list = [n for n, keep in zip(CHANNEL_NAMES, _present) if not keep]
+    if drop_list:
+        if len(drop_list) == len(CHANNEL_NAMES):
+            raise ValueError('--drop_channels would blank every channel.')
+        print(f'Channel ablation: blanking {", ".join(drop_list)} in every image.')
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -1657,6 +1683,7 @@ if __name__ == '__main__':
         min_image_size=20,
         max_image_size=args.max_image_size,
         exclude_classes=exclude_classes,
+        drop_channels=args.drop_channels,
         # Hierarchy labels (B, 4) also feed the --aux_heads losses.
         emit_hierarchy=(args.loss == 'triplet_hierarchy' or bool(aux_weights)),
         min_family_size=(args.min_family_size if args.loss == 'triplet_hierarchy' else 0))
@@ -2094,6 +2121,8 @@ if __name__ == '__main__':
             loss_tag += f'_es-rsf{args.early_stop_k}'
         if args.sampling != 'natural':
             loss_tag += f'_{args.sampling}'
+        if drop_list:
+            loss_tag += '_drop-' + '-'.join(drop_list)
         model_tag = f'{args.model}_unfrozen{args.vit_unfrozen_blocks}' if args.model == 'vit' else args.model
         if args.model == 'resnet18' and not args.pretrained:
             model_tag += '_scratch'
@@ -2133,7 +2162,8 @@ if __name__ == '__main__':
                     'frozen_layers': [] if args.model == 'resnet18' else None,
                     'early_stop_metric': args.early_stop_metric,
                     'early_stop_k': args.early_stop_k,
-                    'val_summary': val_summary}
+                    'val_summary': val_summary,
+                    'drop_channels': drop_list}
             if aux_weights:
                 meta.update(aux_heads=aux_weights, aux_test_accuracy=aux_test_accuracy)
             torch.save({

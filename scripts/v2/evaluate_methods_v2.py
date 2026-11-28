@@ -1005,6 +1005,10 @@ if __name__ == '__main__':
     parser.add_argument('--overwrite', action='store_true',
                         help='No longer needed: every run writes to a new timestamped folder '
                              '(see --out_dir). Accepted and ignored for older command lines.')
+    parser.add_argument('--config', default='config.yml',
+                        help='Config file (default: config.yml in the working directory). Its '
+                             'proteogram_sim_results names the Proteogram search to evaluate; a '
+                             'copy goes into the run folder.')
     parser.add_argument('--out_dir', default=None,
                         help='Base folder for evaluation runs; each run creates '
                              'eval_<YYYYmmdd-HHMMSS>_<scope_level>_k<top_k>/ inside it with the '
@@ -1042,7 +1046,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Files and folders
-    config = read_yaml('config.yml')
+    config = read_yaml(args.config)
     top_k = config['top_k']
     scope_level = config['scope_level']
     scope_eval_set = config['scope_eval_set']
@@ -1068,7 +1072,7 @@ if __name__ == '__main__':
                   'no_relative': os.path.join(run_dir, 'search_images', 'no_relative')}
     for d in image_dirs.values():
         os.makedirs(d)
-    shutil.copy('config.yml', os.path.join(run_dir, 'config.yml'))
+    shutil.copy(args.config, os.path.join(run_dir, 'config.yml'))
     # Everything printed from here on also goes to report.txt.
     report_fh = open(os.path.join(run_dir, 'report.txt'), 'w')
     sys.stdout = Tee(sys.__stdout__, report_fh)
@@ -1354,7 +1358,7 @@ if __name__ == '__main__':
         'ranked_list_depth': depths,
         'remote_depth': remote_depth,
         'remote_short_lists': {name: m.get('remote_short') for name, m in methods.items()},
-        'inputs': {'config': os.path.abspath('config.yml'),
+        'inputs': {'config': os.path.abspath(args.config),
                    'scope_eval_set': scope_eval_set,
                    'train_list': args.train_list,
                    'query_types': args.query_types,

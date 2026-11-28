@@ -14,6 +14,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 
 from proteogram.v2 import Img2Vec
+from proteogram.v2.similarity_maps import channels_present, mask_channels
 from proteogram.common import read_yaml, find_proteogram_images
 
 
@@ -41,6 +42,9 @@ def pad_to_size(img, target=200, fill=128):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Proteogram image similarity search.')
+    parser.add_argument('--config', default='config.yml',
+                        help='Config file (default: config.yml in the working directory). Lets '
+                             'batch scripts point each model at its own embed/results files.')
     parser.add_argument('--exclude_classes', '-x', default=None,
                         help='Comma-separated SCOPe class names to exclude (e.g. "g,h").')
     parser.add_argument('--overwrite', action='store_true',
@@ -72,7 +76,7 @@ if __name__ == '__main__':
     # Run embedding vs loading saved embeddings
     embed = args.embed
 
-    config = read_yaml('config.yml')
+    config = read_yaml(args.config)
     top_k = config['top_k']
     model_file = config['model_file']
     embed_file = config['embed_file']
@@ -176,10 +180,23 @@ if __name__ == '__main__':
     # Single preprocessing fn used both for the embedding transform and for
     # result-image saving, so display images match how embeddings were computed.
     if search_resize:
-        def _prep_fn(img):
+        def _grid_fn(img):
             return img.convert('RGB').resize((search_grid_size, search_grid_size))
     else:
-        _prep_fn = functools.partial(pad_to_size, target=search_grid_size)
+        _grid_fn = functools.partial(pad_to_size, target=search_grid_size)
+    # Channel-ablation checkpoints (train_multiple_models_randomized_eval.py
+    # --drop_channels) were trained with those channels blanked; blank them
+    # here too, before the resize/pad, exactly as training did.
+    drop_channels = img_sim.embedding_meta.get('drop_channels') or []
+    if drop_channels:
+        _present = channels_present(drop_channels)
+        print(f'Blanking channel(s) {", ".join(drop_channels)} in every image (checkpoint meta).')
+
+        def _prep_fn(img):
+            masked = mask_channels(np.array(img.convert('RGB')), _present)
+            return _grid_fn(Image.fromarray(masked))
+    else:
+        _prep_fn = _grid_fn
 
     # Override transform to match training. ViT-B/16 checkpoints (trained with
     # --model vit) always resize to a fixed 224x224 -- see
